@@ -234,6 +234,9 @@ router.post('/email', async (req, res) => {
   }
 });
 
+router.get('/hello', (req, res) => {
+  res.json({ ok: true, msg: "Hello from campaigns!" });
+});
 
 
 module.exports = router;
