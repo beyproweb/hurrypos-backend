@@ -1,0 +1,8 @@
+node_modules
+uploads
+*.log
+.env
+node_modules
+uploads
+public/uploads
+.wwebjs_auth

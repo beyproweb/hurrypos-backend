@@ -1,0 +1,45 @@
+{
+  "name": "hurrypos-backend",
+  "version": "1.0.0",
+  "description": "Backend for HurryPOS system",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "mailer": "node scheduleMailer.js",
+    "dev:all": "concurrently \"npm run dev\" \"npm run mailer\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.8.4",
+    "bcrypt": "^5.1.1",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "dayjs": "^1.11.13",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "json2csv": "^6.0.0-alpha.2",
+    "moment-timezone": "^0.5.48",
+    "multer": "^1.4.5-lts.2",
+    "node-fetch": "^3.3.2",
+    "nodemailer": "^6.10.0",
+    "openai": "^4.98.0",
+    "pdfkit": "^0.12.3",
+    "pg": "^8.14.0",
+    "qrcode-terminal": "^0.12.0",
+    "sharp": "^0.34.2",
+    "socket.io": "^4.8.1",
+    "tesseract.js": "^6.0.1",
+    "whatsapp-web.js": "^1.31.0",
+    "winston": "^3.17.0",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "http-proxy-middleware": "^3.0.5",
+    "nodemon": "^3.1.10"
+  }
+}
