@@ -129,7 +129,7 @@ app.use("/api", autoSuppliersRouter(io));
 
 
 // server.js
-const express = require("express");
+
 const uploadRouter = require("./routes/upload.js"); //
 app.use("/api/upload", uploadRouter);
 
