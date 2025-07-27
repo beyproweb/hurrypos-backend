@@ -140,52 +140,54 @@ router.get('/:id', async (req, res) => {
 
 // POST /api/products - create new product
 // POST /api/products - create new product
-router.post("/", upload.single("image"), async (req, res) => {
+// POST /api/products - create new product (accepts JSON, NOT file upload)
+router.post("/", async (req, res) => {
   try {
     const {
       name,
       price,
       category,
-      preparationTime,
+      preparation_time,
       description,
-      discountType,
-      discountValue,
+      discount_type,
+      discount_value,
       visible,
       tags,
       allergens,
-      promoStart,
-      promoEnd,
+      promo_start,
+      promo_end,
+      image_url,
+      ingredients,
+      extras,
+      selectedExtrasGroup,
     } = req.body;
 
-    // Always store JSON columns as stringified JSON
+    // Safely handle JSON columns
     let parsedIngredients, parsedExtras, parsedGroup;
     try {
-      parsedIngredients = req.body.ingredients ? JSON.stringify(JSON.parse(req.body.ingredients)) : "[]";
+      parsedIngredients = ingredients ? JSON.stringify(ingredients) : "[]";
     } catch (err) {
-      console.error("❌ Invalid JSON in ingredients:", req.body.ingredients);
-      return res.status(400).json({ error: "Invalid JSON in ingredients" });
+      console.error("❌ Invalid ingredients:", ingredients);
+      return res.status(400).json({ error: "Invalid ingredients" });
     }
     try {
-      parsedExtras = req.body.extras ? JSON.stringify(JSON.parse(req.body.extras)) : "[]";
+      parsedExtras = extras ? JSON.stringify(extras) : "[]";
     } catch (err) {
-      console.error("❌ Invalid JSON in extras:", req.body.extras);
-      return res.status(400).json({ error: "Invalid JSON in extras" });
+      console.error("❌ Invalid extras:", extras);
+      return res.status(400).json({ error: "Invalid extras" });
     }
-    // --- THIS PART IS CHANGED ---
     try {
-      const groupArr = req.body.selectedExtrasGroup ? JSON.parse(req.body.selectedExtrasGroup) : [];
+      // Parse group as array or []
+      const groupArr = selectedExtrasGroup || [];
       if (Array.isArray(groupArr) && groupArr.length) {
         parsedGroup = `{${groupArr.map((g) => `"${g}"`).join(",")}}`;
       } else {
         parsedGroup = null;
       }
     } catch (err) {
-      console.error("❌ Invalid JSON in selectedExtrasGroup:", req.body.selectedExtrasGroup);
-      return res.status(400).json({ error: "Invalid JSON in selectedExtrasGroup" });
+      console.error("❌ Invalid selectedExtrasGroup:", selectedExtrasGroup);
+      return res.status(400).json({ error: "Invalid selectedExtrasGroup" });
     }
-    // ---------------------------
-
-    const imageFile = req.file ? req.file.filename : null;
 
     const result = await pool.query(
       `INSERT INTO products (
@@ -201,16 +203,16 @@ router.post("/", upload.single("image"), async (req, res) => {
         name,
         price,
         category,
-        preparationTime || null,
+        preparation_time || null,
         description,
-        discountType,
-        discountValue,
-        visible === "true", // from FormData
+        discount_type,
+        discount_value,
+        visible,
         tags,
         allergens,
-        promoStart || null,
-        promoEnd || null,
-        imageFile,
+        promo_start || null,
+        promo_end || null,
+        image_url, // <-- Use the cloudinary url
         parsedIngredients,
         parsedExtras,
         parsedGroup
@@ -223,6 +225,7 @@ router.post("/", upload.single("image"), async (req, res) => {
     res.status(500).json({ error: "Failed to create product" });
   }
 });
+
 
 
 
