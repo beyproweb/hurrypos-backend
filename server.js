@@ -128,6 +128,8 @@ const autoSuppliersRouter = require("./routes/Autosuppliersorder"); // update pa
 app.use("/api", autoSuppliersRouter(io));
 
 
+import uploadRouter from "./routes/upload.js";
+app.use("/api/upload", uploadRouter);
 
 
 
