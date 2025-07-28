@@ -156,7 +156,7 @@ router.post("/", async (req, res) => {
       allergens,
       promo_start,
       promo_end,
-      image_url,
+      image: image_url,
       ingredients,
       extras,
       selectedExtrasGroup,
