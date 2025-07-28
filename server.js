@@ -50,6 +50,10 @@ const {
 const staffRoutes = require('./routes/staff');
 const bcrypt = require("bcrypt");
 
+
+const uploadRouter = require("./routes/upload.js"); // ✅ correct path
+app.use("/api/upload", uploadRouter);
+
 const { startKitchenTimersJob } = require("./routes/timerScheduler");
 startKitchenTimersJob();
 
@@ -113,9 +117,6 @@ app.use("/api", autoSuppliersRouter(io));
 
 
 // server.js
-
-const uploadRouter = require("./routes/upload.js"); //
-app.use("/api/upload", uploadRouter);
 
 
 
