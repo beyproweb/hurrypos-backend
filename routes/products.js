@@ -143,6 +143,7 @@ router.get('/:id', async (req, res) => {
 // POST /api/products - create new product (accepts JSON, NOT file upload)
 router.post("/", async (req, res) => {
   try {
+  console.log("🟢 POST /api/products body:", req.body);
     const {
       name,
       price,
