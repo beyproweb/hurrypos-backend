@@ -230,40 +230,37 @@ router.post("/", async (req, res) => {
 
 
 
-router.put("/:id", upload.single("image"), async (req, res) => {
+// PUT /api/products/:id - update product
+router.put("/:id", async (req, res) => {
   const { id } = req.params;
-  const imageFilename = req.file ? req.file.filename : req.body.existingImage || null;
 
-  let parsedIngredients = [];
-  let parsedExtras = [];
-  let selectedExtrasGroupArray = [];
+  // Use the correct DB field names according to your schema
+  const {
+    name,
+    price,
+    category,
+    preparation_time,
+    description,
+    discount_type,
+    discount_value,
+    visible,
+    tags,
+    allergens,
+    promo_start,
+    promo_end,
+    image, // This is a full URL from Cloudinary or an empty string
+    ingredients,
+    extras,
+    selectedExtrasGroup,
+  } = req.body;
 
-  // ✅ Safely parse JSON fields
-  try {
-    parsedIngredients =
-  typeof req.body.ingredients === "string"
-    ? JSON.parse(req.body.ingredients)
-    : req.body.ingredients || [];
-
-parsedExtras =
-  typeof req.body.extras === "string"
-    ? JSON.parse(req.body.extras)
-    : req.body.extras || [];
-
-selectedExtrasGroupArray =
-  typeof req.body.selectedExtrasGroup === "string"
-    ? JSON.parse(req.body.selectedExtrasGroup)
-    : req.body.selectedExtrasGroup || [];
-
-  } catch (e) {
-    console.error("❌ Invalid JSON format:", e);
-    return res.status(400).json({ error: "Invalid JSON format in ingredients/extras/groups" });
-  }
-
-  // ✅ Convert selectedExtrasGroupArray to PostgreSQL-compatible text[]
-  const pgExtrasGroup = selectedExtrasGroupArray.length
-    ? `{${selectedExtrasGroupArray.map((g) => `"${g}"`).join(",")}}`
-    : null;
+  // No need to parse these, they're already arrays/objects
+  const parsedIngredients = ingredients || [];
+  const parsedExtras = extras || [];
+  const parsedGroup =
+    Array.isArray(selectedExtrasGroup) && selectedExtrasGroup.length
+      ? `{${selectedExtrasGroup.map((g) => `"${g}"`).join(",")}}`
+      : null;
 
   const client = await pool.connect();
   try {
@@ -290,22 +287,22 @@ selectedExtrasGroupArray =
       WHERE id = $17
       RETURNING *`,
       [
-        req.body.name,
-        parseFloat(req.body.price) || 0,
-        req.body.category,
-        parseInt(req.body.preparationTime) || 0,
-        req.body.description,
-        req.body.discountType || "none",
-        parseFloat(req.body.discountValue) || 0,
-        req.body.visible === "true",
-        req.body.tags,
-        req.body.allergens,
-        req.body.promoStart || null,
-        req.body.promoEnd || null,
-        imageFilename,
+        name,
+        parseFloat(price) || 0,
+        category,
+        parseInt(preparation_time) || 0,
+        description,
+        discount_type || "none",
+        parseFloat(discount_value) || 0,
+        typeof visible === "boolean" ? visible : visible === "true",
+        tags,
+        allergens,
+        promo_start || null,
+        promo_end || null,
+        image || null,
         JSON.stringify(parsedIngredients),
         JSON.stringify(parsedExtras),
-        pgExtrasGroup,
+        parsedGroup,
         id,
       ]
     );
@@ -320,6 +317,7 @@ selectedExtrasGroupArray =
     client.release();
   }
 });
+
 
 
 // DELETE /api/extras-groups/:groupId/items/:itemId
