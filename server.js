@@ -115,7 +115,8 @@ app.use("/api", autoSuppliersRouter(io));
 // server.js
 
 const uploadRouter = require("./routes/upload.js"); //
-app.use("/api/upload", uploadRouter);
+app.use("/api", uploadRouter);
+
 
 
 const kitchen = require("./routes/kitchen"); // update path if needed

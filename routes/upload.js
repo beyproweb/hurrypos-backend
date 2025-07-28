@@ -13,7 +13,7 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() }); // Use memory for Cloudinary
 
 // FIELD NAME MUST BE "file" HERE:
-router.post("/", upload.single("file"), (req, res) => {
+router.post("/upload", upload.single("file"), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
     const stream = cloudinary.uploader.upload_stream(
