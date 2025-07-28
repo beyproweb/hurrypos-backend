@@ -77,7 +77,6 @@ app.use('/api', expensesRoutes);
 const userSettingsRoutes = require("./routes/userSettings");
 app.use("/api/user-settings", userSettingsRoutes);
 
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const printerRoutes = require('./routes/printer');
 app.use('/api/printer-settings', printerRoutes);
