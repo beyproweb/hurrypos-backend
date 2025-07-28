@@ -1,26 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
 
-// Storage for uploaded product images
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = path.join(__dirname, "..", "public", "uploads");
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `product_${Date.now()}${ext}`);
-  }
-});
-
-const upload = multer({ storage });
 // GET /api/products - fetch all products
 router.get('/', async (req, res) => {
   try {
