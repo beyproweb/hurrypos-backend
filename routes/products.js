@@ -138,12 +138,10 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// POST /api/products - create new product
-// POST /api/products - create new product
 // POST /api/products - create new product (accepts JSON, NOT file upload)
 router.post("/", async (req, res) => {
   try {
-  console.log("🟢 POST /api/products body:", req.body);
+     console.log("⏫ File upload attempt:", req.file?.originalname, req.file?.size, "bytes");
     const {
       name,
       price,
