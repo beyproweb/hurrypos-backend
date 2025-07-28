@@ -201,23 +201,24 @@ router.post("/", async (req, res) => {
         $11, $12, $13, $14, $15, $16
       ) RETURNING *`,
       [
-        name,
-        price,
-        category,
-        preparation_time || null,
-        description,
-        discount_type,
-        discount_value,
-        visible,
-        tags,
-        allergens,
-        promo_start || null,
-        promo_end || null,
-        image_url, // <-- Use the cloudinary url
-        parsedIngredients,
-        parsedExtras,
-        parsedGroup
-      ]
+  name,
+  parseFloat(price) || 0,
+  category,
+  preparation_time ? parseInt(preparation_time) : null,
+  description,
+  discount_type || "none",
+  parseFloat(discount_value) || 0,
+  typeof visible === "boolean" ? visible : visible === "true",
+  tags,
+  allergens,
+  promo_start || null,
+  promo_end || null,
+  image_url, // <-- This stays as is
+  parsedIngredients,
+  parsedExtras,
+  parsedGroup
+]
+
     );
 
     res.json(result.rows[0]);
