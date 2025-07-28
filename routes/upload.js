@@ -10,23 +10,25 @@ cloudinary.config({
 });
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ storage: multer.memoryStorage() }); // Use memory for Cloudinary
 
+// FIELD NAME MUST BE "file" HERE:
 router.post("/", upload.single("file"), (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
     const stream = cloudinary.uploader.upload_stream(
-      { folder: "products" },
+      { folder: "products" }, // Optional: customize folder
       (error, result) => {
         if (error) {
-          console.error("Cloudinary upload error:", error);
-          return res.status(500).json({ error: error.message });
+          console.error("❌ Cloudinary error:", error);
+          return res.status(500).json({ error });
         }
         res.json({ url: result.secure_url });
       }
     );
     stream.end(req.file.buffer);
   } catch (err) {
-    console.error("Upload handler error:", err);
+    console.error("❌ Multer error:", err);
     res.status(500).json({ error: err.message });
   }
 });
