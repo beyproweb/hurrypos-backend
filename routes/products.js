@@ -240,9 +240,21 @@ router.put("/:id", upload.single("image"), async (req, res) => {
 
   // ✅ Safely parse JSON fields
   try {
-    parsedIngredients = JSON.parse(req.body.ingredients || "[]");
-    parsedExtras = JSON.parse(req.body.extras || "[]");
-    selectedExtrasGroupArray = JSON.parse(req.body.selectedExtrasGroup || "[]");
+    parsedIngredients =
+  typeof req.body.ingredients === "string"
+    ? JSON.parse(req.body.ingredients)
+    : req.body.ingredients || [];
+
+parsedExtras =
+  typeof req.body.extras === "string"
+    ? JSON.parse(req.body.extras)
+    : req.body.extras || [];
+
+selectedExtrasGroupArray =
+  typeof req.body.selectedExtrasGroup === "string"
+    ? JSON.parse(req.body.selectedExtrasGroup)
+    : req.body.selectedExtrasGroup || [];
+
   } catch (e) {
     console.error("❌ Invalid JSON format:", e);
     return res.status(400).json({ error: "Invalid JSON format in ingredients/extras/groups" });
