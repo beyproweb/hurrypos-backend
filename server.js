@@ -1,22 +1,23 @@
 
 const express = require('express');
 require('dotenv').config();
-
+const app = express();
 const pool = require('./db');
 const cors = require('cors');
 app.use(cors({
-  origin: "*",
+  origin: ["https://pos.beypro.com"],
   methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
   credentials: true,
   allowedHeaders: "Origin,X-Requested-With,Content-Type,Accept,Authorization",
 }));
+
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 
 const Tesseract = require("tesseract.js");
 const path = require("path");
 const fs = require("fs");
-const app = express();
+
 const http = require('http').createServer(app);
 const { initSocket } = require("./utils/socket");
 const io = initSocket(http);
