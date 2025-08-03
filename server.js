@@ -4,6 +4,12 @@ require('dotenv').config();
 
 const pool = require('./db');
 const cors = require('cors');
+app.use(cors({
+  origin: "*",
+  methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
+  credentials: true,
+  allowedHeaders: "Origin,X-Requested-With,Content-Type,Accept,Authorization",
+}));
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 
@@ -28,12 +34,7 @@ app.use("/api", taskRoutes);
 
 
 const dayjs = require("dayjs");
-app.use(cors({
-  origin: "*",
-  methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
-  credentials: true,
-  allowedHeaders: "Origin,X-Requested-With,Content-Type,Accept,Authorization",
-}));
+
 
 
 const { fetchNewOrders, fetchOrderById } = require('./trendyol');
