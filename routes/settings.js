@@ -316,7 +316,17 @@ router.get("/qr-menu-disabled", async (req, res) => {
     const result = await pool.query(
       "SELECT value FROM settings WHERE key = 'qr-menu-disabled' LIMIT 1"
     );
-    res.json({ disabled: result.rows[0]?.value === "true" });
+    // Try to parse value as JSON array, fallback to empty
+    let disabled = [];
+    if (result.rows.length) {
+      try {
+        disabled = JSON.parse(result.rows[0].value);
+        if (!Array.isArray(disabled)) disabled = [];
+      } catch {
+        disabled = [];
+      }
+    }
+    res.json({ disabled });
   } catch (err) {
     console.error("❌ Failed to fetch qr-menu-disabled:", err);
     res.status(500).json({ error: "Failed to fetch qr-menu-disabled" });
@@ -325,13 +335,13 @@ router.get("/qr-menu-disabled", async (req, res) => {
 
 // POST /api/settings/qr-menu-disabled
 router.post("/qr-menu-disabled", async (req, res) => {
-  const { disabled } = req.body; // expects boolean
+  const { disabled } = req.body; // expects an array of IDs
   try {
     await pool.query(
       `INSERT INTO settings (key, value)
        VALUES ('qr-menu-disabled', $1)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [String(!!disabled)]
+      [JSON.stringify(Array.isArray(disabled) ? disabled : [])]
     );
     res.json({ success: true });
   } catch (err) {
@@ -339,6 +349,7 @@ router.post("/qr-menu-disabled", async (req, res) => {
     res.status(500).json({ error: "Failed to update qr-menu-disabled" });
   }
 });
+
 
 
 module.exports = router;
