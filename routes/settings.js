@@ -310,6 +310,35 @@ router.post("/:section", async (req, res) => {
   }
 });
 
+// GET /api/settings/qr-menu-disabled
+router.get("/qr-menu-disabled", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT value FROM settings WHERE key = 'qr-menu-disabled' LIMIT 1"
+    );
+    res.json({ disabled: result.rows[0]?.value === "true" });
+  } catch (err) {
+    console.error("❌ Failed to fetch qr-menu-disabled:", err);
+    res.status(500).json({ error: "Failed to fetch qr-menu-disabled" });
+  }
+});
+
+// POST /api/settings/qr-menu-disabled
+router.post("/qr-menu-disabled", async (req, res) => {
+  const { disabled } = req.body; // expects boolean
+  try {
+    await pool.query(
+      `INSERT INTO settings (key, value)
+       VALUES ('qr-menu-disabled', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [String(!!disabled)]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Failed to update qr-menu-disabled:", err);
+    res.status(500).json({ error: "Failed to update qr-menu-disabled" });
+  }
+});
 
 
 module.exports = router;
