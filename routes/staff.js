@@ -1390,8 +1390,8 @@ router.post('/:staffId/payments', async (req, res) => {
 router.get('/drivers', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, name, phone FROM staff WHERE role = 'Kurye' OR role = 'driver'`
-    );
+  `SELECT id, name, phone FROM staff WHERE LOWER(role) = 'kurye' OR LOWER(role) = 'driver'`
+);
     res.json(result.rows);
   } catch (err) {
     console.error('❌ Error fetching drivers:', err);
