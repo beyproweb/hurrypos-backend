@@ -839,86 +839,65 @@ router.get("/:orderId/suborders", async (req, res) => {
 });
 
 
-// Add after your router.get("/orders", ...) route
-// ✅ PATCHED: GET /api/orders/:id to always include full item info for QR status screen
-// GET order items by order ID
-router.get("/:id/items", async (req, res) => {
-  const { id } = req.params;
+// GET /api/orders/:id  -> header info (safe even if you only need items)
+router.get("/orders/:id", async (req, res) => {
+  const { pool } = require("../db");
   try {
-    const result = await pool.query(
-      `SELECT
-         oi.product_id,
-         oi.external_product_id,
-         oi.quantity,
-         oi.price,
-         oi.ingredients,
-         oi.extras,
-         oi.unique_id,
-         oi.paid_at,
-         oi.confirmed,
-         oi.payment_method,
-         oi.receipt_id,
-         oi.note,
-         oi.kitchen_status,
-         oi.discount_type,
-         oi.discount_value,
-         COALESCE(oi.name, p.name, oi.external_product_name) AS name
-       FROM order_items oi
-       LEFT JOIN products p ON oi.product_id = p.id
-       WHERE oi.order_id = $1`,
-      [id]
+    const { rows } = await pool.query(
+      `SELECT id, status, table_number, order_type, total, created_at
+       FROM orders WHERE id = $1`,
+      [req.params.id]
     );
+    if (!rows.length) return res.status(404).json({ error: "Order not found" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("GET /orders/:id failed", e);
+    res.status(500).json({ error: "Failed to fetch order" });
+  }
+});
 
-    const items = result.rows.map(item => ({
-      ...item,
-      extras: typeof item.extras === 'string'
-        ? JSON.parse(item.extras)
-        : (item.extras || [])
+// GET /api/orders/:id/items  -> items for the status screen
+router.get("/orders/:id/items", async (req, res) => {
+  const { pool } = require("../db");
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        oi.id,
+        oi.order_id,
+        oi.product_id,
+        COALESCE(p.name, oi.external_product_name, oi.name, 'Item') AS name,
+        oi.quantity,
+        oi.kitchen_status,
+        oi.note,
+        oi.extras
+      FROM order_items oi
+      LEFT JOIN products p ON p.id = oi.product_id
+      WHERE oi.order_id = $1
+      ORDER BY oi.id ASC
+    `, [req.params.id]);
+
+    // normalize extras to array
+    const items = rows.map(r => ({
+      id: r.id,
+      name: r.name,
+      quantity: Number(r.quantity || 1),
+      kitchen_status: r.kitchen_status || "new",
+      note: r.note || "",
+      extras: (() => {
+        try {
+          if (!r.extras) return [];
+          return Array.isArray(r.extras) ? r.extras : JSON.parse(r.extras);
+        } catch { return []; }
+      })()
     }));
 
     res.json(items);
-  } catch (err) {
-    console.error("❌ Error fetching order items:", err);
-    res.status(500).json({ error: "Failed to load order items" });
+  } catch (e) {
+    console.error("GET /orders/:id/items failed", e);
+    res.status(500).json({ error: "Failed to fetch order items" });
   }
 });
 
-// routes/orders.js  (inside the exported router)
-router.get("/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { rows } = await pool.query(
-      `
-      SELECT
-        o.*,
-        COALESCE(
-          JSON_AGG(
-            JSON_BUILD_OBJECT(
-              'payment_method', r.payment_method,
-              'amount',         r.amount
-            ) ORDER BY r.id
-          ) FILTER (WHERE r.id IS NOT NULL),
-          '[]'
-        ) AS receipt_methods
-      FROM orders o
-      LEFT JOIN receipt_methods r
-        ON r.receipt_id = o.receipt_id
-      WHERE o.id = $1
-      GROUP BY o.id
-      `,
-      [id]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("❌ GET /orders/:id failed:", err);
-    res.status(500).json({ error: "Database error" });
-  }
-});
 
 
 // ✅ PATCH /orders/:id/reopen
