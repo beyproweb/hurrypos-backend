@@ -839,9 +839,8 @@ router.get("/:orderId/suborders", async (req, res) => {
 });
 
 
-// GET /api/orders/:id  -> header info (safe even if you only need items)
+// Get order header
 router.get("/orders/:id", async (req, res) => {
-  const { pool } = require("../db");
   try {
     const { rows } = await pool.query(
       `SELECT id, status, table_number, order_type, total, created_at
@@ -857,10 +856,11 @@ router.get("/orders/:id", async (req, res) => {
 });
 
 // GET /api/orders/:id/items  -> items for the status screen
+// Get items for status screen — IMPORTANT: alias product name to 'name'
 router.get("/orders/:id/items", async (req, res) => {
-  const { pool } = require("../db");
   try {
-    const { rows } = await pool.query(`
+    const { rows } = await pool.query(
+      `
       SELECT
         oi.id,
         oi.order_id,
@@ -874,9 +874,11 @@ router.get("/orders/:id/items", async (req, res) => {
       LEFT JOIN products p ON p.id = oi.product_id
       WHERE oi.order_id = $1
       ORDER BY oi.id ASC
-    `, [req.params.id]);
+      `,
+      [req.params.id]
+    );
 
-    // normalize extras to array
+    // normalize extras -> array
     const items = rows.map(r => ({
       id: r.id,
       name: r.name,
@@ -888,7 +890,7 @@ router.get("/orders/:id/items", async (req, res) => {
           if (!r.extras) return [];
           return Array.isArray(r.extras) ? r.extras : JSON.parse(r.extras);
         } catch { return []; }
-      })()
+      })(),
     }));
 
     res.json(items);
