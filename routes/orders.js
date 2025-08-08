@@ -840,41 +840,40 @@ router.get("/:orderId/suborders", async (req, res) => {
 
 
 // Add after your router.get("/orders", ...) route
-// ✅ PATCHED: GET /api/orders/:id to include extras and notes
+// ✅ PATCHED: GET /api/orders/:id to always include full item info for QR status screen
 router.get("/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    // Get the order header
+    // 1. Get the order header
     const orderResult = await pool.query("SELECT * FROM orders WHERE id = $1", [id]);
     if (orderResult.rows.length === 0) {
       return res.status(404).json({ error: "Order not found" });
     }
     const order = orderResult.rows[0];
 
-    // Get the order items (including extras and notes)
-const itemsResult = await pool.query(
-  `SELECT
-    oi.product_id,
-    oi.quantity,
-    oi.price,
-    COALESCE(oi.name, p.name, oi.external_product_name) AS name,
-    oi.extras,
-    oi.note,
-    oi.kitchen_status,
-    oi.unique_id
-  FROM order_items oi
-  LEFT JOIN products p ON oi.product_id = p.id
-  WHERE oi.order_id = $1`,
-  [id]
-);
+    // 2. Get the items with unified fields
+    const itemsResult = await pool.query(
+      `SELECT
+        oi.product_id,
+        oi.quantity,
+        oi.price,
+        COALESCE(oi.name, p.name, oi.external_product_name) AS name,
+        oi.extras,
+        oi.note,
+        oi.kitchen_status,
+        oi.unique_id
+      FROM order_items oi
+      LEFT JOIN products p ON oi.product_id = p.id
+      WHERE oi.order_id = $1`,
+      [id]
+    );
 
-order.items = itemsResult.rows.map(item => ({
-  ...item,
-  extras: typeof item.extras === 'string'
-    ? JSON.parse(item.extras)
-    : (item.extras || [])
-}));
-
+    order.items = itemsResult.rows.map(item => ({
+      ...item,
+      extras: typeof item.extras === "string"
+        ? JSON.parse(item.extras)
+        : (item.extras || [])
+    }));
 
     res.json(order);
   } catch (err) {
@@ -882,7 +881,6 @@ order.items = itemsResult.rows.map(item => ({
     res.status(500).json({ error: "Database error" });
   }
 });
-
 
 
 // ✅ PATCH /orders/:id/reopen
