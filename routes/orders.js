@@ -852,24 +852,27 @@ router.get("/:id", async (req, res) => {
     const order = orderResult.rows[0];
 
     // Get the order items (including extras and notes)
-    const itemsResult = await pool.query(
-      `SELECT
-        oi.product_id,
-        oi.quantity AS qty,
-        oi.price,
-        oi.name,
-        p.name AS product_name,
-        oi.extras,
-        oi.note
-      FROM order_items oi
-      LEFT JOIN products p ON oi.product_id = p.id
-      WHERE oi.order_id = $1`,
-      [id]
-    );
+const itemsResult = await pool.query(
+  `SELECT
+    oi.product_id,
+    oi.quantity,
+    oi.price,
+    COALESCE(oi.name, p.name, oi.external_product_name) AS name,
+    oi.extras,
+    oi.note,
+    oi.kitchen_status,
+    oi.unique_id
+  FROM order_items oi
+  LEFT JOIN products p ON oi.product_id = p.id
+  WHERE oi.order_id = $1`,
+  [id]
+);
 
-  order.items = itemsResult.rows.map(item => ({
+order.items = itemsResult.rows.map(item => ({
   ...item,
-  extras: typeof item.extras === 'string' ? JSON.parse(item.extras) : (item.extras || []),
+  extras: typeof item.extras === 'string'
+    ? JSON.parse(item.extras)
+    : (item.extras || [])
 }));
 
 
