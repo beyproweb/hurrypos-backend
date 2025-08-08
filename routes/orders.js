@@ -883,6 +883,42 @@ router.get("/:id/items", async (req, res) => {
   }
 });
 
+// routes/orders.js  (inside the exported router)
+router.get("/:id", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await pool.query(
+      `
+      SELECT
+        o.*,
+        COALESCE(
+          JSON_AGG(
+            JSON_BUILD_OBJECT(
+              'payment_method', r.payment_method,
+              'amount',         r.amount
+            ) ORDER BY r.id
+          ) FILTER (WHERE r.id IS NOT NULL),
+          '[]'
+        ) AS receipt_methods
+      FROM orders o
+      LEFT JOIN receipt_methods r
+        ON r.receipt_id = o.receipt_id
+      WHERE o.id = $1
+      GROUP BY o.id
+      `,
+      [id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("❌ GET /orders/:id failed:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
 
 
 // ✅ PATCH /orders/:id/reopen
