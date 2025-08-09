@@ -855,52 +855,6 @@ router.get("/orders/:id", async (req, res) => {
   }
 });
 
-// GET /api/orders/:id/items  -> items for the status screen
-// Get items for status screen — IMPORTANT: alias product name to 'name'
-router.get("/orders/:id/items", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `
-      SELECT
-        oi.id,
-        oi.order_id,
-        oi.product_id,
-        COALESCE(p.name, oi.external_product_name, oi.name, 'Item') AS name,
-        oi.quantity,
-        oi.kitchen_status,
-        oi.note,
-        oi.extras
-      FROM order_items oi
-      LEFT JOIN products p ON p.id = oi.product_id
-      WHERE oi.order_id = $1
-      ORDER BY oi.id ASC
-      `,
-      [req.params.id]
-    );
-
-    // normalize extras -> array
-    const items = rows.map(r => ({
-      id: r.id,
-      name: r.name,
-      quantity: Number(r.quantity || 1),
-      kitchen_status: r.kitchen_status || "new",
-      note: r.note || "",
-      extras: (() => {
-        try {
-          if (!r.extras) return [];
-          return Array.isArray(r.extras) ? r.extras : JSON.parse(r.extras);
-        } catch { return []; }
-      })(),
-    }));
-
-    res.json(items);
-  } catch (e) {
-    console.error("GET /orders/:id/items failed", e);
-    res.status(500).json({ error: "Failed to fetch order items" });
-  }
-});
-
-
 
 // ✅ PATCH /orders/:id/reopen
 router.patch("/:id/reopen", async (req, res) => {
