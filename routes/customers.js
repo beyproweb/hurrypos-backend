@@ -83,6 +83,28 @@ router.get('/', async (req, res) => {
   }
 });
 
+// GET /api/customers/by-phone/:phone - exact match + addresses
+router.get("/by-phone/:phone", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT * FROM customers WHERE phone = $1 LIMIT 1",
+      [req.params.phone]
+    );
+    if (!rows.length) return res.json(null);
+    const c = rows[0];
+    const { rows: addrs } = await pool.query(
+      `SELECT id,label,address,is_default
+         FROM customer_addresses
+        WHERE customer_id = $1
+        ORDER BY is_default DESC, id ASC`,
+      [c.id]
+    );
+    res.json({ ...c, addresses: addrs });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch customer by phone" });
+  }
+});
+
 
 // GET /api/customers/birthdays
 router.get("/birthdays", async (req, res) => {

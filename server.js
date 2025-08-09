@@ -5,7 +5,7 @@ const app = express();
 const pool = require('./db');
 const cors = require('cors');
 app.use(cors({
-  origin: ["https://pos.beypro.com"],
+  origin: [process.env.FRONTEND_BASE, "https://pos.beypro.com", "http://localhost:5173"].filter(Boolean),
   methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
   credentials: true,
   allowedHeaders: "Origin,X-Requested-With,Content-Type,Accept,Authorization",
@@ -29,6 +29,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
 
 const taskRoutes = require("./routes/tasks");
+app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 app.use("/api", taskRoutes);

@@ -840,7 +840,7 @@ router.get("/:orderId/suborders", async (req, res) => {
 
 
 // Get order header
-router.get("/orders/:id", async (req, res) => {
+router.get("/:id", async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, status, table_number, order_type, total, created_at
