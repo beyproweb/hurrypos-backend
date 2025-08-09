@@ -76,6 +76,10 @@ app.use("/api/notifications", notificationsRoutes);
 const expensesRoutes = require('./routes/expenses');
 app.use('/api', expensesRoutes);
 
+const iyzicoRoutes = require("./routes/iyzico");
+app.use("/api", iyzicoRoutes);
+
+
 const userSettingsRoutes = require("./routes/userSettings");
 app.use("/api/user-settings", userSettingsRoutes);
 
