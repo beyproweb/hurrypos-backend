@@ -736,8 +736,17 @@ router.patch("/:id/reset-if-empty", async (req, res) => {
 
 
 // POST /sub-orders
+// POST /sub-orders  (supports paid & unpaid flows via mark_paid)
 router.post("/sub-orders", async (req, res) => {
-  const { order_id, total, payment_method, items, receipt_id } = req.body;
+  const {
+    order_id,
+    total = 0,
+    payment_method,
+    items = [],
+    receipt_id,
+    mark_paid = true, // <-- NEW: if false, will NOT stamp paid_at
+  } = req.body;
+
   const client = await pool.connect();
 
   try {
@@ -747,36 +756,52 @@ router.post("/sub-orders", async (req, res) => {
       `INSERT INTO sub_orders (order_id, total, payment_method, created_at)
        VALUES ($1, $2, $3, NOW())
        RETURNING id AS sub_order_id`,
-      [order_id, total, payment_method]
+      [order_id, total, payment_method || null]
     );
     const subOrderId = rows[0].sub_order_id;
 
     const itemsWithReceipt = items.map((item) => ({
       ...item,
       receipt_id: receipt_id || null,
-      payment_method: item.payment_method || payment_method,
-      product_id: item.product_id
-      // kitchen_status is intentionally NOT touched ✅
+      payment_method: item.payment_method || payment_method || null,
+      product_id: item.product_id ?? item.id ?? null,
+      // kitchen_status intentionally not forced here
     }));
 
     await saveOrderItems(order_id, itemsWithReceipt);
 
     const uniqueIds = itemsWithReceipt.map((i) => i.unique_id);
 
-    const updateRes = await client.query(
-      `UPDATE order_items
-       SET sub_order_id = $1,
-           paid_at = NOW(),
-           confirmed = true,
-           receipt_id = $4,
-           payment_method = $5
-       WHERE order_id = $2
-         AND unique_id = ANY($3::text[])`,
-      [subOrderId, order_id, uniqueIds, receipt_id, payment_method]
-    );
+    if (mark_paid && receipt_id) {
+      const updateRes = await client.query(
+        `UPDATE order_items
+         SET sub_order_id = $1,
+             paid_at = NOW(),
+             confirmed = true,
+             receipt_id = $4,
+             payment_method = $5
+         WHERE order_id = $2
+           AND unique_id = ANY($3::text[])`,
+        [subOrderId, order_id, uniqueIds, receipt_id, payment_method || "Split"]
+      );
+      console.log(
+        `✅ Marked ${updateRes.rowCount} item(s) as paid for sub_order ${subOrderId}`
+      );
+    } else {
+      const updateRes = await client.query(
+        `UPDATE order_items
+         SET sub_order_id = $1,
+             confirmed = true
+         WHERE order_id = $2
+           AND unique_id = ANY($3::text[])`,
+        [subOrderId, order_id, uniqueIds]
+      );
+      console.log(
+        `🟡 Added ${updateRes.rowCount} item(s) to sub_order ${subOrderId} (UNPAID)`
+      );
+    }
 
-    console.log(`✅ Updated ${updateRes.rowCount} item(s) in order_items`);
-
+    // Keep order total in sync with the sub-order's total
     await client.query(
       `UPDATE orders
        SET total = total + $1
@@ -785,9 +810,8 @@ router.post("/sub-orders", async (req, res) => {
     );
 
     await client.query("COMMIT");
-    emitOrderUpdate(io); // Pass io if needed
-
-    res.json({ sub_order_id: subOrderId });
+    emitOrderUpdate(io);
+    res.json({ sub_order_id: subOrderId, mark_paid: !!mark_paid });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Sub-order failed:", err);
@@ -796,7 +820,6 @@ router.post("/sub-orders", async (req, res) => {
     client.release();
   }
 });
-
 
 // GET /orders/:orderId/suborders
 router.get("/:orderId/suborders", async (req, res) => {
