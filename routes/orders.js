@@ -840,42 +840,51 @@ router.get("/:orderId/suborders", async (req, res) => {
 
 
 // Get order header
+// Get order header + items (items include a unified `name`)
 router.get("/:id", async (req, res) => {
   try {
-    const orderRes = await pool.query(
+    const { rows: orderRows } = await pool.query(
       `SELECT id, status, table_number, order_type, total, created_at
        FROM orders WHERE id = $1`,
       [req.params.id]
     );
-    if (!orderRes.rows.length) return res.status(404).json({ error: "Order not found" });
+    if (!orderRows.length) return res.status(404).json({ error: "Order not found" });
 
-    const itemsRes = await pool.query(
+    const { rows: itemRows } = await pool.query(
       `SELECT
          oi.product_id,
+         oi.unique_id,
          oi.name AS order_item_name,
-         p.name AS product_name,
+         p.name  AS product_name,
          oi.quantity,
          oi.price,
          oi.extras,
-         oi.kitchen_status
+         oi.note,
+         oi.kitchen_status,
+         oi.paid_at
        FROM order_items oi
        LEFT JOIN products p ON oi.product_id = p.id
-       WHERE oi.order_id = $1`,
+       WHERE oi.order_id = $1
+       ORDER BY oi.id ASC`,
       [req.params.id]
     );
 
-    const items = itemsRes.rows.map(it => ({
+    const items = itemRows.map((it) => ({
       ...it,
-      extras: typeof it.extras === "string" ? JSON.parse(it.extras) : (it.extras || [])
+      // unified display name:
+      name: it.order_item_name || it.product_name || "Item",
+      // normalize extras:
+      extras: typeof it.extras === "string" ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })() : (it.extras || []),
+      // convenience total for UI:
+      total: (parseFloat(it.price) || 0) * (it.quantity || 1),
     }));
 
-    res.json({ ...orderRes.rows[0], items });
+    res.json({ ...orderRows[0], items });
   } catch (e) {
     console.error("GET /orders/:id failed", e);
     res.status(500).json({ error: "Failed to fetch order" });
   }
 });
-
 
 
 // ✅ PATCH /orders/:id/reopen
