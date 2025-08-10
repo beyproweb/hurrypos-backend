@@ -842,18 +842,40 @@ router.get("/:orderId/suborders", async (req, res) => {
 // Get order header
 router.get("/:id", async (req, res) => {
   try {
-    const { rows } = await pool.query(
+    const orderRes = await pool.query(
       `SELECT id, status, table_number, order_type, total, created_at
        FROM orders WHERE id = $1`,
       [req.params.id]
     );
-    if (!rows.length) return res.status(404).json({ error: "Order not found" });
-    res.json(rows[0]);
+    if (!orderRes.rows.length) return res.status(404).json({ error: "Order not found" });
+
+    const itemsRes = await pool.query(
+      `SELECT
+         oi.product_id,
+         oi.name AS order_item_name,
+         p.name AS product_name,
+         oi.quantity,
+         oi.price,
+         oi.extras,
+         oi.kitchen_status
+       FROM order_items oi
+       LEFT JOIN products p ON oi.product_id = p.id
+       WHERE oi.order_id = $1`,
+      [req.params.id]
+    );
+
+    const items = itemsRes.rows.map(it => ({
+      ...it,
+      extras: typeof it.extras === "string" ? JSON.parse(it.extras) : (it.extras || [])
+    }));
+
+    res.json({ ...orderRes.rows[0], items });
   } catch (e) {
     console.error("GET /orders/:id failed", e);
     res.status(500).json({ error: "Failed to fetch order" });
   }
 });
+
 
 
 // ✅ PATCH /orders/:id/reopen
