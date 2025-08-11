@@ -719,7 +719,8 @@ router.patch("/:id/reset-if-empty", async (req, res) => {
 
     if (itemCount === 0) {
       await client.query("UPDATE orders SET status = 'closed' WHERE id = $1", [id]);
-        emitOrderUpdate(io); // <-- ADD THIS
+        emitOrderUpdate(io);
+         io.emit("order_closed", { orderId: parseInt(id, 10) });// <-- ADD THIS
 
       return res.json({ message: "Order status reset to closed" });
     }
