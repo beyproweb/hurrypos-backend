@@ -11,7 +11,6 @@ router.get('/', async (req, res) => {
       ingredients: typeof product.ingredients === "string" ? JSON.parse(product.ingredients) : product.ingredients || [],
       extras: typeof product.extras === "string" ? JSON.parse(product.extras) : product.extras || [],
       selectedExtrasGroup: (() => {
-        // For text[], jsonb, or stringified arrays
         if (Array.isArray(product.selected_extras_group)) return product.selected_extras_group;
         if (typeof product.selected_extras_group === "string" && product.selected_extras_group.trim()) {
           try { return JSON.parse(product.selected_extras_group); } catch { return []; }
@@ -29,9 +28,7 @@ router.get('/', async (req, res) => {
 // GET /api/products/costs
 router.get("/costs", async (req, res) => {
   try {
-    // 1. Get all products with their ingredients (as JSON)
     const productsRes = await pool.query("SELECT id, ingredients FROM products");
-    // 2. Get all latest ingredient prices (includes production/supplier!)
     const pricesRes = await pool.query(`
       SELECT x.name, x.unit, x.price_per_unit
       FROM (
@@ -52,7 +49,6 @@ router.get("/costs", async (req, res) => {
       prices[`${p.name}__${p.unit}`] = parseFloat(p.price_per_unit);
     });
 
-    // 3. Calculate cost for each product
     const costs = {};
     productsRes.rows.forEach(prod => {
       let totalCost = 0;
@@ -80,11 +76,7 @@ router.get("/costs", async (req, res) => {
   }
 });
 
-
-
-
-// GET /api/products/:id - fetch product by ID
-// GET /api/products/:id - fetch product by ID (with mapped fields)
+// GET /api/products/:id
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -93,8 +85,6 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Product not found' });
 
     const product = result.rows[0];
-
-    // Patch: ensure correct fields/array mapping
     const mappedProduct = {
       ...product,
       ingredients: typeof product.ingredients === "string"
@@ -119,10 +109,9 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// POST /api/products - create new product (accepts JSON, NOT file upload)
+// POST /api/products
 router.post("/", async (req, res) => {
   try {
-     console.log("⏫ File upload attempt:", req.file?.originalname, req.file?.size, "bytes");
     const {
       name,
       price,
@@ -142,7 +131,6 @@ router.post("/", async (req, res) => {
       selectedExtrasGroup,
     } = req.body;
 
-    // Safely handle JSON columns
     let parsedIngredients, parsedExtras, parsedGroup;
     try {
       parsedIngredients = ingredients ? JSON.stringify(ingredients) : "[]";
@@ -157,13 +145,10 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "Invalid extras" });
     }
     try {
-      // Parse group as array or []
-      const groupArr = selectedExtrasGroup || [];
-      if (Array.isArray(groupArr) && groupArr.length) {
-        parsedGroup = `{${groupArr.map((g) => `"${g}"`).join(",")}}`;
-      } else {
-        parsedGroup = null;
-      }
+      const groupArr = Array.isArray(selectedExtrasGroup) ? selectedExtrasGroup : [];
+      parsedGroup = groupArr.length
+        ? `{${groupArr.map((g) => `"${g.replace(/"/g, '\\"')}"`).join(",")}}`
+        : null;
     } catch (err) {
       console.error("❌ Invalid selectedExtrasGroup:", selectedExtrasGroup);
       return res.status(400).json({ error: "Invalid selectedExtrasGroup" });
@@ -180,24 +165,23 @@ router.post("/", async (req, res) => {
         $11, $12, $13, $14, $15, $16
       ) RETURNING *`,
       [
-  name,
-  parseFloat(price) || 0,
-  category,
-  preparation_time ? parseInt(preparation_time) : null,
-  description,
-  discount_type || "none",
-  parseFloat(discount_value) || 0,
-  typeof visible === "boolean" ? visible : visible === "true",
-  tags,
-  allergens,
-  promo_start || null,
-  promo_end || null,
-  image_url, // <-- This stays as is
-  parsedIngredients,
-  parsedExtras,
-  parsedGroup
-]
-
+        name,
+        parseFloat(price) || 0,
+        category,
+        preparation_time ? parseInt(preparation_time) : null,
+        description,
+        discount_type || "none",
+        parseFloat(discount_value) || 0,
+        typeof visible === "boolean" ? visible : visible === "true",
+        tags,
+        allergens,
+        promo_start || null,
+        promo_end || null,
+        image_url,
+        parsedIngredients,
+        parsedExtras,
+        parsedGroup,
+      ]
     );
 
     res.json(result.rows[0]);
@@ -207,15 +191,9 @@ router.post("/", async (req, res) => {
   }
 });
 
-
-
-
-
-// PUT /api/products/:id - update product
+// PUT /api/products/:id
 router.put("/:id", async (req, res) => {
   const { id } = req.params;
-
-  // Use the correct DB field names according to your schema
   const {
     name,
     price,
@@ -229,18 +207,17 @@ router.put("/:id", async (req, res) => {
     allergens,
     promo_start,
     promo_end,
-    image, // This is a full URL from Cloudinary or an empty string
+    image,
     ingredients,
     extras,
     selectedExtrasGroup,
   } = req.body;
 
-  // No need to parse these, they're already arrays/objects
   const parsedIngredients = ingredients || [];
   const parsedExtras = extras || [];
   const parsedGroup =
     Array.isArray(selectedExtrasGroup) && selectedExtrasGroup.length
-      ? `{${selectedExtrasGroup.map((g) => `"${g}"`).join(",")}}`
+      ? `{${selectedExtrasGroup.map((g) => `"${g.replace(/"/g, '\\"')}"`).join(",")}}`
       : null;
 
   const client = await pool.connect();
@@ -299,8 +276,6 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-
-
 // DELETE /api/extras-groups/:groupId/items/:itemId
 router.delete("/:groupId/items/:itemId", async (req, res) => {
   const { groupId, itemId } = req.params;
@@ -312,8 +287,7 @@ router.delete("/:groupId/items/:itemId", async (req, res) => {
   }
 });
 
-
-// DELETE /api/products/:id - delete product
+// DELETE /api/products/:id
 router.delete('/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -325,10 +299,9 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// DELETE /api/products - delete all or by category
+// DELETE /api/products (all or by category)
 router.delete("/", async (req, res) => {
   const { category } = req.query;
-
   try {
     if (category) {
       await pool.query("DELETE FROM products WHERE category = $1", [category]);
@@ -342,6 +315,5 @@ router.delete("/", async (req, res) => {
     res.status(500).json({ error: "Failed to delete products" });
   }
 });
-
 
 module.exports = router;
