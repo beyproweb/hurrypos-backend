@@ -3,25 +3,39 @@ const router = express.Router();
 const { pool } = require("../db");
 
 // GET /api/products - fetch all products
-router.get('/', async (req, res) => {
+router.get("/", async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM products ORDER BY name ASC');
-    const products = result.rows.map(product => ({
+    const result = await pool.query("SELECT * FROM products ORDER BY name ASC");
+    const products = result.rows.map((product) => ({
       ...product,
-      ingredients: typeof product.ingredients === "string" ? JSON.parse(product.ingredients) : product.ingredients || [],
-      extras: typeof product.extras === "string" ? JSON.parse(product.extras) : product.extras || [],
+      ingredients:
+        typeof product.ingredients === "string"
+          ? JSON.parse(product.ingredients)
+          : product.ingredients || [],
+      extras:
+        typeof product.extras === "string"
+          ? JSON.parse(product.extras)
+          : product.extras || [],
       selectedExtrasGroup: (() => {
-        if (Array.isArray(product.selected_extras_group)) return product.selected_extras_group;
-        if (typeof product.selected_extras_group === "string" && product.selected_extras_group.trim()) {
-          try { return JSON.parse(product.selected_extras_group); } catch { return []; }
+        if (Array.isArray(product.selected_extras_group))
+          return product.selected_extras_group;
+        if (
+          typeof product.selected_extras_group === "string" &&
+          product.selected_extras_group.trim()
+        ) {
+          try {
+            return JSON.parse(product.selected_extras_group);
+          } catch {
+            return [];
+          }
         }
         return [];
       })(),
     }));
     res.json(products);
   } catch (err) {
-    console.error('❌ Error fetching products:', err);
-    res.status(500).json({ error: 'Failed to fetch products' });
+    console.error("❌ Error fetching products:", err);
+    res.status(500).json({ error: "Failed to fetch products" });
   }
 });
 
@@ -45,12 +59,12 @@ router.get("/costs", async (req, res) => {
       WHERE x.rn = 1
     `);
     const prices = {};
-    pricesRes.rows.forEach(p => {
+    pricesRes.rows.forEach((p) => {
       prices[`${p.name}__${p.unit}`] = parseFloat(p.price_per_unit);
     });
 
     const costs = {};
-    productsRes.rows.forEach(prod => {
+    productsRes.rows.forEach((prod) => {
       let totalCost = 0;
       let ingredientsArr = [];
       if (Array.isArray(prod.ingredients)) {
@@ -58,9 +72,11 @@ router.get("/costs", async (req, res) => {
       } else if (typeof prod.ingredients === "string") {
         try {
           ingredientsArr = JSON.parse(prod.ingredients);
-        } catch { ingredientsArr = []; }
+        } catch {
+          ingredientsArr = [];
+        }
       }
-      ingredientsArr.forEach(ing => {
+      ingredientsArr.forEach((ing) => {
         if (!ing.ingredient || !ing.quantity || !ing.unit) return;
         const key = `${ing.ingredient}__${ing.unit}`;
         const price = prices[key] || 0;
@@ -77,26 +93,38 @@ router.get("/costs", async (req, res) => {
 });
 
 // GET /api/products/:id
-router.get('/:id', async (req, res) => {
+router.get("/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
+    const result = await pool.query("SELECT * FROM products WHERE id = $1", [
+      id,
+    ]);
     if (result.rows.length === 0)
-      return res.status(404).json({ error: 'Product not found' });
+      return res.status(404).json({ error: "Product not found" });
 
     const product = result.rows[0];
     const mappedProduct = {
       ...product,
-      ingredients: typeof product.ingredients === "string"
-        ? JSON.parse(product.ingredients)
-        : product.ingredients || [],
-      extras: typeof product.extras === "string"
-        ? JSON.parse(product.extras)
-        : product.extras || [],
+      ingredients:
+        typeof product.ingredients === "string"
+          ? JSON.parse(product.ingredients)
+          : product.ingredients || [],
+      extras:
+        typeof product.extras === "string"
+          ? JSON.parse(product.extras)
+          : product.extras || [],
       selectedExtrasGroup: (() => {
-        if (Array.isArray(product.selected_extras_group)) return product.selected_extras_group;
-        if (typeof product.selected_extras_group === "string" && product.selected_extras_group.trim()) {
-          try { return JSON.parse(product.selected_extras_group); } catch { return []; }
+        if (Array.isArray(product.selected_extras_group))
+          return product.selected_extras_group;
+        if (
+          typeof product.selected_extras_group === "string" &&
+          product.selected_extras_group.trim()
+        ) {
+          try {
+            return JSON.parse(product.selected_extras_group);
+          } catch {
+            return [];
+          }
         }
         return [];
       })(),
@@ -104,8 +132,8 @@ router.get('/:id', async (req, res) => {
 
     res.json(mappedProduct);
   } catch (err) {
-    console.error('❌ Error fetching product:', err);
-    res.status(500).json({ error: 'Failed to fetch product' });
+    console.error("❌ Error fetching product:", err);
+    res.status(500).json({ error: "Failed to fetch product" });
   }
 });
 
@@ -131,27 +159,32 @@ router.post("/", async (req, res) => {
       selectedExtrasGroup,
     } = req.body;
 
-    let parsedIngredients, parsedExtras, parsedGroup;
+    let parsedIngredients = "[]";
+    let parsedExtras = "[]";
+    let parsedGroup = "[]";
+
     try {
-      parsedIngredients = ingredients ? JSON.stringify(ingredients) : "[]";
-    } catch (err) {
-      console.error("❌ Invalid ingredients:", ingredients);
-      return res.status(400).json({ error: "Invalid ingredients" });
+      parsedIngredients = JSON.stringify(
+        Array.isArray(ingredients) ? ingredients : []
+      );
+    } catch {
+      return res.status(400).json({ error: "Invalid ingredients format" });
     }
+
     try {
-      parsedExtras = extras ? JSON.stringify(extras) : "[]";
-    } catch (err) {
-      console.error("❌ Invalid extras:", extras);
-      return res.status(400).json({ error: "Invalid extras" });
+      parsedExtras = JSON.stringify(Array.isArray(extras) ? extras : []);
+    } catch {
+      return res.status(400).json({ error: "Invalid extras format" });
     }
+
     try {
-      const groupArr = Array.isArray(selectedExtrasGroup) ? selectedExtrasGroup : [];
-      parsedGroup = groupArr.length
-        ? `{${groupArr.map((g) => `"${g.replace(/"/g, '\\"')}"`).join(",")}}`
-        : null;
-    } catch (err) {
-      console.error("❌ Invalid selectedExtrasGroup:", selectedExtrasGroup);
-      return res.status(400).json({ error: "Invalid selectedExtrasGroup" });
+      parsedGroup = JSON.stringify(
+        Array.isArray(selectedExtrasGroup) ? selectedExtrasGroup : []
+      );
+    } catch {
+      return res
+        .status(400)
+        .json({ error: "Invalid selectedExtrasGroup format" });
     }
 
     const result = await pool.query(
@@ -213,12 +246,13 @@ router.put("/:id", async (req, res) => {
     selectedExtrasGroup,
   } = req.body;
 
-  const parsedIngredients = ingredients || [];
-  const parsedExtras = extras || [];
-  const parsedGroup =
-    Array.isArray(selectedExtrasGroup) && selectedExtrasGroup.length
-      ? `{${selectedExtrasGroup.map((g) => `"${g.replace(/"/g, '\\"')}"`).join(",")}}`
-      : null;
+  const parsedIngredients = JSON.stringify(
+    Array.isArray(ingredients) ? ingredients : []
+  );
+  const parsedExtras = JSON.stringify(Array.isArray(extras) ? extras : []);
+  const parsedGroup = JSON.stringify(
+    Array.isArray(selectedExtrasGroup) ? selectedExtrasGroup : []
+  );
 
   const client = await pool.connect();
   try {
@@ -248,7 +282,7 @@ router.put("/:id", async (req, res) => {
         name,
         parseFloat(price) || 0,
         category,
-        parseInt(preparation_time) || 0,
+        preparation_time ? parseInt(preparation_time) : null,
         description,
         discount_type || "none",
         parseFloat(discount_value) || 0,
@@ -258,8 +292,8 @@ router.put("/:id", async (req, res) => {
         promo_start || null,
         promo_end || null,
         image || null,
-        JSON.stringify(parsedIngredients),
-        JSON.stringify(parsedExtras),
+        parsedIngredients,
+        parsedExtras,
         parsedGroup,
         id,
       ]
@@ -280,7 +314,10 @@ router.put("/:id", async (req, res) => {
 router.delete("/:groupId/items/:itemId", async (req, res) => {
   const { groupId, itemId } = req.params;
   try {
-    await pool.query("DELETE FROM extras_group_items WHERE group_id = $1 AND id = $2", [groupId, itemId]);
+    await pool.query(
+      "DELETE FROM extras_group_items WHERE group_id = $1 AND id = $2",
+      [groupId, itemId]
+    );
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Failed to delete extra item" });
@@ -288,14 +325,14 @@ router.delete("/:groupId/items/:itemId", async (req, res) => {
 });
 
 // DELETE /api/products/:id
-router.delete('/:id', async (req, res) => {
+router.delete("/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    await pool.query('DELETE FROM products WHERE id = $1', [id]);
+    await pool.query("DELETE FROM products WHERE id = $1", [id]);
     res.json({ success: true });
   } catch (err) {
-    console.error('❌ Error deleting product:', err);
-    res.status(500).json({ error: 'Failed to delete product' });
+    console.error("❌ Error deleting product:", err);
+    res.status(500).json({ error: "Failed to delete product" });
   }
 });
 
@@ -305,7 +342,10 @@ router.delete("/", async (req, res) => {
   try {
     if (category) {
       await pool.query("DELETE FROM products WHERE category = $1", [category]);
-      return res.json({ success: true, message: `Deleted products in category: ${category}` });
+      return res.json({
+        success: true,
+        message: `Deleted products in category: ${category}`,
+      });
     } else {
       await pool.query("DELETE FROM products");
       return res.json({ success: true, message: "Deleted all products" });
