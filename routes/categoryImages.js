@@ -9,6 +9,8 @@ const fs = require("fs");
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
+// categoryImages.js
+
 router.post("/", upload.single("image"), async (req, res) => {
   const { category } = req.body;
   if (!category || !req.file) {
@@ -32,7 +34,8 @@ router.post("/", upload.single("image"), async (req, res) => {
     [category, filename]
   );
 
-  res.json({ success: true, image: filename });
+  const fullUrl = `${process.env.BACKEND_BASE || "http://localhost:5000"}/uploads/${filename}`;
+  res.json({ success: true, image: fullUrl });
 });
 
 router.get("/", async (req, res) => {
@@ -42,7 +45,15 @@ router.get("/", async (req, res) => {
     : "SELECT category, image FROM category_images";
   const params = category ? [category] : [];
   const { rows } = await pool.query(query, params);
-  res.json(rows);
+
+  const base = process.env.BACKEND_BASE || "http://localhost:5000";
+  const mapped = rows.map(r => ({
+    category: r.category,
+    image: `${base}/uploads/${r.image}`,
+  }));
+
+  res.json(mapped);
 });
+
 
 module.exports = router;
