@@ -251,11 +251,27 @@ router.put("/:id/status", async (req, res) => {
    // ✅ FIX in orders.js
 await client.query("COMMIT");
 
+await client.query("COMMIT");
+
+// ✅ Ensure order exists before emitting
 if (status === "confirmed") {
-  setTimeout(() => emitOrderConfirmed(io, parseInt(id)), 500); // 500ms delay for DB commit
+  const confirmedId = parseInt(id);
+  setTimeout(async () => {
+    try {
+      const check = await pool.query("SELECT id FROM orders WHERE id = $1", [confirmedId]);
+      if (check.rows.length > 0) {
+        emitOrderConfirmed(io, confirmedId);
+      } else {
+        console.warn(`⚠️ Tried to emit order_confirmed for non-existing order ${confirmedId}`);
+      }
+    } catch (err) {
+      console.error("❌ Error double-checking confirmed order before emit:", err);
+    }
+  }, 1200); // ⏳ safer delay (1.2s)
 }
 
 emitOrderUpdate(io);
+
 
 
     res.json(result.rows[0]);
