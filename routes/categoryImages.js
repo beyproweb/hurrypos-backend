@@ -1,59 +1,64 @@
+// routes/categoryImages.js
 const express = require("express");
 const router = express.Router();
 const multer = require("multer");
-const sharp = require("sharp");
-const path = require("path");
 const { pool } = require("../db");
-const fs = require("fs");
+const cloudinary = require("../cloudinary"); // <-- use cloudinary
+const streamifier = require("streamifier");
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-// categoryImages.js
-
 router.post("/", upload.single("image"), async (req, res) => {
-  const { category } = req.body;
-  if (!category || !req.file) {
-    return res.status(400).json({ error: "Category and image required" });
+  try {
+    const { category } = req.body;
+    if (!category || !req.file) {
+      return res.status(400).json({ error: "Category and image required" });
+    }
+
+    // Upload to Cloudinary
+    const uploadStream = cloudinary.uploader.upload_stream(
+      { folder: "category_images", public_id: `cat_${Date.now()}` },
+      async (err, result) => {
+        if (err || !result) {
+          console.error("Cloudinary upload error:", err);
+          return res.status(500).json({ error: "Image upload failed" });
+        }
+
+        // Save URL in DB
+        await pool.query(
+          `INSERT INTO category_images (category, image)
+           VALUES ($1, $2)
+           ON CONFLICT (category) DO UPDATE SET image = EXCLUDED.image`,
+          [category, result.secure_url]
+        );
+
+        res.json({ success: true, image: result.secure_url });
+      }
+    );
+
+    streamifier.createReadStream(req.file.buffer).pipe(uploadStream);
+  } catch (e) {
+    console.error("❌ Category upload failed:", e);
+    res.status(500).json({ error: "Internal server error" });
   }
-
-  const uploadDir = path.join(__dirname, "..", "public", "uploads");
-  if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
-  const filename = `catimg_${Date.now()}.jpg`;
-
-  await sharp(req.file.buffer)
-    .resize(200, 200, { fit: "cover" })
-    .jpeg({ quality: 80 })
-    .toFile(path.join(uploadDir, filename));
-
-  await pool.query(
-    `INSERT INTO category_images (category, image)
-     VALUES ($1, $2)
-     ON CONFLICT (category) DO UPDATE SET image = EXCLUDED.image`,
-    [category, filename]
-  );
-
-  const fullUrl = `${process.env.BACKEND_BASE || "http://localhost:5000"}/uploads/${filename}`;
-  res.json({ success: true, image: fullUrl });
 });
 
 router.get("/", async (req, res) => {
-  const { category } = req.query;
-  const query = category
-    ? "SELECT category, image FROM category_images WHERE category = $1"
-    : "SELECT category, image FROM category_images";
-  const params = category ? [category] : [];
-  const { rows } = await pool.query(query, params);
+  try {
+    const { category } = req.query;
+    const query = category
+      ? "SELECT category, image FROM category_images WHERE category = $1"
+      : "SELECT category, image FROM category_images";
+    const params = category ? [category] : [];
+    const { rows } = await pool.query(query, params);
 
-  const base = process.env.BACKEND_BASE || "http://localhost:5000";
-  const mapped = rows.map(r => ({
-    category: r.category,
-    image: `${base}/uploads/${r.image}`,
-  }));
-
-  res.json(mapped);
+    // images are already full Cloudinary URLs
+    res.json(rows);
+  } catch (e) {
+    console.error("❌ Category image fetch failed:", e);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
-
 
 module.exports = router;
