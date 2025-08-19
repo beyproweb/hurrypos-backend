@@ -9,12 +9,16 @@ const streamifier = require("streamifier");
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
+// Upload category image
 router.post("/", upload.single("image"), async (req, res) => {
   try {
-    const { category } = req.body;
+    let { category } = req.body;
     if (!category || !req.file) {
       return res.status(400).json({ error: "Category and image required" });
     }
+
+    // Always normalize category to lowercase
+    category = category.trim().toLowerCase();
 
     // Upload to Cloudinary
     const uploadStream = cloudinary.uploader.upload_stream(
@@ -25,7 +29,7 @@ router.post("/", upload.single("image"), async (req, res) => {
           return res.status(500).json({ error: "Image upload failed" });
         }
 
-        // Save URL in DB
+        // Save URL in DB (with category in lowercase)
         await pool.query(
           `INSERT INTO category_images (category, image)
            VALUES ($1, $2)
@@ -44,17 +48,22 @@ router.post("/", upload.single("image"), async (req, res) => {
   }
 });
 
+// Fetch category image(s)
 router.get("/", async (req, res) => {
   try {
-    const { category } = req.query;
-    const query = category
-      ? "SELECT category, image FROM category_images WHERE category = $1"
-      : "SELECT category, image FROM category_images";
-    const params = category ? [category] : [];
-    const { rows } = await pool.query(query, params);
+    let { category } = req.query;
 
-    // images are already full Cloudinary URLs
-    res.json(rows);
+    let query, params;
+    if (category) {
+      query = "SELECT category, image FROM category_images WHERE category = $1";
+      params = [category.trim().toLowerCase()];
+    } else {
+      query = "SELECT category, image FROM category_images";
+      params = [];
+    }
+
+    const { rows } = await pool.query(query, params);
+    res.json(rows); // each row has full Cloudinary URL now
   } catch (e) {
     console.error("❌ Category image fetch failed:", e);
     res.status(500).json({ error: "Internal server error" });
