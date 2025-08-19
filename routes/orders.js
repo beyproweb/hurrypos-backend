@@ -320,9 +320,20 @@ if (status === "confirmed") {
   const confirmedId = parseInt(id, 10);
   setTimeout(async () => {
     try {
-      const check = await pool.query("SELECT id FROM orders WHERE id = $1", [confirmedId]);
-      if (check.rows.length > 0) {
-        emitOrderConfirmed(io, confirmedId);
+      // fetch id + order_number (if your column is named differently, change here)
+      const { rows } = await pool.query(
+        "SELECT id, order_number FROM orders WHERE id = $1",
+        [confirmedId]
+      );
+      if (rows.length > 0) {
+        const payload = { id: confirmedId };
+        if (rows[0].order_number != null) {
+          // send both fields so clients can fetch either way
+          payload.order_number = rows[0].order_number;
+          payload.number = rows[0].order_number;
+        }
+        // emit a single, rich event
+        io.emit("order_confirmed", payload);
       } else {
         console.warn(`⚠️ Tried to emit order_confirmed for non-existing order ${confirmedId}`);
       }
@@ -333,6 +344,7 @@ if (status === "confirmed") {
 }
 
 emitOrderUpdate(io);
+
 
 
 
@@ -1470,8 +1482,24 @@ console.log("✅ confirm-online route loaded");
     await client.query("COMMIT");
 
     // 5. Emit socket event
-    emitOrderConfirmed(req.app.get("io"), parseInt(id));
-    emitOrderUpdate(req.app.get("io"));
+    // 5. Emit socket event with id + order_number
+const ioRef = req.app.get("io");
+try {
+  const { rows } = await pool.query(
+    "SELECT id, order_number FROM orders WHERE id = $1",
+    [id]
+  );
+  const payload = { id: parseInt(id, 10) };
+  if (rows.length && rows[0].order_number != null) {
+    payload.order_number = rows[0].order_number;
+    payload.number = rows[0].order_number;
+  }
+  ioRef.emit("order_confirmed", payload);
+} catch (e) {
+  console.error("❌ Failed to build order_confirmed payload:", e);
+}
+emitOrderUpdate(ioRef);
+
 
     res.json({ message: "Order confirmed", order: updateRes.rows[0] });
   } catch (err) {
