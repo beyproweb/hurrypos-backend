@@ -212,6 +212,27 @@ router.put("/:id/pay", async (req, res) => {
   }
 });
 
+// ADD THIS BLOCK in /orders.js (right after your existing GET routes)
+router.get('/by-number/:orderNumber', async (req, res) => {
+  try {
+    const { orderNumber } = req.params;
+    // if your column name is different (e.g. order_no, ticket_no), change it here:
+    const { rows } = await db.query(
+      `SELECT * FROM orders WHERE order_number = $1 LIMIT 1`,
+      [orderNumber]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found by order_number', orderNumber });
+    }
+
+    // If you also join order_items, payments, etc., do it here before returning
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error('GET /orders/by-number error:', err);
+    return res.status(500).json({ error: 'Internal error fetching order by number' });
+  }
+});
 
 
 // ✅ PUT /orders/:id/status
