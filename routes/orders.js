@@ -213,21 +213,65 @@ router.put("/:id/pay", async (req, res) => {
 });
 
 // ADD THIS BLOCK in /orders.js (right after your existing GET routes)
+// ✅ FIXED: fetch full order by public order_number, using pool + same shape as GET /:id
 router.get('/by-number/:orderNumber', async (req, res) => {
   try {
     const { orderNumber } = req.params;
-    // if your column name is different (e.g. order_no, ticket_no), change it here:
-    const { rows } = await db.query(
-      `SELECT * FROM orders WHERE order_number = $1 LIMIT 1`,
+
+    // 1) Find internal id by order_number (⚠️ change column name if yours differs)
+    const { rows: idRows } = await pool.query(
+      `SELECT id FROM orders WHERE order_number = $1 LIMIT 1`,
       [orderNumber]
     );
-
-    if (rows.length === 0) {
+    if (!idRows.length) {
       return res.status(404).json({ error: 'Order not found by order_number', orderNumber });
     }
+    const internalId = idRows[0].id;
 
-    // If you also join order_items, payments, etc., do it here before returning
-    return res.json(rows[0]);
+    // 2) Fetch header (same fields as GET /:id)
+    const { rows: orderRows } = await pool.query(
+      `SELECT id, status, table_number, order_type, total, created_at
+       FROM orders WHERE id = $1`,
+      [internalId]
+    );
+    if (!orderRows.length) {
+      return res.status(404).json({ error: "Order not found (after mapping order_number)" });
+    }
+
+    // 3) Fetch items (same query as GET /:id)
+    const { rows: itemRows } = await pool.query(
+      `SELECT
+         oi.product_id,
+         oi.unique_id,
+         oi.name AS order_item_name,
+         p.name  AS product_name,
+         oi.quantity,
+         oi.price,
+         oi.extras,
+         oi.note,
+         oi.kitchen_status,
+         oi.paid_at
+       FROM order_items oi
+       LEFT JOIN products p ON oi.product_id = p.id
+       WHERE oi.order_id = $1
+       ORDER BY oi.id ASC`,
+      [internalId]
+    );
+
+    const items = itemRows.map((it) => ({
+      ...it,
+      name: it.order_item_name || it.product_name || "Item",
+    }));
+
+    res.json({
+      id: orderRows[0].id,
+      status: orderRows[0].status,
+      table_number: orderRows[0].table_number,
+      order_type: orderRows[0].order_type,
+      total: orderRows[0].total,
+      created_at: orderRows[0].created_at,
+      items,
+    });
   } catch (err) {
     console.error('GET /orders/by-number error:', err);
     return res.status(500).json({ error: 'Internal error fetching order by number' });
@@ -269,14 +313,11 @@ router.put("/:id/status", async (req, res) => {
       );
     }
 
-   // ✅ FIX in orders.js
+// ✅ single COMMIT, then emit after a short delay to avoid race with read replicas / cold starts
 await client.query("COMMIT");
 
-await client.query("COMMIT");
-
-// ✅ Ensure order exists before emitting
 if (status === "confirmed") {
-  const confirmedId = parseInt(id);
+  const confirmedId = parseInt(id, 10);
   setTimeout(async () => {
     try {
       const check = await pool.query("SELECT id FROM orders WHERE id = $1", [confirmedId]);
@@ -288,10 +329,11 @@ if (status === "confirmed") {
     } catch (err) {
       console.error("❌ Error double-checking confirmed order before emit:", err);
     }
-  }, 1200); // ⏳ safer delay (1.2s)
+  }, 1200);
 }
 
 emitOrderUpdate(io);
+
 
 
 
