@@ -4,6 +4,24 @@
   const { pool } = require("../db");
   const { getIO } = require("../utils/socket");
   const { v4: uuidv4 } = require("uuid");
+  // --- DEBUG INSTRUMENTATION (ADD THIS BLOCK) ---
+const { performance } = require("perf_hooks");
+const dlog = (...args) =>
+  console.log(new Date().toISOString(), "[orders]", ...args);
+
+// Track the last write/update time per order id to spot read-after-write timing
+const ORDER_TOUCH = new Map(); // id:number -> { when:number(ms), source:string }
+function touch(id, source) {
+  if (id == null) return;
+  const n = Number(id);
+  if (!Number.isFinite(n)) return;
+  ORDER_TOUCH.set(n, { when: Date.now(), source });
+}
+function since(id) {
+  const n = Number(id);
+  const info = ORDER_TOUCH.get(n);
+  return info ? { ms: Date.now() - info.when, source: info.source } : null;
+}
 
 
   const { emitAlert, emitStockUpdate,emitOrderUpdate,emitOrderConfirmed,emitOrderDelivered} = require('../utils/realtime');
@@ -127,14 +145,20 @@ router.post("/", async (req, res) => {
 
     const order = orderResult.rows[0];
 
-    if (items && items.length > 0) {
-      await saveOrderItems(order.id, items);
-    }
+// DEBUG
+dlog("POST /orders created", { id: order.id, order_type, table_number, total });
+touch(order.id, "POST /orders create");
 
-    await client.query("COMMIT");
-    if (typeof emitOrderUpdate === 'function') emitOrderUpdate(io);
+if (items && items.length > 0) {
+  await saveOrderItems(order.id, items);
+  dlog("POST /orders saved items", { id: order.id, count: items.length });
+}
 
-    res.json(order);
+await client.query("COMMIT");
+if (typeof emitOrderUpdate === 'function') emitOrderUpdate(io);
+
+res.json(order);
+
 
   } catch (err) {
     await client.query("ROLLBACK");
@@ -387,11 +411,12 @@ setTimeout(async () => {
 
 emitOrderUpdate(io);
 
+// DEBUG
+touch(id, "PUT /orders/:id/status");
+dlog("PUT /orders/:id/status committed", { id, status, total, payment_method });
 
+res.json(result.rows[0]);
 
-
-
-    res.json(result.rows[0]);
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error updating order status:", err);
