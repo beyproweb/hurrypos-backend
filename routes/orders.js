@@ -91,9 +91,10 @@ router.post("/", async (req, res) => {
     return res.status(403).json({ error: "Register is closed. Cannot place order." });
   }
 
-  const { rows: closeLogs } = await pool.query(`
-    SELECT * FROM cash_register_logs WHERE type = 'close' AND created_at > $1 ORDER BY created_at ASC LIMIT 1
-  `, [lastOpen.created_at]);
+  const { rows: closeLogs } = await pool.query(
+    `SELECT * FROM cash_register_logs WHERE type = 'close' AND created_at > $1 ORDER BY created_at ASC LIMIT 1`,
+    [lastOpen.created_at]
+  );
   const lastClose = closeLogs[0] || null;
 
   if (lastClose) {
@@ -101,25 +102,24 @@ router.post("/", async (req, res) => {
   }
   // --- END REGISTER CHECK ---
 
-  // ...rest of your order creation logic...
   const client = await pool.connect();
   try {
     const {
       table_number,
       total,
       items = [],
-      order_type,          // 'table' or 'phone'
+      order_type,          // 'table' | 'phone' | 'packet' ...
       customer_name,
       customer_phone,
       customer_address,
-      payment_method       // <-- ADDED HERE
+      payment_method
     } = req.body;
-    console.log('ORDER TYPE from payload:', order_type);
+
+    console.log("ORDER TYPE from payload:", order_type);
     await client.query("BEGIN");
 
-    // Insert with all possible fields including payment_method
-    const hasItems = items && items.length > 0;
-    const initialStatus = hasItems ? 'confirmed' : 'occupied'; // was 'closed', now 'occupied'
+    const hasItems = Array.isArray(items) && items.length > 0;
+    const initialStatus = hasItems ? "confirmed" : "occupied";
 
     const orderResult = await client.query(
       `
@@ -141,25 +141,93 @@ router.post("/", async (req, res) => {
         payment_method || null
       ]
     );
-    console.log('ORDER TYPE after insert:', orderResult.rows[0].order_type);
 
     const order = orderResult.rows[0];
 
-// DEBUG
-dlog("POST /orders created", { id: order.id, order_type, table_number, total });
-touch(order.id, "POST /orders create");
+    // DEBUG
+    dlog("POST /orders created", { id: order.id, order_type, table_number, total });
+    touch(order.id, "POST /orders create");
 
-if (items && items.length > 0) {
-  await saveOrderItems(order.id, items);
-  dlog("POST /orders saved items", { id: order.id, count: items.length });
-}
+    if (hasItems) {
+      await saveOrderItems(order.id, items);
+      dlog("POST /orders saved items", { id: order.id, count: items.length });
+    }
 
-await client.query("COMMIT");
-if (typeof emitOrderUpdate === 'function') emitOrderUpdate(io);
+    await client.query("COMMIT");
+    touch(order.id, "POST /orders create+commit");
 
-res.json(order);
+    // Always notify lists
+    if (typeof emitOrderUpdate === "function") emitOrderUpdate(io);
 
+    // 🔥 If the order was created WITH items, emit a full payload for auto‑print
+    if (hasItems) {
+      try {
+        const { rows: orderRows } = await pool.query(
+          `SELECT id, order_number, status, table_number, order_type, total, created_at
+           FROM orders WHERE id = $1`,
+          [order.id]
+        );
 
+        if (orderRows.length) {
+          const { rows: itemRows } = await pool.query(
+            `SELECT
+               oi.product_id,
+               oi.unique_id,
+               oi.name AS order_item_name,
+               p.name  AS product_name,
+               oi.quantity,
+               oi.price,
+               oi.extras,
+               oi.note,
+               oi.kitchen_status,
+               oi.paid_at
+             FROM order_items oi
+             LEFT JOIN products p ON oi.product_id = p.id
+             WHERE oi.order_id = $1
+             ORDER BY oi.id ASC`,
+            [order.id]
+          );
+
+          const payloadItems = itemRows.map((it) => ({
+            ...it,
+            name: it.order_item_name || it.product_name || "Item",
+            extras:
+              typeof it.extras === "string"
+                ? (() => {
+                    try { return JSON.parse(it.extras); } catch { return []; }
+                  })()
+                : (it.extras || []),
+            total: (parseFloat(it.price) || 0) * (it.quantity || 1),
+          }));
+
+          const header = orderRows[0];
+          const payload = {
+            id: header.id,
+            order_number: header.order_number ?? undefined,
+            number: header.order_number ?? undefined,
+            order: {
+              id: header.id,
+              status: header.status,              // likely 'confirmed' here
+              table_number: header.table_number,  // table orders ✅
+              order_type: header.order_type,
+              total: header.total,
+              created_at: header.created_at,
+              items: payloadItems,
+            },
+          };
+
+          io.emit("order_confirmed", payload);
+          console.log(
+            "🖨️ [orders] order_confirmed emitted from POST /orders (created-with-items):",
+            header.id
+          );
+        }
+      } catch (e) {
+        console.error("❌ Failed to emit order_confirmed from POST /orders:", e);
+      }
+    }
+
+    return res.json(order);
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error creating order:", err);
@@ -338,71 +406,74 @@ router.put("/:id/status", async (req, res) => {
       );
     }
 
-    // ✅ single COMMIT
-    await client.query("COMMIT");
+await client.query("COMMIT");
 
-    // 🔥 Emit order_confirmed immediately when confirmed
-    if (status === "confirmed") {
-      const confirmedId = parseInt(id, 10);
-      try {
-        const { rows: orderRows } = await pool.query(
-          `SELECT id, order_number, status, table_number, order_type, total, created_at
-           FROM orders WHERE id = $1`,
-          [confirmedId]
-        );
+if (status === "confirmed") {
+  const confirmedId = parseInt(id, 10);
 
-        if (orderRows.length) {
-          const { rows: itemRows } = await pool.query(
-            `SELECT
-               oi.product_id,
-               oi.unique_id,
-               oi.name AS order_item_name,
-               p.name  AS product_name,
-               oi.quantity,
-               oi.price,
-               oi.extras,
-               oi.note,
-               oi.kitchen_status,
-               oi.paid_at
-             FROM order_items oi
-             LEFT JOIN products p ON oi.product_id = p.id
-             WHERE oi.order_id = $1
-             ORDER BY oi.id ASC`,
-            [confirmedId]
-          );
+  try {
+    // 🔥 Emit full order payload immediately
+    const { rows: orderRows } = await pool.query(
+      `SELECT id, order_number, status, table_number, order_type, total, created_at
+       FROM orders WHERE id = $1`,
+      [confirmedId]
+    );
 
-          const items = itemRows.map((it) => ({
-            ...it,
-            name: it.order_item_name || it.product_name || "Item",
-            extras: typeof it.extras === "string"
-              ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })()
-              : (it.extras || []),
-            total: (parseFloat(it.price) || 0) * (it.quantity || 1),
-          }));
+    if (!orderRows.length) {
+      console.warn(`⚠️ Tried to emit order_confirmed for non-existing order ${confirmedId}`);
+    } else {
+      const { rows: itemRows } = await pool.query(
+        `SELECT
+           oi.product_id,
+           oi.unique_id,
+           oi.name AS order_item_name,
+           p.name  AS product_name,
+           oi.quantity,
+           oi.price,
+           oi.extras,
+           oi.note,
+           oi.kitchen_status,
+           oi.paid_at
+         FROM order_items oi
+         LEFT JOIN products p ON oi.product_id = p.id
+         WHERE oi.order_id = $1
+         ORDER BY oi.id ASC`,
+        [confirmedId]
+      );
 
-          const header = orderRows[0];
-          const payload = {
-            id: header.id,
-            order_number: header.order_number ?? undefined,
-            number: header.order_number ?? undefined,
-            order: {
-              id: header.id,
-              status: header.status,
-              table_number: header.table_number,
-              order_type: header.order_type,
-              total: header.total,
-              created_at: header.created_at,
-              items,
-            },
-          };
+      const items = itemRows.map((it) => ({
+        ...it,
+        name: it.order_item_name || it.product_name || "Item",
+        extras: typeof it.extras === "string"
+          ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })()
+          : (it.extras || []),
+        total: (parseFloat(it.price) || 0) * (it.quantity || 1),
+      }));
 
-          io.emit("order_confirmed", payload);
-          console.log("🖨️ [orders] order_confirmed emitted immediately:", payload.id);
-        }
-      } catch (err) {
-        console.error("❌ Error building full order payload for order_confirmed:", err);
-      }
+      const header = orderRows[0];
+      const payload = {
+        id: header.id,
+        order_number: header.order_number ?? undefined,
+        number: header.order_number ?? undefined,
+        order: {
+          id: header.id,
+          status: header.status,
+          table_number: header.table_number,
+          order_type: header.order_type,
+          total: header.total,
+          created_at: header.created_at,
+          items,
+        },
+      };
+
+      io.emit("order_confirmed", payload);
+      console.log("🖨️ [orders] order_confirmed emitted immediately:", payload.id);
     }
+  } catch (err) {
+    console.error("❌ Error building full order payload for order_confirmed:", err);
+  }
+}
+
 
     emitOrderUpdate(io);
 
