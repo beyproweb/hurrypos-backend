@@ -77,8 +77,14 @@ app.use("/api/notifications", notificationsRoutes);
 const expensesRoutes = require('./routes/expenses');
 app.use('/api', expensesRoutes);
 
-const iyzicoRoutes = require("./routes/iyzico");
-app.use("/api", iyzicoRoutes);
+// Disable Iyzico routes if no API key configured
+if (process.env.IYZI_API_KEY && process.env.IYZI_SECRET) {
+  const iyzicoRoutes = require("./routes/iyzico");
+  app.use("/api", iyzicoRoutes);
+} else {
+  console.log("⚠️ Iyzico not configured – skipping /api/iyzico routes");
+}
+
 
 
 const userSettingsRoutes = require("./routes/userSettings");
