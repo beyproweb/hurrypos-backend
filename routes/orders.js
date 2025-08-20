@@ -995,17 +995,22 @@ router.get("/:orderId/suborders", async (req, res) => {
   }
 });
 
-
-// Get order header
-// Get order header + items (items include a unified `name`)
+// Strongly-consistent GET /:id with short retry window to hide replica/latency lag
 router.get("/:id", async (req, res) => {
-  try {
+  const rawId = req.params.id;
+  const id = Number.isFinite(+rawId) ? +rawId : rawId; // supports numeric PKs
+  // allow client to tune; default ~1.5s, cap at 5s
+  const waitMs = Math.min(parseInt(req.query.wait_ms || "1500", 10) || 1500, 5000);
+  const stepMs = 150;                                // retry step
+  const attempts = Math.max(Math.ceil(waitMs / stepMs), 1);
+
+  const fetchOnce = async () => {
     const { rows: orderRows } = await pool.query(
       `SELECT id, status, table_number, order_type, total, created_at
        FROM orders WHERE id = $1`,
-      [req.params.id]
+      [id]
     );
-    if (!orderRows.length) return res.status(404).json({ error: "Order not found" });
+    if (!orderRows.length) return null;
 
     const { rows: itemRows } = await pool.query(
       `SELECT
@@ -1023,20 +1028,36 @@ router.get("/:id", async (req, res) => {
        LEFT JOIN products p ON oi.product_id = p.id
        WHERE oi.order_id = $1
        ORDER BY oi.id ASC`,
-      [req.params.id]
+      [id]
     );
 
     const items = itemRows.map((it) => ({
       ...it,
-      // unified display name:
       name: it.order_item_name || it.product_name || "Item",
-      // normalize extras:
-      extras: typeof it.extras === "string" ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })() : (it.extras || []),
-      // convenience total for UI:
+      extras:
+        typeof it.extras === "string"
+          ? (() => {
+              try { return JSON.parse(it.extras); } catch { return []; }
+            })()
+          : (it.extras || []),
       total: (parseFloat(it.price) || 0) * (it.quantity || 1),
     }));
 
-    res.json({ ...orderRows[0], items });
+    return { ...orderRows[0], items };
+  };
+
+  try {
+    let order = await fetchOnce();
+    for (let i = 0; !order && i < attempts - 1; i++) {
+      await new Promise((r) => setTimeout(r, stepMs));
+      order = await fetchOnce();
+    }
+    if (!order) {
+      // last-chance debug to see what's happening in prod
+      console.warn(`GET /api/orders/${id} still not visible after ${attempts} attempts / ${attempts * stepMs}ms`);
+      return res.status(404).json({ error: "Order not found" });
+    }
+    res.json(order);
   } catch (e) {
     console.error("GET /orders/:id failed", e);
     res.status(500).json({ error: "Failed to fetch order" });
