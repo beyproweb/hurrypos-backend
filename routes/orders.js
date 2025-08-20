@@ -9,6 +9,7 @@ const { performance } = require("perf_hooks");
 const dlog = (...args) =>
   console.log(new Date().toISOString(), "[orders]", ...args);
 
+
 // Track the last write/update time per order id to spot read-after-write timing
 const ORDER_TOUCH = new Map(); // id:number -> { when:number(ms), source:string }
 function touch(id, source) {
@@ -27,6 +28,58 @@ function since(id) {
   const { emitAlert, emitStockUpdate,emitOrderUpdate,emitOrderConfirmed,emitOrderDelivered} = require('../utils/realtime');
 
 
+// ---- Shared payload builder for printer (no order_number) ----
+async function buildFullOrderPayload(orderId) {
+  const { rows: orderRows } = await pool.query(
+    `SELECT id, status, table_number, order_type, total, created_at
+     FROM orders WHERE id = $1`,
+    [orderId]
+  );
+  if (!orderRows.length) throw new Error(`Order ${orderId} not found`);
+
+  const { rows: itemRows } = await pool.query(
+    `SELECT
+       oi.product_id,
+       oi.unique_id,
+       oi.name AS order_item_name,
+       p.name  AS product_name,
+       oi.quantity,
+       oi.price,
+       oi.extras,
+       oi.note,
+       oi.kitchen_status,
+       oi.paid_at
+     FROM order_items oi
+     LEFT JOIN products p ON oi.product_id = p.id
+     WHERE oi.order_id = $1
+     ORDER BY oi.id ASC`,
+    [orderId]
+  );
+
+  const items = itemRows.map((it) => ({
+    ...it,
+    name: it.order_item_name || it.product_name || "Item",
+    extras:
+      typeof it.extras === "string"
+        ? (() => { try { return JSON.parse(it.extras); } catch { return []; } })()
+        : (it.extras || []),
+    total: (parseFloat(it.price) || 0) * (it.quantity || 1),
+  }));
+
+  const header = orderRows[0];
+  return {
+    id: header.id,
+    order: {
+      id: header.id,
+      status: header.status,
+      table_number: header.table_number,
+      order_type: header.order_type,
+      total: header.total,
+      created_at: header.created_at,
+      items,
+    },
+  };
+}
 
 
 // GET /orders - Returns all active orders or filters by table_number if provided
@@ -580,62 +633,13 @@ router.post("/order-items", async (req, res) => {
 
 // If posting items caused a closed/occupied order to become confirmed, emit full payload for printing
 try {
-  const { rows: ord } = await pool.query(
-    `SELECT id, status, order_number, table_number, order_type, total, created_at
-     FROM orders WHERE id = $1`,
-    [order_id]
-  );
-  const header = ord[0];
-  if (header && header.status === "confirmed") {
-    const { rows: itemRows } = await pool.query(
-      `SELECT
-         oi.product_id,
-         oi.unique_id,
-         oi.name AS order_item_name,
-         p.name  AS product_name,
-         oi.quantity,
-         oi.price,
-         oi.extras,
-         oi.note,
-         oi.kitchen_status,
-         oi.paid_at
-       FROM order_items oi
-       LEFT JOIN products p ON oi.product_id = p.id
-       WHERE oi.order_id = $1
-       ORDER BY oi.id ASC`,
-      [order_id]
-    );
-
-    const items = itemRows.map((it) => ({
-      ...it,
-      name: it.order_item_name || it.product_name || "Item",
-      extras: typeof it.extras === "string"
-        ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })()
-        : (it.extras || []),
-      total: (parseFloat(it.price) || 0) * (it.quantity || 1),
-    }));
-
-    const payload = {
-      id: header.id,
-      order_number: header.order_number ?? undefined,
-      number: header.order_number ?? undefined,
-      order: {
-        id: header.id,
-        status: header.status,
-        table_number: header.table_number,
-        order_type: header.order_type,
-        total: header.total,
-        created_at: header.created_at,
-        items,
-      },
-    };
-
-    io.emit("order_confirmed", payload);
-    console.log("🖨️ [orders] order_confirmed emitted from /order-items:", payload.id);
-  }
+  const payload = await buildFullOrderPayload(order_id);
+  io.emit("order_confirmed", payload);
+  console.log("🖨️ [orders] order_confirmed emitted from /order-items:", payload.id);
 } catch (e) {
   console.error("❌ Failed to emit order_confirmed after /order-items:", e);
 }
+
 
 res.json({ message: "Order items saved successfully" });
 
@@ -1624,63 +1628,12 @@ console.log("✅ confirm-online route loaded");
 
 const ioRef = req.app.get("io");
 try {
-  const { rows: orderRows } = await pool.query(
-    `SELECT id, order_number, status, table_number, order_type, total, created_at
-     FROM orders WHERE id = $1`,
-    [id]
-  );
-  if (!orderRows.length) {
-    console.warn(`⚠️ Tried to emit order_confirmed for non-existing order ${id}`);
-  } else {
-    const { rows: itemRows } = await pool.query(
-      `SELECT
-         oi.product_id,
-         oi.unique_id,
-         oi.name AS order_item_name,
-         p.name  AS product_name,
-         oi.quantity,
-         oi.price,
-         oi.extras,
-         oi.note,
-         oi.kitchen_status,
-         oi.paid_at
-       FROM order_items oi
-       LEFT JOIN products p ON oi.product_id = p.id
-       WHERE oi.order_id = $1
-       ORDER BY oi.id ASC`,
-      [id]
-    );
-
-    const items = itemRows.map((it) => ({
-      ...it,
-      name: it.order_item_name || it.product_name || "Item",
-      extras: typeof it.extras === "string"
-        ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })()
-        : (it.extras || []),
-      total: (parseFloat(it.price) || 0) * (it.quantity || 1),
-    }));
-
-    const header = orderRows[0];
-    const payload = {
-      id: header.id,
-      order_number: header.order_number ?? undefined,
-      number: header.order_number ?? undefined,
-      order: {
-        id: header.id,
-        status: header.status,
-        table_number: header.table_number,
-        order_type: header.order_type,
-        total: header.total,
-        created_at: header.created_at,
-        items,
-      },
-    };
-
-    ioRef.emit("order_confirmed", payload);
-  }
+  const payload = await buildFullOrderPayload(id);
+  ioRef.emit("order_confirmed", payload);
 } catch (e) {
   console.error("❌ Failed to build full order payload for order_confirmed:", e);
 }
+
 emitOrderUpdate(ioRef);
 
 
