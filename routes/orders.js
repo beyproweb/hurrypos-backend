@@ -318,9 +318,9 @@ await client.query("COMMIT");
 
 if (status === "confirmed") {
   const confirmedId = parseInt(id, 10);
-  setTimeout(async () => {
+setTimeout(async () => {
   try {
-    // Fetch order header
+    // 1) Fetch order header
     const { rows: orderRows } = await pool.query(
       `SELECT id, order_number, status, table_number, order_type, total, created_at
        FROM orders WHERE id = $1`,
@@ -331,7 +331,7 @@ if (status === "confirmed") {
       return;
     }
 
-    // Fetch items (same shape as GET /:id)
+    // 2) Fetch items (same shape as GET /:id)
     const { rows: itemRows } = await pool.query(
       `SELECT
          oi.product_id,
@@ -362,10 +362,10 @@ if (status === "confirmed") {
 
     const header = orderRows[0];
     const payload = {
-      id: header.id,
-      order_number: header.order_number ?? undefined,
+      id: header.id,                                     // internal PK
+      order_number: header.order_number ?? undefined,    // public number (if any)
       number: header.order_number ?? undefined,
-      order: {
+      order: {                                           // fully hydrated for printing
         id: header.id,
         status: header.status,
         table_number: header.table_number,
@@ -381,6 +381,7 @@ if (status === "confirmed") {
     console.error("❌ Error building full order payload for order_confirmed:", err);
   }
 }, 1200);
+
 
 }
 
@@ -1524,7 +1525,6 @@ console.log("✅ confirm-online route loaded");
 
 const ioRef = req.app.get("io");
 try {
-  // Fetch order header
   const { rows: orderRows } = await pool.query(
     `SELECT id, order_number, status, table_number, order_type, total, created_at
      FROM orders WHERE id = $1`,
@@ -1533,7 +1533,6 @@ try {
   if (!orderRows.length) {
     console.warn(`⚠️ Tried to emit order_confirmed for non-existing order ${id}`);
   } else {
-    // Fetch items (same shape as GET /:id)
     const { rows: itemRows } = await pool.query(
       `SELECT
          oi.product_id,
@@ -1584,6 +1583,7 @@ try {
   console.error("❌ Failed to build full order payload for order_confirmed:", e);
 }
 emitOrderUpdate(ioRef);
+
 
 
 
