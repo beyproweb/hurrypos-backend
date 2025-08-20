@@ -1020,36 +1020,43 @@ router.get("/:orderId/suborders", async (req, res) => {
   }
 });
 
-// Strongly-consistent GET /:id with short retry window to hide replica/latency lag
-// Strongly-instrumented GET /:id
-router.get("/:id", async (req, res) => {
-  const t0 = performance.now();
-  const rawId = req.params.id;
-  const numericId = Number.isFinite(+rawId) ? +rawId : null;
+// 🔎 Unified resolver: GET /api/orders/:raw  (accepts internal id OR public order_number)
+router.get("/:raw", async (req, res) => {
+  const raw = String(req.params.raw || "").trim();
+  console.log(`🧪 [orders] GET /api/orders/${raw} — resolver start`);
 
-  // Optional wait window via query string (helps read-after-write on some hosts)
-  const waitMs = Math.min(parseInt(req.query.wait_ms || "0", 10) || 0, 5000);
-  const stepMs = 150;
-  const attempts = Math.max(Math.ceil(waitMs / stepMs), 1);
+  try {
+    // 1) Try as internal numeric id
+    let internalId = Number.isFinite(+raw) ? +raw : null;
+    if (internalId) {
+      const test = await pool.query(`SELECT id FROM orders WHERE id = $1`, [internalId]);
+      if (!test.rows.length) {
+        console.log(`🧪 [orders] not found by id=${internalId}, trying order_number=${raw}`);
+        internalId = null;
+      } else {
+        console.log(`🧪 [orders] matched by id=${internalId}`);
+      }
+    }
 
-  const lastWrite = since(rawId);
-  dlog("GET /api/orders/:id START", {
-    rawId,
-    numericId,
-    waitMs,
-    attempts,
-    lastWriteMs: lastWrite?.ms,
-    lastWriteSource: lastWrite?.source,
-  });
+    // 2) If not found by id, try mapping by public order_number
+    if (!internalId) {
+      const map = await pool.query(`SELECT id FROM orders WHERE order_number = $1 LIMIT 1`, [raw]);
+      if (!map.rows.length) {
+        console.warn(`⚠️ [orders] not found by id or order_number for '${raw}'`);
+        return res.status(404).json({ error: "Order not found", raw });
+      }
+      internalId = map.rows[0].id;
+      console.log(`🧪 [orders] resolved order_number=${raw} -> id=${internalId}`);
+    }
 
-  async function fetchByInternalId(id) {
+    // 3) Fetch header
     const { rows: orderRows } = await pool.query(
       `SELECT id, status, table_number, order_type, total, created_at
        FROM orders WHERE id = $1`,
-      [id]
+      [internalId]
     );
-    if (!orderRows.length) return null;
 
+    // 4) Fetch items
     const { rows: itemRows } = await pool.query(
       `SELECT
          oi.product_id,
@@ -1066,7 +1073,7 @@ router.get("/:id", async (req, res) => {
        LEFT JOIN products p ON oi.product_id = p.id
        WHERE oi.order_id = $1
        ORDER BY oi.id ASC`,
-      [id]
+      [internalId]
     );
 
     const items = itemRows.map((it) => ({
@@ -1074,66 +1081,21 @@ router.get("/:id", async (req, res) => {
       name: it.order_item_name || it.product_name || "Item",
       extras:
         typeof it.extras === "string"
-          ? (() => { try { return JSON.parse(it.extras); } catch { return []; } })()
+          ? (() => {
+              try { return JSON.parse(it.extras); } catch { return []; }
+            })()
           : (it.extras || []),
       total: (parseFloat(it.price) || 0) * (it.quantity || 1),
     }));
 
-    return { ...orderRows[0], items };
-  }
-
-  try {
-    // 1) Try the given param as internal ID (with optional tiny retries)
-    let order = null;
-    if (numericId != null) {
-      for (let i = 0; i < attempts; i++) {
-        order = await fetchByInternalId(numericId);
-        if (order) {
-          dlog("GET /api/orders/:id OK by internal id", { id: numericId, attempt: i + 1 });
-          const dt = (performance.now() - t0).toFixed(1);
-          dlog("GET /api/orders/:id END", { id: numericId, ms: dt });
-          return res.json(order);
-        }
-        if (i < attempts - 1) await new Promise((r) => setTimeout(r, stepMs));
-      }
-    }
-
-    // 2) Not found by id => see if rawId actually matches a public order_number
-    //    This handles a class of bugs where clients pass order_number to /:id.
-    const { rows: byNum } = await pool.query(
-      `SELECT id FROM orders WHERE order_number::text = $1 LIMIT 1`,
-      [String(rawId)]
-    );
-    if (byNum.length) {
-      const internalId = byNum[0].id;
-      dlog("GET /api/orders/:id resolved via order_number", { rawId, internalId });
-
-      const order2 = await fetchByInternalId(internalId);
-      if (order2) {
-        const dt = (performance.now() - t0).toFixed(1);
-        dlog("GET /api/orders/:id END via order_number", { rawId, internalId, ms: dt });
-        return res.json(order2);
-      }
-    }
-
-    // 3) Still not found — log final state and 404
-    const dt = (performance.now() - t0).toFixed(1);
-    dlog("GET /api/orders/:id NOT FOUND", {
-      rawId,
-      triedNumeric: numericId != null,
-      attempts,
-      waitedMs: attempts * stepMs,
-      lastWriteMs: lastWrite?.ms,
-      lastWriteSource: lastWrite?.source,
-    });
-    return res.status(404).json({ error: "Order not found" });
+    console.log(`✅ [orders] resolver success id=${internalId} items=${items.length}`);
+    return res.json({ ...orderRows[0], items });
   } catch (e) {
-    const dt = (performance.now() - t0).toFixed(1);
-    console.error("GET /orders/:id failed", e);
-    dlog("GET /api/orders/:id ERROR", { rawId, ms: dt });
+    console.error("🔥 [orders] resolver failed", e);
     return res.status(500).json({ error: "Failed to fetch order" });
   }
 });
+
 
 // ✅ PATCH /orders/:id/reopen
 router.patch("/:id/reopen", async (req, res) => {
