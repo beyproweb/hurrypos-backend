@@ -1021,15 +1021,28 @@ router.get("/:orderId/suborders", async (req, res) => {
 });
 
 // Strongly-consistent GET /:id with short retry window to hide replica/latency lag
+// Strongly-instrumented GET /:id
 router.get("/:id", async (req, res) => {
+  const t0 = performance.now();
   const rawId = req.params.id;
-  const id = Number.isFinite(+rawId) ? +rawId : rawId; // supports numeric PKs
-  // allow client to tune; default ~1.5s, cap at 5s
-  const waitMs = Math.min(parseInt(req.query.wait_ms || "1500", 10) || 1500, 5000);
-  const stepMs = 150;                                // retry step
+  const numericId = Number.isFinite(+rawId) ? +rawId : null;
+
+  // Optional wait window via query string (helps read-after-write on some hosts)
+  const waitMs = Math.min(parseInt(req.query.wait_ms || "0", 10) || 0, 5000);
+  const stepMs = 150;
   const attempts = Math.max(Math.ceil(waitMs / stepMs), 1);
 
-  const fetchOnce = async () => {
+  const lastWrite = since(rawId);
+  dlog("GET /api/orders/:id START", {
+    rawId,
+    numericId,
+    waitMs,
+    attempts,
+    lastWriteMs: lastWrite?.ms,
+    lastWriteSource: lastWrite?.source,
+  });
+
+  async function fetchByInternalId(id) {
     const { rows: orderRows } = await pool.query(
       `SELECT id, status, table_number, order_type, total, created_at
        FROM orders WHERE id = $1`,
@@ -1061,34 +1074,66 @@ router.get("/:id", async (req, res) => {
       name: it.order_item_name || it.product_name || "Item",
       extras:
         typeof it.extras === "string"
-          ? (() => {
-              try { return JSON.parse(it.extras); } catch { return []; }
-            })()
+          ? (() => { try { return JSON.parse(it.extras); } catch { return []; } })()
           : (it.extras || []),
       total: (parseFloat(it.price) || 0) * (it.quantity || 1),
     }));
 
     return { ...orderRows[0], items };
-  };
+  }
 
   try {
-    let order = await fetchOnce();
-    for (let i = 0; !order && i < attempts - 1; i++) {
-      await new Promise((r) => setTimeout(r, stepMs));
-      order = await fetchOnce();
+    // 1) Try the given param as internal ID (with optional tiny retries)
+    let order = null;
+    if (numericId != null) {
+      for (let i = 0; i < attempts; i++) {
+        order = await fetchByInternalId(numericId);
+        if (order) {
+          dlog("GET /api/orders/:id OK by internal id", { id: numericId, attempt: i + 1 });
+          const dt = (performance.now() - t0).toFixed(1);
+          dlog("GET /api/orders/:id END", { id: numericId, ms: dt });
+          return res.json(order);
+        }
+        if (i < attempts - 1) await new Promise((r) => setTimeout(r, stepMs));
+      }
     }
-    if (!order) {
-      // last-chance debug to see what's happening in prod
-      console.warn(`GET /api/orders/${id} still not visible after ${attempts} attempts / ${attempts * stepMs}ms`);
-      return res.status(404).json({ error: "Order not found" });
+
+    // 2) Not found by id => see if rawId actually matches a public order_number
+    //    This handles a class of bugs where clients pass order_number to /:id.
+    const { rows: byNum } = await pool.query(
+      `SELECT id FROM orders WHERE order_number::text = $1 LIMIT 1`,
+      [String(rawId)]
+    );
+    if (byNum.length) {
+      const internalId = byNum[0].id;
+      dlog("GET /api/orders/:id resolved via order_number", { rawId, internalId });
+
+      const order2 = await fetchByInternalId(internalId);
+      if (order2) {
+        const dt = (performance.now() - t0).toFixed(1);
+        dlog("GET /api/orders/:id END via order_number", { rawId, internalId, ms: dt });
+        return res.json(order2);
+      }
     }
-    res.json(order);
+
+    // 3) Still not found — log final state and 404
+    const dt = (performance.now() - t0).toFixed(1);
+    dlog("GET /api/orders/:id NOT FOUND", {
+      rawId,
+      triedNumeric: numericId != null,
+      attempts,
+      waitedMs: attempts * stepMs,
+      lastWriteMs: lastWrite?.ms,
+      lastWriteSource: lastWrite?.source,
+    });
+    return res.status(404).json({ error: "Order not found" });
   } catch (e) {
+    const dt = (performance.now() - t0).toFixed(1);
     console.error("GET /orders/:id failed", e);
-    res.status(500).json({ error: "Failed to fetch order" });
+    dlog("GET /api/orders/:id ERROR", { rawId, ms: dt });
+    return res.status(500).json({ error: "Failed to fetch order" });
   }
 });
-
 
 // ✅ PATCH /orders/:id/reopen
 router.patch("/:id/reopen", async (req, res) => {
