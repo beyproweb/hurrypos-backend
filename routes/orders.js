@@ -216,7 +216,7 @@ router.post("/", async (req, res) => {
     if (hasItems) {
       try {
         const { rows: orderRows } = await pool.query(
-          `SELECT id, order_number, status, table_number, order_type, total, created_at
+          `SELECT id, status, table_number, order_type, total, created_at
            FROM orders WHERE id = $1`,
           [order.id]
         );
@@ -357,72 +357,6 @@ router.put("/:id/pay", async (req, res) => {
   }
 });
 
-// ADD THIS BLOCK in /orders.js (right after your existing GET routes)
-// ✅ FIXED: fetch full order by public order_number, using pool + same shape as GET /:id
-router.get('/by-number/:orderNumber', async (req, res) => {
-  try {
-    const { orderNumber } = req.params;
-
-    // 1) Find internal id by order_number (⚠️ change column name if yours differs)
-    const { rows: idRows } = await pool.query(
-      `SELECT id FROM orders WHERE order_number = $1 LIMIT 1`,
-      [orderNumber]
-    );
-    if (!idRows.length) {
-      return res.status(404).json({ error: 'Order not found by order_number', orderNumber });
-    }
-    const internalId = idRows[0].id;
-
-    // 2) Fetch header (same fields as GET /:id)
-    const { rows: orderRows } = await pool.query(
-      `SELECT id, status, table_number, order_type, total, created_at
-       FROM orders WHERE id = $1`,
-      [internalId]
-    );
-    if (!orderRows.length) {
-      return res.status(404).json({ error: "Order not found (after mapping order_number)" });
-    }
-
-    // 3) Fetch items (same query as GET /:id)
-    const { rows: itemRows } = await pool.query(
-      `SELECT
-         oi.product_id,
-         oi.unique_id,
-         oi.name AS order_item_name,
-         p.name  AS product_name,
-         oi.quantity,
-         oi.price,
-         oi.extras,
-         oi.note,
-         oi.kitchen_status,
-         oi.paid_at
-       FROM order_items oi
-       LEFT JOIN products p ON oi.product_id = p.id
-       WHERE oi.order_id = $1
-       ORDER BY oi.id ASC`,
-      [internalId]
-    );
-
-    const items = itemRows.map((it) => ({
-      ...it,
-      name: it.order_item_name || it.product_name || "Item",
-    }));
-
-    res.json({
-      id: orderRows[0].id,
-      status: orderRows[0].status,
-      table_number: orderRows[0].table_number,
-      order_type: orderRows[0].order_type,
-      total: orderRows[0].total,
-      created_at: orderRows[0].created_at,
-      items,
-    });
-  } catch (err) {
-    console.error('GET /orders/by-number error:', err);
-    return res.status(500).json({ error: 'Internal error fetching order by number' });
-  }
-});
-
 
 
 // ✅ PUT /orders/:id/status
@@ -467,7 +401,7 @@ if (status === "confirmed") {
   try {
     // 🔥 Emit full order payload immediately
     const { rows: orderRows } = await pool.query(
-      `SELECT id, order_number, status, table_number, order_type, total, created_at
+      `SELECT id, status, table_number, order_type, total, created_at
        FROM orders WHERE id = $1`,
       [confirmedId]
     );
@@ -1667,34 +1601,16 @@ router.get('/:id/payment-changes', async (req, res) => {
   }
 });
 
-// 🔎 Unified resolver: GET /api/orders/:raw  (accepts internal id OR public order_number)
 router.get("/:raw", async (req, res) => {
   const raw = String(req.params.raw || "").trim();
   console.log(`🧪 [orders] GET /api/orders/${raw} — resolver start`);
 
   try {
-    // 1) Try as internal numeric id
-    let internalId = Number.isFinite(+raw) ? +raw : null;
-    if (internalId) {
-      const test = await pool.query(`SELECT id FROM orders WHERE id = $1`, [internalId]);
-      if (!test.rows.length) {
-        console.log(`🧪 [orders] not found by id=${internalId}, trying order_number=${raw}`);
-        internalId = null;
-      } else {
-        console.log(`🧪 [orders] matched by id=${internalId}`);
-      }
+    // Only allow numeric ID now (order_number column removed/not used)
+    if (!/^\d+$/.test(raw)) {
+      return res.status(400).json({ error: "Order id must be numeric", raw });
     }
-
-    // 2) If not found by id, try mapping by public order_number
-    if (!internalId) {
-      const map = await pool.query(`SELECT id FROM orders WHERE order_number = $1 LIMIT 1`, [raw]);
-      if (!map.rows.length) {
-        console.warn(`⚠️ [orders] not found by id or order_number for '${raw}'`);
-        return res.status(404).json({ error: "Order not found", raw });
-      }
-      internalId = map.rows[0].id;
-      console.log(`🧪 [orders] resolved order_number=${raw} -> id=${internalId}`);
-    }
+    const internalId = parseInt(raw, 10);
 
     // 3) Fetch header
     const { rows: orderRows } = await pool.query(
@@ -1702,6 +1618,9 @@ router.get("/:raw", async (req, res) => {
        FROM orders WHERE id = $1`,
       [internalId]
     );
+    if (!orderRows.length) {
+      return res.status(404).json({ error: "Order not found", id: internalId });
+    }
 
     // 4) Fetch items
     const { rows: itemRows } = await pool.query(
@@ -1742,6 +1661,7 @@ router.get("/:raw", async (req, res) => {
     return res.status(500).json({ error: "Failed to fetch order" });
   }
 });
+
 
 return router;
 };
