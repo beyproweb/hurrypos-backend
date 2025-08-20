@@ -94,6 +94,10 @@ app.use("/api/user-settings", userSettingsRoutes);
 const printerRoutes = require('./routes/printer');
 app.use('/api/printer-settings', printerRoutes);
 
+// ▶▶ LAN thermal printer (raw ESC/POS over TCP 9100)
+const lanPrinters = require('./routes/lan-printers');
+app.use('/api/lan-printers', lanPrinters);
+
 
 const subscriptionRoutes = require('./routes/subscription');
 app.use('/api', subscriptionRoutes);
