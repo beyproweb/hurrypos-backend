@@ -303,6 +303,7 @@ router.get('/by-number/:orderNumber', async (req, res) => {
 });
 
 
+
 // ✅ PUT /orders/:id/status
 router.put("/:id/status", async (req, res) => {
   const { id } = req.params;
@@ -337,135 +338,79 @@ router.put("/:id/status", async (req, res) => {
       );
     }
 
-// ✅ single COMMIT, then emit after a short delay to avoid race with read replicas / cold starts
-await client.query("COMMIT");
+    // ✅ single COMMIT
+    await client.query("COMMIT");
 
-if (status === "confirmed") {
-  const confirmedId = parseInt(id, 10);
+    // 🔥 Emit order_confirmed immediately when confirmed
+    if (status === "confirmed") {
+      const confirmedId = parseInt(id, 10);
+      try {
+        const { rows: orderRows } = await pool.query(
+          `SELECT id, order_number, status, table_number, order_type, total, created_at
+           FROM orders WHERE id = $1`,
+          [confirmedId]
+        );
 
-  try {
-    // 🔥 Emit full order payload immediately
-    const { rows: orderRows } = await pool.query(
-      `SELECT id, order_number, status, table_number, order_type, total, created_at
-       FROM orders WHERE id = $1`,
-      [confirmedId]
-    );
-    if (orderRows.length) {
-      const { rows: itemRows } = await pool.query(
-        `SELECT
-           oi.product_id,
-           oi.unique_id,
-           oi.name AS order_item_name,
-           p.name  AS product_name,
-           oi.quantity,
-           oi.price,
-           oi.extras,
-           oi.note,
-           oi.kitchen_status,
-           oi.paid_at
-         FROM order_items oi
-         LEFT JOIN products p ON oi.product_id = p.id
-         WHERE oi.order_id = $1
-         ORDER BY oi.id ASC`,
-        [confirmedId]
-      );
+        if (orderRows.length) {
+          const { rows: itemRows } = await pool.query(
+            `SELECT
+               oi.product_id,
+               oi.unique_id,
+               oi.name AS order_item_name,
+               p.name  AS product_name,
+               oi.quantity,
+               oi.price,
+               oi.extras,
+               oi.note,
+               oi.kitchen_status,
+               oi.paid_at
+             FROM order_items oi
+             LEFT JOIN products p ON oi.product_id = p.id
+             WHERE oi.order_id = $1
+             ORDER BY oi.id ASC`,
+            [confirmedId]
+          );
 
-      const items = itemRows.map((it) => ({
-        ...it,
-        name: it.order_item_name || it.product_name || "Item",
-        extras: typeof it.extras === "string"
-          ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })()
-          : (it.extras || []),
-        total: (parseFloat(it.price) || 0) * (it.quantity || 1),
-      }));
+          const items = itemRows.map((it) => ({
+            ...it,
+            name: it.order_item_name || it.product_name || "Item",
+            extras: typeof it.extras === "string"
+              ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })()
+              : (it.extras || []),
+            total: (parseFloat(it.price) || 0) * (it.quantity || 1),
+          }));
 
-      const header = orderRows[0];
-      const payload = {
-        id: header.id,
-        order_number: header.order_number ?? undefined,
-        number: header.order_number ?? undefined,
-        order: {
-          id: header.id,
-          status: header.status,
-          table_number: header.table_number,
-          order_type: header.order_type,
-          total: header.total,
-          created_at: header.created_at,
-          items,
-        },
-      };
+          const header = orderRows[0];
+          const payload = {
+            id: header.id,
+            order_number: header.order_number ?? undefined,
+            number: header.order_number ?? undefined,
+            order: {
+              id: header.id,
+              status: header.status,
+              table_number: header.table_number,
+              order_type: header.order_type,
+              total: header.total,
+              created_at: header.created_at,
+              items,
+            },
+          };
 
-      io.emit("order_confirmed", payload);
-      console.log("🖨️ [orders] order_confirmed emitted immediately:", payload.id);
+          io.emit("order_confirmed", payload);
+          console.log("🖨️ [orders] order_confirmed emitted immediately:", payload.id);
+        }
+      } catch (err) {
+        console.error("❌ Error building full order payload for order_confirmed:", err);
+      }
     }
-  } catch (err) {
-    console.error("❌ Error building full order payload for order_confirmed:", err);
-  }
-}
 
+    emitOrderUpdate(io);
 
-    // 2) Fetch items (same shape as GET /:id)
-    const { rows: itemRows } = await pool.query(
-      `SELECT
-         oi.product_id,
-         oi.unique_id,
-         oi.name AS order_item_name,
-         p.name  AS product_name,
-         oi.quantity,
-         oi.price,
-         oi.extras,
-         oi.note,
-         oi.kitchen_status,
-         oi.paid_at
-       FROM order_items oi
-       LEFT JOIN products p ON oi.product_id = p.id
-       WHERE oi.order_id = $1
-       ORDER BY oi.id ASC`,
-      [confirmedId]
-    );
+    // DEBUG
+    touch(id, "PUT /orders/:id/status");
+    dlog("PUT /orders/:id/status committed", { id, status, total, payment_method });
 
-    const items = itemRows.map((it) => ({
-      ...it,
-      name: it.order_item_name || it.product_name || "Item",
-      extras: typeof it.extras === "string"
-        ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })()
-        : (it.extras || []),
-      total: (parseFloat(it.price) || 0) * (it.quantity || 1),
-    }));
-
-    const header = orderRows[0];
-    const payload = {
-      id: header.id,                                     // internal PK
-      order_number: header.order_number ?? undefined,    // public number (if any)
-      number: header.order_number ?? undefined,
-      order: {                                           // fully hydrated for printing
-        id: header.id,
-        status: header.status,
-        table_number: header.table_number,
-        order_type: header.order_type,
-        total: header.total,
-        created_at: header.created_at,
-        items,
-      },
-    };
-
-    io.emit("order_confirmed", payload);
-  } catch (err) {
-    console.error("❌ Error building full order payload for order_confirmed:", err);
-  }
-}, 1200);
-
-
-}
-
-emitOrderUpdate(io);
-
-// DEBUG
-touch(id, "PUT /orders/:id/status");
-dlog("PUT /orders/:id/status committed", { id, status, total, payment_method });
-
-res.json(result.rows[0]);
-
+    res.json(result.rows[0]);
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error updating order status:", err);
@@ -476,11 +421,6 @@ res.json(result.rows[0]);
 });
 
 
-
-
-// In orders.js after your other routes
-
-// GET /api/driver-report?driver_id=1&date=YYYY-MM-DD
 // GET /api/driver-report?driver_id=1&date=YYYY-MM-DD
 router.get("/driver-report", async (req, res) => {
   const { driver_id, date } = req.query;
@@ -565,8 +505,69 @@ router.post("/order-items", async (req, res) => {
   await pool.query("UPDATE orders SET status = 'confirmed' WHERE id = $1", [order_id]);
 }
 
-    emitOrderUpdate(io); // <-- ADD THIS
-    res.json({ message: "Order items saved successfully" });
+    emitOrderUpdate(io);
+
+// If posting items caused a closed/occupied order to become confirmed, emit full payload for printing
+try {
+  const { rows: ord } = await pool.query(
+    `SELECT id, status, order_number, table_number, order_type, total, created_at
+     FROM orders WHERE id = $1`,
+    [order_id]
+  );
+  const header = ord[0];
+  if (header && header.status === "confirmed") {
+    const { rows: itemRows } = await pool.query(
+      `SELECT
+         oi.product_id,
+         oi.unique_id,
+         oi.name AS order_item_name,
+         p.name  AS product_name,
+         oi.quantity,
+         oi.price,
+         oi.extras,
+         oi.note,
+         oi.kitchen_status,
+         oi.paid_at
+       FROM order_items oi
+       LEFT JOIN products p ON oi.product_id = p.id
+       WHERE oi.order_id = $1
+       ORDER BY oi.id ASC`,
+      [order_id]
+    );
+
+    const items = itemRows.map((it) => ({
+      ...it,
+      name: it.order_item_name || it.product_name || "Item",
+      extras: typeof it.extras === "string"
+        ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })()
+        : (it.extras || []),
+      total: (parseFloat(it.price) || 0) * (it.quantity || 1),
+    }));
+
+    const payload = {
+      id: header.id,
+      order_number: header.order_number ?? undefined,
+      number: header.order_number ?? undefined,
+      order: {
+        id: header.id,
+        status: header.status,
+        table_number: header.table_number,
+        order_type: header.order_type,
+        total: header.total,
+        created_at: header.created_at,
+        items,
+      },
+    };
+
+    io.emit("order_confirmed", payload);
+    console.log("🖨️ [orders] order_confirmed emitted from /order-items:", payload.id);
+  }
+} catch (e) {
+  console.error("❌ Failed to emit order_confirmed after /order-items:", e);
+}
+
+res.json({ message: "Order items saved successfully" });
+
   } catch (err) {
     console.error("❌ Error saving order items:", err);
     res.status(500).json({ error: "Failed to save order items" });
@@ -1069,81 +1070,6 @@ router.get("/:orderId/suborders", async (req, res) => {
   }
 });
 
-// 🔎 Unified resolver: GET /api/orders/:raw  (accepts internal id OR public order_number)
-router.get("/:raw", async (req, res) => {
-  const raw = String(req.params.raw || "").trim();
-  console.log(`🧪 [orders] GET /api/orders/${raw} — resolver start`);
-
-  try {
-    // 1) Try as internal numeric id
-    let internalId = Number.isFinite(+raw) ? +raw : null;
-    if (internalId) {
-      const test = await pool.query(`SELECT id FROM orders WHERE id = $1`, [internalId]);
-      if (!test.rows.length) {
-        console.log(`🧪 [orders] not found by id=${internalId}, trying order_number=${raw}`);
-        internalId = null;
-      } else {
-        console.log(`🧪 [orders] matched by id=${internalId}`);
-      }
-    }
-
-    // 2) If not found by id, try mapping by public order_number
-    if (!internalId) {
-      const map = await pool.query(`SELECT id FROM orders WHERE order_number = $1 LIMIT 1`, [raw]);
-      if (!map.rows.length) {
-        console.warn(`⚠️ [orders] not found by id or order_number for '${raw}'`);
-        return res.status(404).json({ error: "Order not found", raw });
-      }
-      internalId = map.rows[0].id;
-      console.log(`🧪 [orders] resolved order_number=${raw} -> id=${internalId}`);
-    }
-
-    // 3) Fetch header
-    const { rows: orderRows } = await pool.query(
-      `SELECT id, status, table_number, order_type, total, created_at
-       FROM orders WHERE id = $1`,
-      [internalId]
-    );
-
-    // 4) Fetch items
-    const { rows: itemRows } = await pool.query(
-      `SELECT
-         oi.product_id,
-         oi.unique_id,
-         oi.name AS order_item_name,
-         p.name  AS product_name,
-         oi.quantity,
-         oi.price,
-         oi.extras,
-         oi.note,
-         oi.kitchen_status,
-         oi.paid_at
-       FROM order_items oi
-       LEFT JOIN products p ON oi.product_id = p.id
-       WHERE oi.order_id = $1
-       ORDER BY oi.id ASC`,
-      [internalId]
-    );
-
-    const items = itemRows.map((it) => ({
-      ...it,
-      name: it.order_item_name || it.product_name || "Item",
-      extras:
-        typeof it.extras === "string"
-          ? (() => {
-              try { return JSON.parse(it.extras); } catch { return []; }
-            })()
-          : (it.extras || []),
-      total: (parseFloat(it.price) || 0) * (it.quantity || 1),
-    }));
-
-    console.log(`✅ [orders] resolver success id=${internalId} items=${items.length}`);
-    return res.json({ ...orderRows[0], items });
-  } catch (e) {
-    console.error("🔥 [orders] resolver failed", e);
-    return res.status(500).json({ error: "Failed to fetch order" });
-  }
-});
 
 
 // ✅ PATCH /orders/:id/reopen
@@ -1714,6 +1640,82 @@ router.get('/:id/payment-changes', async (req, res) => {
   } catch (err) {
     console.error('❌ Error fetching payment method changes:', err);
     res.status(500).json({ error: 'Failed to fetch payment method changes' });
+  }
+});
+
+// 🔎 Unified resolver: GET /api/orders/:raw  (accepts internal id OR public order_number)
+router.get("/:raw", async (req, res) => {
+  const raw = String(req.params.raw || "").trim();
+  console.log(`🧪 [orders] GET /api/orders/${raw} — resolver start`);
+
+  try {
+    // 1) Try as internal numeric id
+    let internalId = Number.isFinite(+raw) ? +raw : null;
+    if (internalId) {
+      const test = await pool.query(`SELECT id FROM orders WHERE id = $1`, [internalId]);
+      if (!test.rows.length) {
+        console.log(`🧪 [orders] not found by id=${internalId}, trying order_number=${raw}`);
+        internalId = null;
+      } else {
+        console.log(`🧪 [orders] matched by id=${internalId}`);
+      }
+    }
+
+    // 2) If not found by id, try mapping by public order_number
+    if (!internalId) {
+      const map = await pool.query(`SELECT id FROM orders WHERE order_number = $1 LIMIT 1`, [raw]);
+      if (!map.rows.length) {
+        console.warn(`⚠️ [orders] not found by id or order_number for '${raw}'`);
+        return res.status(404).json({ error: "Order not found", raw });
+      }
+      internalId = map.rows[0].id;
+      console.log(`🧪 [orders] resolved order_number=${raw} -> id=${internalId}`);
+    }
+
+    // 3) Fetch header
+    const { rows: orderRows } = await pool.query(
+      `SELECT id, status, table_number, order_type, total, created_at
+       FROM orders WHERE id = $1`,
+      [internalId]
+    );
+
+    // 4) Fetch items
+    const { rows: itemRows } = await pool.query(
+      `SELECT
+         oi.product_id,
+         oi.unique_id,
+         oi.name AS order_item_name,
+         p.name  AS product_name,
+         oi.quantity,
+         oi.price,
+         oi.extras,
+         oi.note,
+         oi.kitchen_status,
+         oi.paid_at
+       FROM order_items oi
+       LEFT JOIN products p ON oi.product_id = p.id
+       WHERE oi.order_id = $1
+       ORDER BY oi.id ASC`,
+      [internalId]
+    );
+
+    const items = itemRows.map((it) => ({
+      ...it,
+      name: it.order_item_name || it.product_name || "Item",
+      extras:
+        typeof it.extras === "string"
+          ? (() => {
+              try { return JSON.parse(it.extras); } catch { return []; }
+            })()
+          : (it.extras || []),
+      total: (parseFloat(it.price) || 0) * (it.quantity || 1),
+    }));
+
+    console.log(`✅ [orders] resolver success id=${internalId} items=${items.length}`);
+    return res.json({ ...orderRows[0], items });
+  } catch (e) {
+    console.error("🔥 [orders] resolver failed", e);
+    return res.status(500).json({ error: "Failed to fetch order" });
   }
 });
 
