@@ -25,7 +25,9 @@ app.set("io", io);
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY; // Store your key securely!
 const { sendEmail } = require("./utils/notifications"); // make sure this import exists
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
+// Serve downloadable Beypro Bridge binaries
 
+app.use("/bridge", express.static(path.join(__dirname, "public", "bridge")));
 
 
 const taskRoutes = require("./routes/tasks");
@@ -192,3 +194,5 @@ http.listen(PORT, "0.0.0.0", () => {
 
 
 module.exports = { app, pool };
+
+app.use('/bridge', express.static(path.join(__dirname, 'public', 'bridge')));

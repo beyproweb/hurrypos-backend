@@ -1,0 +1,17 @@
+{
+  "name": "beypro-bridge",
+  "version": "1.0.0",
+  "description": "Beypro local print bridge",
+  "bin": "local-print-bridge.js",
+  "type": "commonjs",
+  "scripts": {
+  "build": "npx pkg local-print-bridge.js --targets node18-macos-x64 --out-path dist"
+},
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}
