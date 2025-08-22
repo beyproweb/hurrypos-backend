@@ -6,3 +6,5 @@ node_modules
 uploads
 public/uploads
 .wwebjs_auth
+bridge/dist/
+tmp_bridge_*
