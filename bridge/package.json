@@ -5,8 +5,16 @@
   "bin": "local-print-bridge.js",
   "type": "commonjs",
   "scripts": {
-  "build": "npx pkg local-print-bridge.js --targets node18-macos-x64 --out-path dist"
-},
+    "build:win":   "npx pkg local-print-bridge.js --targets node18-win-x64   --output dist/beypro-bridge-win-x64.exe",
+    "build:mac":   "npx pkg local-print-bridge.js --targets node18-macos-x64 --output dist/beypro-bridge-macos-x64",
+    "build:linux": "npx pkg local-print-bridge.js --targets node18-linux-x64 --output dist/beypro-bridge-linux-x64",
+    "build:all":   "npm run build:win && npm run build:mac && npm run build:linux",
+
+    "pack:win":   "mkdir -p public/bridge && (cd dist && zip -9 ../public/bridge/beypro-bridge-win-x64.zip beypro-bridge-win-x64.exe ../installers/windows/install-beyprobridge.ps1)",
+    "pack:mac":   "mkdir -p public/bridge && (cd dist && zip -9 ../public/bridge/beypro-bridge-mac.zip beypro-bridge-macos-x64 ../installers/macos/install-beyprobridge.sh)",
+    "pack:linux": "mkdir -p public/bridge && (cd dist && tar -czf ../public/bridge/beypro-bridge-linux-x64.tar.gz beypro-bridge-linux-x64 ../installers/linux/install-beyprobridge.sh)",
+    "pack:all":   "npm run pack:win && npm run pack:mac && npm run pack:linux"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2"
