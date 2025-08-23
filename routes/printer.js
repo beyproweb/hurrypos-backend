@@ -2,12 +2,13 @@
 const express = require("express");
 const router = express.Router();
 
-// Try to load DB pool, but don't crash if it's unavailable
+// Robust JSON parsing for this router
+router.use(express.json({ limit: "256kb" }));
+
+// Try to load DB pool, but work without it too
 let pool = null;
-try {
-  pool = require("../db");
-} catch (e) {
-  console.warn("printer.js: DB module not available, will use file fallback. Reason:", e?.message || e);
+try { pool = require("../db"); } catch (e) {
+  console.warn("printer.js: DB module not available; will use file fallback. Reason:", e?.message || e);
 }
 
 const fs = require("fs");
@@ -15,7 +16,7 @@ const path = require("path");
 const DATA_DIR = path.join(__dirname, "..", "data");
 const DATA_FILE = path.join(DATA_DIR, "printer_settings.json");
 
-// === Keep in sync with src/pages/PrinterTab.jsx ===
+// ---- DEFAULTS (keep in sync with frontend) ----
 const DEFAULT_LAYOUT = {
   shopAddress: "",
   receiptWidth: "80mm",
@@ -39,10 +40,7 @@ function mergeWithDefaults(saved) {
   if (!Array.isArray(merged.extras)) merged.extras = [];
   merged.extras = merged.extras
     .filter(e => e && typeof e === "object")
-    .map(e => ({
-      label: String(e.label || ""),
-      value: String(e.value || ""),
-    }));
+    .map(e => ({ label: String(e.label || ""), value: String(e.value || "") }));
   merged.fontSize = Number(merged.fontSize) || DEFAULT_LAYOUT.fontSize;
   merged.lineHeight = Number(merged.lineHeight) || DEFAULT_LAYOUT.lineHeight;
   if (!["left","center","right"].includes(merged.alignment)) merged.alignment = "left";
@@ -50,34 +48,26 @@ function mergeWithDefaults(saved) {
   return merged;
 }
 
-// ---------- File fallback helpers ----------
+// ---------- File fallback ----------
 function ensureDataFile() {
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({}, null, 2));
-  } catch (e) {
-    console.warn("printer.js: ensureDataFile failed:", e?.message || e);
-  }
+  } catch (e) { console.warn("ensureDataFile failed:", e?.message || e); }
 }
 function readFileStore() {
   try {
     ensureDataFile();
     const raw = fs.readFileSync(DATA_FILE, "utf8");
     return JSON.parse(raw || "{}");
-  } catch (e) {
-    console.warn("printer.js: readFileStore failed:", e?.message || e);
-    return {};
-  }
+  } catch (e) { console.warn("readFileStore failed:", e?.message || e); return {}; }
 }
 function writeFileStore(obj) {
   try {
     ensureDataFile();
     fs.writeFileSync(DATA_FILE, JSON.stringify(obj || {}, null, 2));
     return true;
-  } catch (e) {
-    console.warn("printer.js: writeFileStore failed:", e?.message || e);
-    return false;
-  }
+  } catch (e) { console.warn("writeFileStore failed:", e?.message || e); return false; }
 }
 
 // ---------- DB helpers ----------
@@ -92,126 +82,73 @@ async function ensureTable() {
   `);
 }
 
-// ---------- Routes ----------
+// Unified handlers (work with or without shopId)
+async function handleGet(req, res, shopId) {
+  const key = shopId || "default";
 
-/**
- * GET /api/printer-settings/:shopId
- * Always returns 200 with a valid layout.
- * Source: "db" | "file" | "default"
- */
-router.get("/:shopId", async (req, res) => {
-  const { shopId } = req.params;
-
-  // Try DB first
+  // Try DB
   if (pool) {
     try {
       await ensureTable();
-      const { rows } = await pool.query(
-        "SELECT layout FROM printer_settings WHERE shop_id = $1",
-        [shopId]
-      );
-      if (rows.length) {
-        const merged = mergeWithDefaults(rows[0].layout);
-        return res.json({ layout: merged, source: "db" });
-      }
-      // If not in DB, try file
+      const { rows } = await pool.query("SELECT layout FROM printer_settings WHERE shop_id = $1", [key]);
+      if (rows.length) return res.json({ layout: mergeWithDefaults(rows[0].layout), source: "db" });
+      // fall back to file
       const store = readFileStore();
-      if (store[shopId]) {
-        return res.json({ layout: mergeWithDefaults(store[shopId]), source: "file" });
-      }
-      // Default
+      if (store[key]) return res.json({ layout: mergeWithDefaults(store[key]), source: "file" });
       return res.json({ layout: DEFAULT_LAYOUT, source: "default" });
-    } catch (err) {
-      console.error("GET /printer-settings DB error:", err?.message || err);
-      // Fall through to file/default
+    } catch (e) {
+      console.error("GET printer-settings DB error:", e?.message || e);
     }
   }
 
   // File fallback
   const store = readFileStore();
-  if (store[shopId]) {
-    return res.json({ layout: mergeWithDefaults(store[shopId]), source: "file" });
-  }
+  if (store[key]) return res.json({ layout: mergeWithDefaults(store[key]), source: "file" });
   return res.json({ layout: DEFAULT_LAYOUT, source: "default" });
-});
+}
 
-/**
- * PUT /api/printer-settings/:shopId
- * Body: { layout: { ... } }
- * Upserts into DB, falls back to file if DB fails/unavailable.
- */
-router.put("/:shopId", async (req, res) => {
-  const { shopId } = req.params;
+async function handlePut(req, res, shopId) {
+  const key = shopId || "default";
   const incoming = req.body?.layout;
-
   if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
     return res.status(400).json({ error: "layout object is required" });
   }
-
   const cleaned = mergeWithDefaults(incoming);
-
-  // Try DB first
-  if (pool) {
-    try {
-      await ensureTable();
-      await pool.query(
-        `
-        INSERT INTO printer_settings (shop_id, layout, updated_at)
-        VALUES ($1, $2, NOW())
-        ON CONFLICT (shop_id)
-        DO UPDATE SET layout = EXCLUDED.layout, updated_at = NOW()
-        `,
-        [shopId, cleaned]
-      );
-      return res.json({ ok: true, layout: cleaned, target: "db" });
-    } catch (err) {
-      console.error("PUT /printer-settings DB error:", err?.message || err);
-      // Fall through to file
-    }
-  }
-
-  // File fallback
-  const store = readFileStore();
-  store[shopId] = cleaned;
-  const ok = writeFileStore(store);
-  if (!ok) {
-    return res.status(500).json({ error: "Failed to save printer settings (file fallback)" });
-  }
-  return res.json({ ok: true, layout: cleaned, target: "file" });
-});
-
-/**
- * Optional quick reset endpoint
- * POST /api/printer-settings/:shopId/reset
- */
-router.post("/:shopId/reset", async (req, res) => {
-  const { shopId } = req.params;
 
   // Try DB
   if (pool) {
     try {
       await ensureTable();
       await pool.query(
-        `
-        INSERT INTO printer_settings (shop_id, layout, updated_at)
-        VALUES ($1, $2, NOW())
-        ON CONFLICT (shop_id)
-        DO UPDATE SET layout = EXCLUDED.layout, updated_at = NOW()
-        `,
-        [shopId, DEFAULT_LAYOUT]
+        `INSERT INTO printer_settings (shop_id, layout, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (shop_id) DO UPDATE SET layout = EXCLUDED.layout, updated_at = NOW()`,
+        [key, cleaned]
       );
-      return res.json({ ok: true, layout: DEFAULT_LAYOUT, target: "db" });
+      return res.json({ ok: true, layout: cleaned, target: "db" });
     } catch (e) {
-      console.error("POST /printer-settings reset DB error:", e?.message || e);
+      console.error("PUT printer-settings DB error:", e?.message || e);
     }
   }
 
   // File fallback
   const store = readFileStore();
-  store[shopId] = DEFAULT_LAYOUT;
+  store[key] = cleaned;
   const ok = writeFileStore(store);
-  if (!ok) return res.status(500).json({ error: "Reset failed (file fallback)" });
-  return res.json({ ok: true, layout: DEFAULT_LAYOUT, target: "file" });
-});
+  if (!ok) return res.status(500).json({ error: "Failed to save printer settings (file fallback)" });
+  return res.json({ ok: true, layout: cleaned, target: "file" });
+}
+
+// ---- Routes without shopId (your frontend will use these) ----
+router.get("/", (req, res) => { handleGet(req, res, null); });
+router.put("/", (req, res) => { handlePut(req, res, null); });
+
+// ---- Also support routes WITH shopId (backwards compatible) ----
+router.get("/:shopId", (req, res) => { handleGet(req, res, req.params.shopId); });
+router.put("/:shopId", (req, res) => { handlePut(req, res, req.params.shopId); });
+
+// Optional: reset to defaults
+router.post("/:shopId/reset", async (req, res) => handlePut({ ...req, body: { layout: DEFAULT_LAYOUT } }, res, req.params.shopId));
+router.post("/reset", async (req, res) => handlePut({ ...req, body: { layout: DEFAULT_LAYOUT } }, res, null));
 
 module.exports = router;
