@@ -1,9 +1,9 @@
 // routes/printer.js
 const express = require("express");
 const router = express.Router();
-const pool = require("../db"); // adjust path if your db file lives elsewhere
+const pool = require("../db"); // adjust if your db module lives elsewhere
 
-// Keep this in sync with src/pages/PrinterTab.jsx
+// IMPORTANT: keep this in sync with src/pages/PrinterTab.jsx defaultLayout
 const DEFAULT_LAYOUT = {
   shopAddress: "",
   receiptWidth: "80mm",
@@ -22,54 +22,70 @@ const DEFAULT_LAYOUT = {
   extras: [],
 };
 
-// Ensure table exists
+// Create table if it doesn't exist (PostgreSQL)
 async function ensureTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS printer_settings (
-      shop_id   TEXT PRIMARY KEY,
-      layout    JSONB NOT NULL,
+      shop_id    TEXT PRIMARY KEY,
+      layout     JSONB NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
 }
-ensureTable().catch(err => console.error("printer_settings ensureTable error:", err));
+
+// Merge helper: fill missing/new keys with backend defaults
+function mergeWithDefaults(saved) {
+  const merged = { ...DEFAULT_LAYOUT, ...(saved || {}) };
+  if (!Array.isArray(merged.extras)) merged.extras = [];
+  merged.extras = merged.extras
+    .filter(e => e && typeof e === "object")
+    .map(e => ({
+      label: String(e.label || ""),
+      value: String(e.value || ""),
+    }));
+  // coerce some numeric fields
+  merged.fontSize = Number(merged.fontSize) || DEFAULT_LAYOUT.fontSize;
+  merged.lineHeight = Number(merged.lineHeight) || DEFAULT_LAYOUT.lineHeight;
+  return merged;
+}
 
 /**
  * GET /api/printer-settings/:shopId
- * Returns saved layout or DEFAULT_LAYOUT if not found.
- * If found, merges with DEFAULT_LAYOUT to include any newly added keys.
+ * Returns saved layout; if not found (or on DB error) returns DEFAULT_LAYOUT.
+ * Always 200 so the frontend doesn't break.
  */
 router.get("/:shopId", async (req, res) => {
   const { shopId } = req.params;
   try {
+    await ensureTable();
+
     const { rows } = await pool.query(
       "SELECT layout FROM printer_settings WHERE shop_id = $1",
       [shopId]
     );
 
     if (!rows.length) {
-      return res.json({
-        layout: DEFAULT_LAYOUT,
-        source: "default",
-      });
+      // nothing saved yet
+      return res.json({ layout: DEFAULT_LAYOUT, source: "default" });
     }
 
-    // Merge to ensure newly added fields have defaults
-    const merged = { ...DEFAULT_LAYOUT, ...(rows[0].layout || {}) };
-    return res.json({
-      layout: merged,
-      source: "db",
-    });
+    const merged = mergeWithDefaults(rows[0].layout);
+    return res.json({ layout: merged, source: "db" });
   } catch (err) {
-    console.error("GET /printer-settings error:", err);
-    return res.status(500).json({ error: "Failed to load printer settings" });
+    console.error("GET /api/printer-settings error:", err?.message || err);
+    // Fallback to defaults to avoid 500 in UI
+    return res.json({
+      layout: DEFAULT_LAYOUT,
+      source: "default-db-error",
+      warning: "DB unavailable; using defaults",
+    });
   }
 });
 
 /**
  * PUT /api/printer-settings/:shopId
  * Body: { layout: { ... } }
- * Saves (UPSERT) sanitized layout.
+ * Upserts the layout. Returns sanitized+merged payload.
  */
 router.put("/:shopId", async (req, res) => {
   const { shopId } = req.params;
@@ -79,17 +95,11 @@ router.put("/:shopId", async (req, res) => {
     return res.status(400).json({ error: "layout object is required" });
   }
 
-  // Sanitize and fill defaults
-  const cleaned = { ...DEFAULT_LAYOUT, ...incoming };
-  if (!Array.isArray(cleaned.extras)) cleaned.extras = [];
-  cleaned.extras = cleaned.extras
-    .filter(e => e && typeof e === "object")
-    .map(e => ({
-      label: String(e.label || ""),
-      value: String(e.value || ""),
-    }));
-
   try {
+    await ensureTable();
+
+    const cleaned = mergeWithDefaults(incoming);
+
     await pool.query(
       `
       INSERT INTO printer_settings (shop_id, layout, updated_at)
@@ -102,7 +112,7 @@ router.put("/:shopId", async (req, res) => {
 
     return res.json({ ok: true, layout: cleaned });
   } catch (err) {
-    console.error("PUT /printer-settings error:", err);
+    console.error("PUT /api/printer-settings error:", err?.message || err);
     return res.status(500).json({ error: "Failed to save printer settings" });
   }
 });
