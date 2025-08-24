@@ -5,16 +5,23 @@ const router = express.Router();
 // Robust JSON parsing for this router
 router.use(express.json({ limit: "256kb" }));
 
-// Try to load DB pool, but work without it too
+// ✅ Correctly import pool from ../db
 let pool = null;
-try { pool = require("../db"); } catch (e) {
-  console.warn("printer.js: DB module not available; will use file fallback. Reason:", e?.message || e);
+try {
+  // Your db.js exports { pool }, so destructure it:
+  ({ pool } = require("../db"));
+} catch (e) {
+  console.warn(
+    "printer.js: DB module not available; will use file fallback. Reason:",
+    e?.message || e
+  );
 }
 
 const fs = require("fs");
 const path = require("path");
 const DATA_DIR = path.join(__dirname, "..", "data");
 const DATA_FILE = path.join(DATA_DIR, "printer_settings.json");
+
 
 // ---- DEFAULTS (keep in sync with frontend) ----
 const DEFAULT_LAYOUT = {

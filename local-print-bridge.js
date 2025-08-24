@@ -7,6 +7,24 @@ const os = require("os");
 const app = express();
 app.use(cors()); // allow browser fetch from POS
 app.use(express.json());
+// Allow Private Network Access (HTTPS site -> http://127.0.0.1 requests)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Private-Network", "true"); // Chrome PNA
+  // Optional: widen CORS if you want to be explicit
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  next();
+});
+
+// Handle preflight quickly
+app.options("*", (req, res) => {
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.sendStatus(204);
+});
 
 const DEFAULT_PORT = 7777;
 
