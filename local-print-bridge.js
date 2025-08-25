@@ -7,10 +7,10 @@ const os = require("os");
 const app = express();
 app.use(cors()); // allow browser fetch from POS
 app.use(express.json());
+
 // Allow Private Network Access (HTTPS site -> http://127.0.0.1 requests)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Private-Network", "true"); // Chrome PNA
-  // Optional: widen CORS if you want to be explicit
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -26,7 +26,12 @@ app.options("*", (req, res) => {
   res.sendStatus(204);
 });
 
-const DEFAULT_PORT = 7777;
+const DEFAULT_HTTP_PORT = 7777;
+// Common printer service ports:
+// 9100..9102  -> JetDirect RAW (ESC/POS & many LAN printers)
+// 515        -> LPD
+// 631        -> IPP
+const DEFAULT_DISCOVER_PORTS = [9100, 9101, 9102, 515, 631];
 
 // --- helpers ---
 function getLocalBase() {
@@ -57,7 +62,7 @@ function tryConnect(host, port = 9100, timeoutMs = 600) {
     socket.setTimeout(timeoutMs, () => finish(false, "timeout"));
     socket.once("error", (e) => finish(false, String(e.code || e.message || e)));
     socket.connect(port, host, () => {
-      // If we can connect, assume JetDirect RAW is present
+      // If we can connect, assume the port is open
       finish(true);
     });
   });
@@ -66,6 +71,7 @@ function tryConnect(host, port = 9100, timeoutMs = 600) {
 // --- endpoints ---
 app.get("/ping", (_req, res) => res.json({ ok: true, bridge: "beypro", ts: Date.now() }));
 
+// Print raw ESC/POS (or text) to a host:port
 app.post("/print-raw", async (req, res) => {
   try {
     const { host, port = 9100, content, timeoutMs = 15000 } = req.body || {};
@@ -104,33 +110,86 @@ app.post("/print-raw", async (req, res) => {
   }
 });
 
-// NEW: discover printers on LAN by scanning base.X from start..end for port 9100
+/**
+ * Probe a single host across multiple ports.
+ * GET /probe?host=192.168.123.100&ports=9100,515,631&timeoutMs=800
+ * -> { ok:true, host, open:[{port}], closed:[{port, error}] }
+ */
+app.get("/probe", async (req, res) => {
+  try {
+    const host = (req.query.host || "").trim();
+    if (!host) return res.status(400).json({ error: "host is required" });
+    const timeoutMs = Math.min(5000, Number(req.query.timeoutMs) || 800);
+    const ports = String(req.query.ports || "")
+      .split(",")
+      .map(s => Number(s.trim()))
+      .filter(n => Number.isFinite(n) && n > 0);
+    const portList = ports.length ? ports : DEFAULT_DISCOVER_PORTS;
+
+    const checks = await Promise.all(portList.map(p => tryConnect(host, p, timeoutMs)));
+    const open = checks.filter(r => r.ok).map(r => ({ port: r.port }));
+    const closed = checks.filter(r => !r.ok).map(r => ({ port: r.port, error: r.error }));
+    res.json({ ok: true, host, open, closed });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/**
+ * Discover printers on LAN by scanning base.X from start..end across MULTIPLE ports.
+ * Example:
+ *   /discover?base=192.168.123&start=1&end=254&ports=9100,9101,515,631&timeoutMs=600&concurrency=64
+ * Response:
+ *   { ok:true, base, ports:[...], results:[ {host, ports:[9100,515]} ] }
+ */
 app.get("/discover", async (req, res) => {
-  const port = Number(req.query.port) || 9100;
-  const base = (req.query.base || getLocalBase()).trim();    // e.g. "192.168.1"
+  const base = (req.query.base || getLocalBase()).trim(); // e.g. "192.168.123"
   const start = Math.max(1, Number(req.query.start) || 1);
   const end = Math.min(254, Number(req.query.end) || 254);
   const timeoutMs = Math.min(5000, Number(req.query.timeoutMs) || 600);
-  const concurrency = Math.min(64, Number(req.query.concurrency) || 48);
+  const concurrency = Math.min(128, Number(req.query.concurrency) || 48);
+
+  // Parse ports list (comma-separated); fallback to defaults
+  const portsParsed = String(req.query.ports || "")
+    .split(",")
+    .map(s => Number(s.trim()))
+    .filter(n => Number.isFinite(n) && n > 0);
+  const portList = portsParsed.length ? portsParsed : DEFAULT_DISCOVER_PORTS;
 
   const hosts = [];
   for (let i = start; i <= end; i++) hosts.push(`${base}.${i}`);
 
-  const results = [];
+  // Queue of (host, port) pairs to test
+  const tasks = [];
+  for (const h of hosts) {
+    for (const p of portList) tasks.push({ host: h, port: p });
+  }
+
+  const byHost = new Map();
   let idx = 0;
+
   async function worker() {
-    while (idx < hosts.length) {
+    while (idx < tasks.length) {
       const i = idx++;
-      const host = hosts[i];
+      const { host, port } = tasks[i];
       const r = await tryConnect(host, port, timeoutMs);
-      if (r.ok) results.push({ host, port });
+      if (r.ok) {
+        if (!byHost.has(host)) byHost.set(host, new Set());
+        byHost.get(host).add(port);
+      }
     }
   }
+
   await Promise.all(Array.from({ length: concurrency }, worker));
-  results.sort((a, b) => a.host.localeCompare(b.host));
-  res.json({ ok: true, base, port, results });
+
+  // Build results array sorted by IP
+  const results = Array.from(byHost.entries())
+    .map(([host, portsSet]) => ({ host, ports: Array.from(portsSet).sort((a, b) => a - b) }))
+    .sort((a, b) => a.host.localeCompare(b.host));
+
+  res.json({ ok: true, base, ports: portList, results });
 });
 
-app.listen(DEFAULT_PORT, () => {
-  console.log(`Beypro Bridge listening on http://127.0.0.1:${DEFAULT_PORT}`);
+app.listen(DEFAULT_HTTP_PORT, () => {
+  console.log(`Beypro Bridge listening on http://127.0.0.1:${DEFAULT_HTTP_PORT}`);
 });
