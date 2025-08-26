@@ -5,19 +5,18 @@ const net = require("net");
 const os = require("os");
 
 const app = express();
-app.use(cors()); // allow browser fetch from POS
+app.use(cors());
 app.use(express.json());
 
 // Allow Private Network Access (HTTPS site -> http://127.0.0.1 requests)
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Private-Network", "true"); // Chrome PNA
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   next();
 });
 
-// Handle preflight quickly
 app.options("*", (req, res) => {
   res.setHeader("Access-Control-Allow-Private-Network", "true");
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -27,24 +26,36 @@ app.options("*", (req, res) => {
 });
 
 const DEFAULT_HTTP_PORT = 7777;
-// Common printer service ports:
-// 9100..9102  -> JetDirect RAW (ESC/POS & many LAN printers)
-// 515        -> LPD
-// 631        -> IPP
+// Common printer service ports
 const DEFAULT_DISCOVER_PORTS = [9100, 9101, 9102, 515, 631];
 
-// --- helpers ---
-function getLocalBase() {
+/* ----------------------------- Net Helpers ----------------------------- */
+
+function listIPv4Interfaces() {
+  const out = [];
   const ifaces = os.networkInterfaces();
   for (const name of Object.keys(ifaces)) {
-    for (const iface of ifaces[name]) {
-      if (iface.family === "IPv4" && !iface.internal) {
-        const parts = iface.address.split(".");
-        if (parts.length === 4) return parts.slice(0, 3).join(".");
+    for (const i of ifaces[name] || []) {
+      if (i && i.family === "IPv4" && !i.internal) {
+        const octets = i.address.split(".");
+        if (octets.length === 4) {
+          out.push({
+            name,
+            address: i.address,
+            netmask: i.netmask,
+            base: `${octets[0]}.${octets[1]}.${octets[2]}`, // assume /24 for scan speed
+          });
+        }
       }
     }
   }
-  return "192.168.1";
+  return out;
+}
+
+// Heuristic "primary" = first active IPv4
+function getPrimaryIPv4() {
+  const list = listIPv4Interfaces();
+  return list[0] || null;
 }
 
 function tryConnect(host, port = 9100, timeoutMs = 600) {
@@ -61,15 +72,18 @@ function tryConnect(host, port = 9100, timeoutMs = 600) {
 
     socket.setTimeout(timeoutMs, () => finish(false, "timeout"));
     socket.once("error", (e) => finish(false, String(e.code || e.message || e)));
-    socket.connect(port, host, () => {
-      // If we can connect, assume the port is open
-      finish(true);
-    });
+    socket.connect(port, host, () => finish(true));
   });
 }
 
-// --- endpoints ---
-app.get("/ping", (_req, res) => res.json({ ok: true, bridge: "beypro", ts: Date.now() }));
+/* ------------------------------ Endpoints ------------------------------ */
+
+app.get("/ping", (_req, res) => res.json({
+  ok: true,
+  bridge: "beypro",
+  ts: Date.now(),
+  interfaces: listIPv4Interfaces()
+}));
 
 // Print raw ESC/POS (or text) to a host:port
 app.post("/print-raw", async (req, res) => {
@@ -111,9 +125,8 @@ app.post("/print-raw", async (req, res) => {
 });
 
 /**
- * Probe a single host across multiple ports.
- * GET /probe?host=192.168.123.100&ports=9100,515,631&timeoutMs=800
- * -> { ok:true, host, open:[{port}], closed:[{port, error}] }
+ * Probe one host across multiple ports.
+ * GET /probe?host=192.168.1.50&ports=9100,515,631&timeoutMs=800
  */
 app.get("/probe", async (req, res) => {
   try {
@@ -121,73 +134,109 @@ app.get("/probe", async (req, res) => {
     if (!host) return res.status(400).json({ error: "host is required" });
     const timeoutMs = Math.min(5000, Number(req.query.timeoutMs) || 800);
     const ports = String(req.query.ports || "")
-      .split(",")
-      .map(s => Number(s.trim()))
+      .split(",").map(s => Number(s.trim()))
       .filter(n => Number.isFinite(n) && n > 0);
     const portList = ports.length ? ports : DEFAULT_DISCOVER_PORTS;
 
     const checks = await Promise.all(portList.map(p => tryConnect(host, p, timeoutMs)));
     const open = checks.filter(r => r.ok).map(r => ({ port: r.port }));
     const closed = checks.filter(r => !r.ok).map(r => ({ port: r.port, error: r.error }));
-    res.json({ ok: true, host, open, closed });
+    const primary = getPrimaryIPv4();
+    const primaryBase = primary?.base || null;
+    const hostBase = host.split(".").slice(0,3).join(".");
+    const sameSubnet = primaryBase ? (hostBase === primaryBase) : null;
+
+    res.json({ ok: true, host, open, closed, sameSubnet, primaryBase });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 /**
- * Discover printers on LAN by scanning base.X from start..end across MULTIPLE ports.
- * Example:
- *   /discover?base=192.168.123&start=1&end=254&ports=9100,9101,515,631&timeoutMs=600&concurrency=64
+ * Discover printers:
+ * - By default scans ONLY the primary interface's /24 (fast, customer-friendly)
+ * - If all=1 is provided, scans ALL local IPv4 /24 subnets
+ *
+ * GET /discover
+ * GET /discover?all=1
+ *  Optional: &ports=9100,9101,515,631&timeoutMs=600&concurrency=64
+ *
  * Response:
- *   { ok:true, base, ports:[...], results:[ {host, ports:[9100,515]} ] }
+ * {
+ *   ok: true,
+ *   primaryBase: "192.168.1",
+ *   networks: [{name, address, base}],
+ *   results: [
+ *     { host, ports:[9100], base:"192.168.1", sameSubnet:true }
+ *   ],
+ *   subnetMismatch: true|false  // true if found hosts but none on primaryBase
+ * }
  */
 app.get("/discover", async (req, res) => {
-  const base = (req.query.base || getLocalBase()).trim(); // e.g. "192.168.123"
-  const start = Math.max(1, Number(req.query.start) || 1);
-  const end = Math.min(254, Number(req.query.end) || 254);
   const timeoutMs = Math.min(5000, Number(req.query.timeoutMs) || 600);
   const concurrency = Math.min(128, Number(req.query.concurrency) || 48);
 
-  // Parse ports list (comma-separated); fallback to defaults
+  // Ports
   const portsParsed = String(req.query.ports || "")
-    .split(",")
-    .map(s => Number(s.trim()))
+    .split(",").map(s => Number(s.trim()))
     .filter(n => Number.isFinite(n) && n > 0);
   const portList = portsParsed.length ? portsParsed : DEFAULT_DISCOVER_PORTS;
 
-  const hosts = [];
-  for (let i = start; i <= end; i++) hosts.push(`${base}.${i}`);
+  // Interfaces
+  const allIfs = listIPv4Interfaces();
+  const primary = getPrimaryIPv4();
+  const primaryBase = primary?.base || null;
 
-  // Queue of (host, port) pairs to test
+  // Decide which bases to scan
+  const scanAll = String(req.query.all || "0") === "1";
+  const bases = scanAll
+    ? Array.from(new Set(allIfs.map(x => x.base)))
+    : (primaryBase ? [primaryBase] : []);
+
+  // Build tasks: (host, port, base)
   const tasks = [];
-  for (const h of hosts) {
-    for (const p of portList) tasks.push({ host: h, port: p });
+  for (const base of bases) {
+    for (let i = 1; i <= 254; i++) {
+      const host = `${base}.${i}`;
+      for (const p of portList) tasks.push({ host, port: p, base });
+    }
   }
 
   const byHost = new Map();
   let idx = 0;
-
   async function worker() {
     while (idx < tasks.length) {
       const i = idx++;
-      const { host, port } = tasks[i];
+      const { host, port, base } = tasks[i];
       const r = await tryConnect(host, port, timeoutMs);
       if (r.ok) {
-        if (!byHost.has(host)) byHost.set(host, new Set());
-        byHost.get(host).add(port);
+        const entry = byHost.get(host) || { host, ports: new Set(), base };
+        entry.ports.add(port);
+        byHost.set(host, entry);
       }
     }
   }
 
   await Promise.all(Array.from({ length: concurrency }, worker));
 
-  // Build results array sorted by IP
-  const results = Array.from(byHost.entries())
-    .map(([host, portsSet]) => ({ host, ports: Array.from(portsSet).sort((a, b) => a - b) }))
+  const results = Array.from(byHost.values())
+    .map(({ host, ports, base }) => ({
+      host,
+      ports: Array.from(ports).sort((a,b) => a - b),
+      base,
+      sameSubnet: primaryBase ? (base === primaryBase) : null
+    }))
     .sort((a, b) => a.host.localeCompare(b.host));
 
-  res.json({ ok: true, base, ports: portList, results });
+  const subnetMismatch = results.length > 0 && results.every(r => r.sameSubnet === false);
+
+  res.json({
+    ok: true,
+    primaryBase,
+    networks: allIfs.map(({ name, address, base }) => ({ name, address, base })),
+    results,
+    subnetMismatch
+  });
 });
 
 app.listen(DEFAULT_HTTP_PORT, () => {
