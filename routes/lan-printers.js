@@ -66,4 +66,40 @@ router.post("/print-raw", async (req, res) => {
   }
 });
 
+// --- Pretty test receipt (ESC/POS) ---
+router.post("/print-test", async (req, res) => {
+  try {
+    const { host, port = 9100, title = "Beypro Test" } = req.body || {};
+    if (!host) return res.status(400).json({ error: "host is required" });
+
+    // ESC/POS helpers
+    const ESC = Buffer.from([0x1b]);
+    const GS  = Buffer.from([0x1d]);
+
+    const init   = Buffer.from([0x1b, 0x40]);              // ESC @
+    const center = Buffer.from([0x1b, 0x61, 0x01]);         // ESC a 1 (center)
+    const normal = Buffer.from([0x1b, 0x21, 0x00]);         // font normal
+    const bold   = Buffer.from([0x1b, 0x45, 0x01]);         // bold on
+    const boldOff= Buffer.from([0x1b, 0x45, 0x00]);         // bold off
+    const lf     = Buffer.from("\n");
+    const cut    = Buffer.concat([GS, Buffer.from("V"), Buffer.from([66, 3])]); // partial cut
+
+    const lines = Buffer.concat([
+      init,
+      center,
+      bold, Buffer.from(String(title).toUpperCase(), "utf8"), boldOff, lf, lf,
+      normal, Buffer.from(new Date().toLocaleString(), "utf8"), lf, lf,
+      Buffer.from("If you can read this, ESC/POS works ✅", "utf8"), lf, lf,
+      cut
+    ]);
+
+    // Reuse existing raw sender in this router file:
+    await sendRawToPrinter({ host, port: Number(port) || 9100, data: lines });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("print-test failed:", err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 module.exports = router;
