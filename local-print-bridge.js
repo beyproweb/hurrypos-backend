@@ -3,6 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const net = require("net");
 const os = require("os");
+const { spawn } = require("child_process");
 
 const app = express();
 app.use(cors());
@@ -26,7 +27,6 @@ app.options("*", (req, res) => {
 });
 
 const DEFAULT_HTTP_PORT = 7777;
-// Common printer service ports
 const DEFAULT_DISCOVER_PORTS = [9100, 9101, 9102, 515, 631];
 
 /* ----------------------------- Net Helpers ----------------------------- */
@@ -74,6 +74,19 @@ function tryConnect(host, port = 9100, timeoutMs = 600) {
     socket.once("error", (e) => finish(false, String(e.code || e.message || e)));
     socket.connect(port, host, () => finish(true));
   });
+}
+
+function ipBase(ip) {
+  const parts = String(ip || "").trim().split(".");
+  if (parts.length !== 4) return null;
+  return `${parts[0]}.${parts[1]}.${parts[2]}`;
+}
+
+function makeTempIPFromPrinter(printerIp) {
+  const base = ipBase(printerIp);
+  if (!base) return null;
+  // Pick a safe-looking host .50 by default
+  return `${base}.50`;
 }
 
 /* ------------------------------ Endpoints ------------------------------ */
@@ -143,7 +156,7 @@ app.get("/probe", async (req, res) => {
     const closed = checks.filter(r => !r.ok).map(r => ({ port: r.port, error: r.error }));
     const primary = getPrimaryIPv4();
     const primaryBase = primary?.base || null;
-    const hostBase = host.split(".").slice(0,3).join(".");
+    const hostBase = ipBase(host);
     const sameSubnet = primaryBase ? (hostBase === primaryBase) : null;
 
     res.json({ ok: true, host, open, closed, sameSubnet, primaryBase });
@@ -154,23 +167,12 @@ app.get("/probe", async (req, res) => {
 
 /**
  * Discover printers:
- * - By default scans ONLY the primary interface's /24 (fast, customer-friendly)
- * - If all=1 is provided, scans ALL local IPv4 /24 subnets
+ * - Default: scans ONLY the primary interface's /24 (fast)
+ * - If all=1: scan all local IPv4 /24 subnets
  *
  * GET /discover
  * GET /discover?all=1
  *  Optional: &ports=9100,9101,515,631&timeoutMs=600&concurrency=64
- *
- * Response:
- * {
- *   ok: true,
- *   primaryBase: "192.168.1",
- *   networks: [{name, address, base}],
- *   results: [
- *     { host, ports:[9100], base:"192.168.1", sameSubnet:true }
- *   ],
- *   subnetMismatch: true|false  // true if found hosts but none on primaryBase
- * }
  */
 app.get("/discover", async (req, res) => {
   const timeoutMs = Math.min(5000, Number(req.query.timeoutMs) || 600);
@@ -193,7 +195,6 @@ app.get("/discover", async (req, res) => {
     ? Array.from(new Set(allIfs.map(x => x.base)))
     : (primaryBase ? [primaryBase] : []);
 
-  // Build tasks: (host, port, base)
   const tasks = [];
   for (const base of bases) {
     for (let i = 1; i <= 254; i++) {
@@ -237,6 +238,130 @@ app.get("/discover", async (req, res) => {
     results,
     subnetMismatch
   });
+});
+
+/* ---------------- Assisted Subnet (Windows) ----------------
+   These endpoints help non-technical users when a printer is on a different subnet:
+   - /assist/subnet/add    -> add a temporary secondary IP (e.g. 192.168.123.50)
+   - /assist/subnet/cleanup-> remove the temporary IP
+   - /assist/subnet/open   -> open the printer web UI in default browser
+-------------------------------------------------------------- */
+
+/**
+ * POST /assist/subnet/add
+ * Body: { printerHost: "192.168.123.100", adapterAlias?: "Ethernet", tempIp?: "192.168.123.50", prefixLength?: 24 }
+ * Notes: Windows only; requires running the bridge with Administrator rights.
+ */
+app.post("/assist/subnet/add", async (req, res) => {
+  try {
+    if (process.platform !== "win32") {
+      return res.status(400).json({ error: "This assisted operation is only available on Windows." });
+    }
+
+    const { printerHost } = req.body || {};
+    if (!printerHost) return res.status(400).json({ error: "printerHost is required" });
+
+    const printerBase = ipBase(printerHost);
+    if (!printerBase) return res.status(400).json({ error: "Invalid printerHost" });
+
+    const adapters = listIPv4Interfaces();
+    const primary = getPrimaryIPv4();
+    if (!primary) return res.status(500).json({ error: "No active IPv4 interface found" });
+
+    const prefixLength = Number(req.body?.prefixLength) || 24;
+    const adapterAlias = String(req.body?.adapterAlias || primary.name);
+    const tempIp = String(req.body?.tempIp || makeTempIPFromPrinter(printerHost));
+
+    if (!tempIp) return res.status(400).json({ error: "Could not compute temp IP from printerHost" });
+
+    // Run PowerShell: New-NetIPAddress -InterfaceAlias "Ethernet" -IPAddress 192.168.123.50 -PrefixLength 24
+    const ps = `New-NetIPAddress -InterfaceAlias "${adapterAlias}" -IPAddress ${tempIp} -PrefixLength ${prefixLength}`;
+    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { windowsHide: true });
+
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("close", (code) => {
+      if (code === 0) {
+        return res.json({ ok: true, adapterAlias, tempIp, prefixLength, note: "Temporary IP added. Now open the printer UI and switch it to DHCP." });
+      } else {
+        return res.status(500).json({
+          error: "Failed to add temporary IP. Try running the bridge as Administrator.",
+          details: stderr.trim(),
+          adapterAlias, tempIp, prefixLength
+        });
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/**
+ * POST /assist/subnet/cleanup
+ * Body: { adapterAlias?: "Ethernet", tempIp: "192.168.123.50" }
+ * Remove the previously added temp IP.
+ */
+app.post("/assist/subnet/cleanup", async (req, res) => {
+  try {
+    if (process.platform !== "win32") {
+      return res.status(400).json({ error: "This assisted operation is only available on Windows." });
+    }
+
+    const primary = getPrimaryIPv4();
+    const adapterAlias = String(req.body?.adapterAlias || primary?.name || "");
+    const tempIp = String(req.body?.tempIp || "");
+
+    if (!adapterAlias || !tempIp) return res.status(400).json({ error: "adapterAlias and tempIp are required" });
+
+    const ps = `Remove-NetIPAddress -InterfaceAlias "${adapterAlias}" -IPAddress ${tempIp} -Confirm:$false`;
+    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { windowsHide: true });
+
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("close", (code) => {
+      if (code === 0) {
+        return res.json({ ok: true, adapterAlias, tempIp, note: "Temporary IP removed." });
+      } else {
+        return res.status(500).json({
+          error: "Failed to remove temporary IP. Try running the bridge as Administrator.",
+          details: stderr.trim(),
+          adapterAlias, tempIp
+        });
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/**
+ * POST /assist/subnet/open
+ * Body: { printerHost: "192.168.123.100" }
+ * Opens the printer web UI in the default browser.
+ */
+app.post("/assist/subnet/open", (req, res) => {
+  try {
+    const { printerHost } = req.body || {};
+    if (!printerHost) return res.status(400).json({ error: "printerHost is required" });
+    const url = `http://${printerHost}`;
+
+    // Windows 'start', macOS 'open', Linux 'xdg-open'
+    let cmd, args;
+    if (process.platform === "win32") {
+      cmd = "cmd"; args = ["/c", "start", "", url];
+    } else if (process.platform === "darwin") {
+      cmd = "open"; args = [url];
+    } else {
+      cmd = "xdg-open"; args = [url];
+    }
+
+    const child = spawn(cmd, args, { windowsHide: true, detached: true, stdio: "ignore" });
+    child.unref();
+
+    res.json({ ok: true, url });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 app.listen(DEFAULT_HTTP_PORT, () => {
