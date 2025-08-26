@@ -8,6 +8,65 @@ const { spawn } = require("child_process");
 const app = express();
 app.use(cors());
 app.use(express.json());
+// at top with other requires:
+const path = require("path");
+
+
+
+/**
+ * POST /assist/fix-printer
+ * Body: { printerHost: "192.168.123.100", adapterAlias?: "Ethernet", tempIp?: "192.168.123.50" }
+ * Launches tools/fix-printer-ip.ps1 with elevation (UAC prompt).
+ * - The script handles: add temp IP -> open web UI -> wait -> cleanup.
+ */
+app.post("/assist/fix-printer", (req, res) => {
+  try {
+    if (process.platform !== "win32") {
+      return res.status(400).json({ error: "Windows only operation." });
+    }
+    const printerHost = String(req.body?.printerHost || "").trim();
+    const adapterAlias = req.body?.adapterAlias ? String(req.body.adapterAlias) : null;
+    const tempIp = req.body?.tempIp ? String(req.body.tempIp) : null;
+
+    if (!printerHost) {
+      return res.status(400).json({ error: "printerHost is required" });
+    }
+
+    // script path (bundled next to bridge exe, under /tools)
+    const scriptPath = path.join(__dirname, "tools", "fix-printer-ip.ps1");
+
+    // Build argument list for elevated PowerShell:
+    // We use Start-Process -Verb RunAs to trigger UAC elevation and pass our args through.
+    const psCommandPieces = [
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-Command",
+      // Escape quotes carefully for Windows PowerShell
+      `Start-Process powershell -Verb RunAs -ArgumentList `
+      + `'\"-NoProfile\",\"-ExecutionPolicy\",\"Bypass\",\"-File\",\"${scriptPath}\",\"-PrinterHost\",\"${printerHost}\"`
+      + (adapterAlias ? `,\"-AdapterAlias\",\"${adapterAlias}\"` : "")
+      + (tempIp ? `,\"-TempIp\",\"${tempIp}\"` : "")
+      + `,\"-PrefixLength\",\"24\"'`
+    ];
+
+    const child = spawn("powershell.exe", psCommandPieces, { windowsHide: true });
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (e) => {
+      return res.status(500).json({ error: "Failed to launch PowerShell.", details: String(e) });
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        return res.json({ ok: true, launched: true, scriptPath, printerHost, adapterAlias, tempIp });
+      } else {
+        // Note: When elevation prompts, parent often closes with 0/1 regardless of user action.
+        return res.json({ ok: true, launched: true, note: "UAC prompt should have appeared. Complete steps in the PowerShell window.", scriptPath, printerHost });
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
 
 // Allow Private Network Access (HTTPS site -> http://127.0.0.1 requests)
 app.use((req, res, next) => {

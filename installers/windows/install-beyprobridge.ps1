@@ -1,61 +1,128 @@
-# Beypro Bridge Windows Installer (per-user; no admin needed)
-# HOW TO RUN:
-#   1) Extract the ZIP
-#   2) Open Windows PowerShell (not Git Bash/WSL)
-#   3) Set-ExecutionPolicy -Scope Process Bypass -Force
-#   4) cd to the extracted folder
-#   5) .\install-beyprobridge.ps1
+<#
+.SYNOPSIS
+  Temporarily add a secondary IP on Windows so you can reach a LAN receipt printer
+  stuck on a different subnet (e.g., 192.168.123.100), open its web UI, switch it
+  to DHCP (or set a proper static in your main LAN), then remove the temp IP.
 
-$ErrorActionPreference = "Stop"
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File .\fix-printer-ip.ps1 -PrinterHost 192.168.123.100
 
-$Here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Write-Host "Script path: $Here"
+.OPTIONAL
+  -AdapterAlias "Ethernet"  # use a specific NIC; otherwise auto-selects the primary IPv4 adapter
+  -TempIp 192.168.123.50    # override the temp IP on that subnet (default picks .50 / .51 / .52…)
+  -PrefixLength 24
+#>
 
-# Try common names next to the script
-$exe1 = Join-Path $Here "beypro-bridge-win-x64.exe"
-$exe2 = Join-Path $Here "beypro-bridge.exe"
-$SrcExe = if (Test-Path $exe1) { $exe1 } elseif (Test-Path $exe2) { $exe2 } else { $null }
+param(
+  [Parameter(Mandatory=$false)][string]$PrinterHost = "192.168.123.100",
+  [Parameter(Mandatory=$false)][string]$AdapterAlias,
+  [Parameter(Mandatory=$false)][string]$TempIp,
+  [Parameter(Mandatory=$false)][int]$PrefixLength = 24
+)
 
-# Fallback: ask user to browse for the EXE
-if (-not $SrcExe) {
-  try {
-    Add-Type -AssemblyName System.Windows.Forms | Out-Null
-    $dlg = New-Object System.Windows.Forms.OpenFileDialog
-    $dlg.InitialDirectory = $Here
-    $dlg.Filter = "Executable (*.exe)|*.exe"
-    $dlg.Title = "Locate the Beypro Bridge EXE"
-    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
-      throw "No EXE selected."
-    }
-    $SrcExe = $dlg.FileName
-  } catch {
-    throw "Could not find the EXE. Make sure it's next to the PS1, then re-run."
+function Write-Info($msg){ Write-Host "[INFO] $msg" -ForegroundColor Cyan }
+function Write-OK($msg){ Write-Host "[ OK ] $msg" -ForegroundColor Green }
+function Write-Err($msg){ Write-Host "[ERR] $msg" -ForegroundColor Red }
+
+# --- Ensure admin ---
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if(-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)){
+  Write-Info "Re-launching with Administrator rights…"
+  $psi = @{
+    FilePath = "powershell.exe"
+    ArgumentList = "-NoProfile","-ExecutionPolicy","Bypass","-File",$PSCommandPath,"-PrinterHost",$PrinterHost
+    Verb = "RunAs"
   }
+  if($AdapterAlias){ $psi.ArgumentList += @("-AdapterAlias",$AdapterAlias) }
+  if($TempIp){ $psi.ArgumentList += @("-TempIp",$TempIp) }
+  $psi.ArgumentList += @("-PrefixLength",$PrefixLength)
+  Start-Process @psi
+  exit
 }
 
-Write-Host "Found EXE: $SrcExe" -ForegroundColor Green
-
-$AppDir = Join-Path $env:LOCALAPPDATA "BeyproBridge"
-if (-not (Test-Path $AppDir)) {
-  New-Item -ItemType Directory -Path $AppDir | Out-Null
+# --- Helpers ---
+function Get-PrimaryIPv4Adapter {
+  if($AdapterAlias){
+    $a = Get-NetAdapter -Name $AdapterAlias -ErrorAction SilentlyContinue
+    if($a -and $a.Status -eq "Up"){ return $a }
+    Write-Err "Adapter '$AdapterAlias' not found or not Up."
+    exit 1
+  }
+  # Prefer adapter with a default gateway (active internet)
+  $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -and $_.IPv4DefaultGateway } | Select-Object -First 1
+  if($cfg){ return (Get-NetAdapter -InterfaceIndex $cfg.InterfaceIndex) }
+  # Fallback: first Up adapter with IPv4
+  $a2 = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
+  return $a2
 }
-$TargetExe = Join-Path $AppDir "beypro-bridge.exe"
-Copy-Item -LiteralPath $SrcExe -Destination $TargetExe -Force
-Write-Host "Copied to: $TargetExe" -ForegroundColor Green
 
-# Create Startup shortcut (per-user)
-$StartupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
-if (-not (Test-Path $StartupDir)) { New-Item -ItemType Directory -Path $StartupDir | Out-Null }
-$Lnk = Join-Path $StartupDir "Beypro Bridge.lnk"
+function Get-SubnetBase([string]$ip){
+  $parts = $ip.Split("."); if($parts.Length -ne 4){ return $null }
+  return ("{0}.{1}.{2}" -f $parts[0],$parts[1],$parts[2])
+}
 
-$WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut($Lnk)
-$Shortcut.TargetPath = $TargetExe
-$Shortcut.WorkingDirectory = $AppDir
-$Shortcut.WindowStyle = 7
-$Shortcut.Description = "Beypro Bridge (127.0.0.1:7777 → RAW :9100)"
-$Shortcut.Save()
+function Pick-TempIp([string]$printerHost){
+  if($TempIp){ return $TempIp }
+  $base = Get-SubnetBase $printerHost
+  if(-not $base){ Write-Err "Invalid PrinterHost '$printerHost'"; exit 1 }
+  $candidates = 50..99 | ForEach-Object { "$base.$_" }
+  foreach($ip in $candidates){
+    $used = (Get-NetIPAddress -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $ip })
+    if(-not $used){
+      # quick ping check; if already responds, skip
+      if(-not (Test-Connection -Quiet -Count 1 -TimeoutSeconds 1 -ErrorAction SilentlyContinue $ip)){
+        return $ip
+      }
+    }
+  }
+  Write-Err "Couldn't find a free temp IP on $base. Try specifying -TempIp manually."
+  exit 1
+}
 
-Write-Host "Startup shortcut: $Lnk"
-Write-Host "✅ Done. It will auto-start on next login." -ForegroundColor Green
-Write-Host "➡️ Start now (optional): & `"$TargetExe`""
+# --- Begin ---
+Write-Info "Target printer: $PrinterHost"
+$primary = Get-PrimaryIPv4Adapter
+if(-not $primary){ Write-Err "No active IPv4 adapter found."; exit 1 }
+Write-OK "Using adapter: $($primary.Name)"
+
+$chosenTemp = Pick-TempIp $PrinterHost
+Write-Info "Temporary IP candidate: $chosenTemp/$PrefixLength"
+
+# Add temp IP
+try{
+  New-NetIPAddress -InterfaceAlias $primary.Name -IPAddress $chosenTemp -PrefixLength $PrefixLength -ErrorAction Stop | Out-Null
+  Write-OK "Added secondary IP $chosenTemp to '$($primary.Name)'"
+}catch{
+  Write-Err "Failed to add temp IP: $($_.Exception.Message)"
+  Write-Err "If this persists, ensure PowerShell is running as Administrator."
+  exit 1
+}
+
+# Try connectivity to the printer host/port 9100 to confirm reachability
+try{
+  $test = Test-NetConnection -ComputerName $PrinterHost -Port 80 -WarningAction SilentlyContinue
+  if($test.TcpTestSucceeded){
+    Write-OK "Port 80 reachable — opening printer web UI…"
+  }else{
+    Write-Info "Port 80 not reachable (some models use other mgmt ports). Will try to open HTTP anyway."
+  }
+}catch{}
+
+# Open browser to printer UI
+Start-Process "http://$PrinterHost" | Out-Null
+Write-Info "In the printer web UI, set IP mode to DHCP (recommended) or assign a static in your main LAN."
+Write-Info "After saving & rebooting the printer, press ENTER here to remove the temp IP."
+[void][System.Console]::ReadLine()
+
+# Cleanup temp IP
+try{
+  Remove-NetIPAddress -InterfaceAlias $primary.Name -IPAddress $chosenTemp -Confirm:$false -ErrorAction Stop
+  Write-OK "Removed temporary IP $chosenTemp from '$($primary.Name)'"
+}catch{
+  Write-Err "Failed to remove temp IP: $($_.Exception.Message)"
+  Write-Info "You can remove it later with:"
+  Write-Host "  Remove-NetIPAddress -InterfaceAlias `"$($primary.Name)`" -IPAddress $chosenTemp -Confirm:`$false" -ForegroundColor Yellow
+}
+
+Write-OK "Done. Now the printer should be on your main LAN (same subnet as the PC)."
+Write-Info "Tip: In Beypro, click 'Find Printers' and then 'Test Print'."
