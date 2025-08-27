@@ -3,92 +3,171 @@ const express = require("express");
 const cors = require("cors");
 const net = require("net");
 const os = require("os");
+const fs = require("fs");
 const { spawn } = require("child_process");
+const path = require("path");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-// at top with other requires:
-const path = require("path");
 
-
-
+/* ---------------------- Fix-Script Resolver & Embed ---------------------- */
 /**
- * POST /assist/fix-printer
- * Body: { printerHost: "192.168.123.100", adapterAlias?: "Ethernet", tempIp?: "192.168.123.50" }
- * Launches tools/fix-printer-ip.ps1 with elevation (UAC prompt).
- * - The script handles: add temp IP -> open web UI -> wait -> cleanup.
+ * Tries common locations for fix-printer-ip.ps1. If not found, writes an
+ * embedded copy into the system temp folder and returns that path.
  */
-app.post("/assist/fix-printer", (req, res) => {
-  try {
-    if (process.platform !== "win32") {
-      return res.status(400).json({ error: "Windows only operation." });
-    }
-    const printerHost = String(req.body?.printerHost || "").trim();
-    const adapterAlias = req.body?.adapterAlias ? String(req.body.adapterAlias) : null;
-    const tempIp = req.body?.tempIp ? String(req.body.tempIp) : null;
-
-    if (!printerHost) {
-      return res.status(400).json({ error: "printerHost is required" });
-    }
-
-    // script path (bundled next to bridge exe, under /tools)
-    const scriptPath = path.join(__dirname, "tools", "fix-printer-ip.ps1");
-
-    // Build argument list for elevated PowerShell:
-    // We use Start-Process -Verb RunAs to trigger UAC elevation and pass our args through.
-    const psCommandPieces = [
-      "-NoProfile",
-      "-ExecutionPolicy", "Bypass",
-      "-Command",
-      // Escape quotes carefully for Windows PowerShell
-      `Start-Process powershell -Verb RunAs -ArgumentList `
-      + `'\"-NoProfile\",\"-ExecutionPolicy\",\"Bypass\",\"-File\",\"${scriptPath}\",\"-PrinterHost\",\"${printerHost}\"`
-      + (adapterAlias ? `,\"-AdapterAlias\",\"${adapterAlias}\"` : "")
-      + (tempIp ? `,\"-TempIp\",\"${tempIp}\"` : "")
-      + `,\"-PrefixLength\",\"24\"'`
-    ];
-
-    const child = spawn("powershell.exe", psCommandPieces, { windowsHide: true });
-    let stderr = "";
-    child.stderr.on("data", (d) => { stderr += d.toString(); });
-    child.on("error", (e) => {
-      return res.status(500).json({ error: "Failed to launch PowerShell.", details: String(e) });
-    });
-    child.on("close", (code) => {
-      if (code === 0) {
-        return res.json({ ok: true, launched: true, scriptPath, printerHost, adapterAlias, tempIp });
-      } else {
-        // Note: When elevation prompts, parent often closes with 0/1 regardless of user action.
-        return res.json({ ok: true, launched: true, note: "UAC prompt should have appeared. Complete steps in the PowerShell window.", scriptPath, printerHost });
-      }
-    });
-  } catch (e) {
-    return res.status(500).json({ error: String(e.message || e) });
+function resolveOrWriteFixScript() {
+  const filename = "fix-printer-ip.ps1";
+  const candidates = [
+    path.join(__dirname, "tools", filename),                      // next to JS/EXE
+    path.join(process.cwd(), "bridge", "tools", filename),        // repo: bridge/tools
+    path.join(process.cwd(), "tools", filename),                   // repo: tools
+    path.join(path.dirname(process.execPath), "tools", filename),  // alongside packaged exe (pkg)
+  ];
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
   }
-});
+  // Not found on disk — write to temp:
+  const tmp = path.join(os.tmpdir(), filename);
+  try {
+    fs.writeFileSync(tmp, FIX_PRINTER_PS1, "utf8");
+    return tmp;
+  } catch {
+    return null;
+  }
+}
 
-// Allow Private Network Access (HTTPS site -> http://127.0.0.1 requests)
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Private-Network", "true");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  next();
-});
+// Embedded PowerShell script (safe to run elevated). If you keep a real file
+// at bridge/tools/fix-printer-ip.ps1 it will be preferred over this string.
+const FIX_PRINTER_PS1 = `
+<#
+.SYNOPSIS
+  Temporarily add a secondary IP on Windows so you can reach a LAN receipt printer
+  stuck on a different subnet (e.g., 192.168.123.100), open its web UI, switch it
+  to DHCP (or set a proper static in your main LAN), then remove the temp IP.
 
-app.options("*", (req, res) => {
-  res.setHeader("Access-Control-Allow-Private-Network", "true");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.sendStatus(204);
-});
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File .\\fix-printer-ip.ps1 -PrinterHost 192.168.123.100
+#>
+
+param(
+  [Parameter(Mandatory=$false)][string]$PrinterHost = "192.168.123.100",
+  [Parameter(Mandatory=$false)][string]$AdapterAlias,
+  [Parameter(Mandatory=$false)][string]$TempIp,
+  [Parameter(Mandatory=$false)][int]$PrefixLength = 24
+)
+
+function Write-Info($msg){ Write-Host "[INFO] $msg" -ForegroundColor Cyan }
+function Write-OK($msg){ Write-Host "[ OK ] $msg" -ForegroundColor Green }
+function Write-Err($msg){ Write-Host "[ERR] $msg" -ForegroundColor Red }
+
+# --- Ensure admin ---
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if(-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)){
+  Write-Info "Re-launching with Administrator rights…"
+  $psi = @{
+    FilePath = "powershell.exe"
+    ArgumentList = "-NoProfile","-ExecutionPolicy","Bypass","-File",$PSCommandPath,"-PrinterHost",$PrinterHost
+    Verb = "RunAs"
+  }
+  if($AdapterAlias){ $psi.ArgumentList += @("-AdapterAlias",$AdapterAlias) }
+  if($TempIp){ $psi.ArgumentList += @("-TempIp",$TempIp) }
+  $psi.ArgumentList += @("-PrefixLength",$PrefixLength)
+  Start-Process @psi
+  exit
+}
+
+# --- Helpers ---
+function Get-PrimaryIPv4Adapter {
+  if($AdapterAlias){
+    $a = Get-NetAdapter -Name $AdapterAlias -ErrorAction SilentlyContinue
+    if($a -and $a.Status -eq "Up"){ return $a }
+    Write-Err "Adapter '$AdapterAlias' not found or not Up."
+    exit 1
+  }
+  # Prefer adapter with a default gateway (active internet)
+  $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -and $_.IPv4DefaultGateway } | Select-Object -First 1
+  if($cfg){ return (Get-NetAdapter -InterfaceIndex $cfg.InterfaceIndex) }
+  # Fallback: first Up adapter with IPv4
+  $a2 = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
+  return $a2
+}
+
+function Get-SubnetBase([string]$ip){
+  $parts = $ip.Split("."); if($parts.Length -ne 4){ return $null }
+  return ("{0}.{1}.{2}" -f $parts[0],$parts[1],$parts[2])
+}
+
+function Pick-TempIp([string]$printerHost){
+  if($TempIp){ return $TempIp }
+  $base = Get-SubnetBase $printerHost
+  if(-not $base){ Write-Err "Invalid PrinterHost '$printerHost'"; exit 1 }
+  $candidates = 50..99 | ForEach-Object { "$base.$_" }
+  foreach($ip in $candidates){
+    $used = (Get-NetIPAddress -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $ip })
+    if(-not $used){
+      # quick ping check; if already responds, skip
+      if(-not (Test-Connection -Quiet -Count 1 -TimeoutSeconds 1 -ErrorAction SilentlyContinue $ip)){
+        return $ip
+      }
+    }
+  }
+  Write-Err "Couldn't find a free temp IP on $base. Try specifying -TempIp manually."
+  exit 1
+}
+
+# --- Begin ---
+Write-Info "Target printer: $PrinterHost"
+$primary = Get-PrimaryIPv4Adapter
+if(-not $primary){ Write-Err "No active IPv4 adapter found."; exit 1 }
+Write-OK "Using adapter: $($primary.Name)"
+
+$chosenTemp = Pick-TempIp $PrinterHost
+Write-Info "Temporary IP candidate: $chosenTemp/$PrefixLength"
+
+# Add temp IP
+try{
+  New-NetIPAddress -InterfaceAlias $primary.Name -IPAddress $chosenTemp -PrefixLength $PrefixLength -ErrorAction Stop | Out-Null
+  Write-OK "Added secondary IP $chosenTemp to '$($primary.Name)'"
+}catch{
+  Write-Err "Failed to add temp IP: $($_.Exception.Message)"
+  Write-Err "If this persists, ensure PowerShell is running as Administrator."
+  exit 1
+}
+
+# Try connectivity to the printer host management port
+try{
+  $test = Test-NetConnection -ComputerName $PrinterHost -Port 80 -WarningAction SilentlyContinue
+  if($test.TcpTestSucceeded){
+    Write-OK "Port 80 reachable — opening printer web UI…"
+  }else{
+    Write-Info "Port 80 not reachable (some models use other mgmt ports). Will try to open HTTP anyway."
+  }
+}catch{}
+
+# Open browser to printer UI
+Start-Process ("http://{0}" -f $PrinterHost) | Out-Null
+Write-Info "In the printer web UI, set IP mode to DHCP (recommended) or assign a static in your main LAN."
+Write-Info "After saving & rebooting the printer, press ENTER here to remove the temp IP."
+[void][System.Console]::ReadLine()
+
+# Cleanup temp IP
+try{
+  Remove-NetIPAddress -InterfaceAlias $primary.Name -IPAddress $chosenTemp -Confirm:$false -ErrorAction Stop
+  Write-OK "Removed temporary IP $chosenTemp from '$($primary.Name)'"
+}catch{
+  Write-Err "Failed to remove temp IP: $($_.Exception.Message)"
+  Write-Info ("You can remove it later with:  Remove-NetIPAddress -InterfaceAlias ""{0}"" -IPAddress {1} -Confirm:$false" -f $primary.Name, $chosenTemp)
+}
+
+Write-OK "Done. Now the printer should be on your main LAN (same subnet as the PC)."
+Write-Info "Tip: In Beypro, click 'Find Printers' and then 'Test Print'."
+`;
+
+/* ----------------------------- Net Helpers ------------------------------ */
 
 const DEFAULT_HTTP_PORT = 7777;
 const DEFAULT_DISCOVER_PORTS = [9100, 9101, 9102, 515, 631];
-
-/* ----------------------------- Net Helpers ----------------------------- */
 
 function listIPv4Interfaces() {
   const out = [];
@@ -117,6 +196,18 @@ function getPrimaryIPv4() {
   return list[0] || null;
 }
 
+function ipBase(ip) {
+  const parts = String(ip || "").trim().split(".");
+  if (parts.length !== 4) return null;
+  return `${parts[0]}.${parts[1]}.${parts[2]}`;
+}
+
+function makeTempIPFromPrinter(printerIp) {
+  const base = ipBase(printerIp);
+  if (!base) return null;
+  return `${base}.50`;
+}
+
 function tryConnect(host, port = 9100, timeoutMs = 600) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
@@ -135,21 +226,27 @@ function tryConnect(host, port = 9100, timeoutMs = 600) {
   });
 }
 
-function ipBase(ip) {
-  const parts = String(ip || "").trim().split(".");
-  if (parts.length !== 4) return null;
-  return `${parts[0]}.${parts[1]}.${parts[2]}`;
-}
+/* ------------------------ CORS / Private Network ------------------------ */
 
-function makeTempIPFromPrinter(printerIp) {
-  const base = ipBase(printerIp);
-  if (!base) return null;
-  // Pick a safe-looking host .50 by default
-  return `${base}.50`;
-}
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  next();
+});
 
-/* ------------------------------ Endpoints ------------------------------ */
+app.options("*", (req, res) => {
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.sendStatus(204);
+});
 
+/* -------------------------------- Routes -------------------------------- */
+
+// Health
 app.get("/ping", (_req, res) => res.json({
   ok: true,
   bridge: "beypro",
@@ -306,11 +403,7 @@ app.get("/discover", async (req, res) => {
    - /assist/subnet/open   -> open the printer web UI in default browser
 -------------------------------------------------------------- */
 
-/**
- * POST /assist/subnet/add
- * Body: { printerHost: "192.168.123.100", adapterAlias?: "Ethernet", tempIp?: "192.168.123.50", prefixLength?: 24 }
- * Notes: Windows only; requires running the bridge with Administrator rights.
- */
+// POST /assist/subnet/add
 app.post("/assist/subnet/add", async (req, res) => {
   try {
     if (process.platform !== "win32") {
@@ -320,20 +413,14 @@ app.post("/assist/subnet/add", async (req, res) => {
     const { printerHost } = req.body || {};
     if (!printerHost) return res.status(400).json({ error: "printerHost is required" });
 
-    const printerBase = ipBase(printerHost);
-    if (!printerBase) return res.status(400).json({ error: "Invalid printerHost" });
-
-    const adapters = listIPv4Interfaces();
     const primary = getPrimaryIPv4();
     if (!primary) return res.status(500).json({ error: "No active IPv4 interface found" });
 
     const prefixLength = Number(req.body?.prefixLength) || 24;
     const adapterAlias = String(req.body?.adapterAlias || primary.name);
     const tempIp = String(req.body?.tempIp || makeTempIPFromPrinter(printerHost));
-
     if (!tempIp) return res.status(400).json({ error: "Could not compute temp IP from printerHost" });
 
-    // Run PowerShell: New-NetIPAddress -InterfaceAlias "Ethernet" -IPAddress 192.168.123.50 -PrefixLength 24
     const ps = `New-NetIPAddress -InterfaceAlias "${adapterAlias}" -IPAddress ${tempIp} -PrefixLength ${prefixLength}`;
     const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { windowsHide: true });
 
@@ -355,11 +442,7 @@ app.post("/assist/subnet/add", async (req, res) => {
   }
 });
 
-/**
- * POST /assist/subnet/cleanup
- * Body: { adapterAlias?: "Ethernet", tempIp: "192.168.123.50" }
- * Remove the previously added temp IP.
- */
+// POST /assist/subnet/cleanup
 app.post("/assist/subnet/cleanup", async (req, res) => {
   try {
     if (process.platform !== "win32") {
@@ -369,7 +452,6 @@ app.post("/assist/subnet/cleanup", async (req, res) => {
     const primary = getPrimaryIPv4();
     const adapterAlias = String(req.body?.adapterAlias || primary?.name || "");
     const tempIp = String(req.body?.tempIp || "");
-
     if (!adapterAlias || !tempIp) return res.status(400).json({ error: "adapterAlias and tempIp are required" });
 
     const ps = `Remove-NetIPAddress -InterfaceAlias "${adapterAlias}" -IPAddress ${tempIp} -Confirm:$false`;
@@ -393,18 +475,13 @@ app.post("/assist/subnet/cleanup", async (req, res) => {
   }
 });
 
-/**
- * POST /assist/subnet/open
- * Body: { printerHost: "192.168.123.100" }
- * Opens the printer web UI in the default browser.
- */
+// POST /assist/subnet/open
 app.post("/assist/subnet/open", (req, res) => {
   try {
     const { printerHost } = req.body || {};
     if (!printerHost) return res.status(400).json({ error: "printerHost is required" });
     const url = `http://${printerHost}`;
 
-    // Windows 'start', macOS 'open', Linux 'xdg-open'
     let cmd, args;
     if (process.platform === "win32") {
       cmd = "cmd"; args = ["/c", "start", "", url];
@@ -422,6 +499,59 @@ app.post("/assist/subnet/open", (req, res) => {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
+
+/**
+ * POST /assist/fix-printer
+ * Body: { printerHost: "192.168.123.100", adapterAlias?: "Ethernet", tempIp?: "192.168.123.50" }
+ * Launches fix-printer-ip.ps1 with elevation (UAC prompt). If the script file
+ * isn't present on disk, it will be written to a temp file first.
+ */
+app.post("/assist/fix-printer", (req, res) => {
+  try {
+    if (process.platform !== "win32") {
+      return res.status(400).json({ error: "Windows only operation." });
+    }
+    const printerHost = String(req.body?.printerHost || "").trim();
+    const adapterAlias = req.body?.adapterAlias ? String(req.body.adapterAlias) : null;
+    const tempIp = req.body?.tempIp ? String(req.body.tempIp) : null;
+
+    if (!printerHost) {
+      return res.status(400).json({ error: "printerHost is required" });
+    }
+
+    const scriptPath = resolveOrWriteFixScript();
+    if (!scriptPath) {
+      return res.status(500).json({ error: "Could not locate or write fix-printer-ip.ps1" });
+    }
+
+    // Elevate and run the script
+    const psCommandPieces = [
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-Command",
+      `Start-Process powershell -Verb RunAs -ArgumentList `
+      + `'\"-NoProfile\",\"-ExecutionPolicy\",\"Bypass\",\"-File\",\"${scriptPath}\",\"-PrinterHost\",\"${printerHost}\"`
+      + (adapterAlias ? `,\"-AdapterAlias\",\"${adapterAlias}\"` : "")
+      + (tempIp ? `,\"-TempIp\",\"${tempIp}\"` : "")
+      + `,\"-PrefixLength\",\"24\"'`
+    ];
+
+    const child = spawn("powershell.exe", psCommandPieces, { windowsHide: true });
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (e) => {
+      return res.status(500).json({ error: "Failed to launch PowerShell.", details: String(e) });
+    });
+    child.on("close", (_code) => {
+      // The parent often exits regardless of user action in the elevated shell.
+      return res.json({ ok: true, launched: true, scriptPath, printerHost, adapterAlias, tempIp });
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/* ------------------------------- Listener -------------------------------- */
 
 app.listen(DEFAULT_HTTP_PORT, () => {
   console.log(`Beypro Bridge listening on http://127.0.0.1:${DEFAULT_HTTP_PORT}`);
