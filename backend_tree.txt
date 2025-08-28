@@ -1,0 +1,172 @@
+.
+├── .DS_Store
+├── .env
+├── .gitignore
+├── .wwebjs_auth
+│   └── session
+│       ├── Default
+│       │   ├── Cache
+│       │   │   └── Cache_Data
+│       │   ├── Code Cache
+│       │   │   ├── js
+│       │   │   └── wasm
+│       │   ├── Cookies
+│       │   ├── Cookies-journal
+│       │   ├── DawnCache
+│       │   │   ├── data_0
+│       │   │   ├── data_1
+│       │   │   ├── data_2
+│       │   │   ├── data_3
+│       │   │   └── index
+│       │   ├── GPUCache
+│       │   │   ├── data_0
+│       │   │   ├── data_1
+│       │   │   ├── data_2
+│       │   │   ├── data_3
+│       │   │   └── index
+│       │   ├── IndexedDB
+│       │   │   ├── https_web.whatsapp.com_0.indexeddb.blob
+│       │   │   └── https_web.whatsapp.com_0.indexeddb.leveldb
+│       │   ├── Local Storage
+│       │   │   └── leveldb
+│       │   ├── Service Worker
+│       │   │   ├── CacheStorage
+│       │   │   ├── Database
+│       │   │   └── ScriptCache
+│       │   ├── Session Storage
+│       │   │   ├── 000003.log
+│       │   │   ├── CURRENT
+│       │   │   ├── LOCK
+│       │   │   ├── LOG
+│       │   │   ├── LOG.old
+│       │   │   └── MANIFEST-000001
+│       │   ├── VideoDecodeStats
+│       │   │   ├── LOCK
+│       │   │   └── LOG
+│       │   ├── WebStorage
+│       │   │   ├── QuotaManager
+│       │   │   └── QuotaManager-journal
+│       │   ├── blob_storage
+│       │   │   └── c3892388-0e02-4ad7-8337-70dd33e4d42b
+│       │   ├── databases
+│       │   │   ├── Databases.db
+│       │   │   └── Databases.db-journal
+│       │   └── shared_proto_db
+│       │       ├── 000003.log
+│       │       ├── CURRENT
+│       │       ├── LOCK
+│       │       ├── LOG
+│       │       ├── MANIFEST-000001
+│       │       └── metadata
+│       └── DevToolsActivePort
+├── .wwebjs_cache
+│   ├── 2.3000.1025185003.html
+│   ├── 2.3000.1025186692.html
+│   ├── 2.3000.1025187021.html
+│   ├── 2.3000.1025187666.html
+│   └── 2.3000.1025308755.html
+├── backend_tree.txt
+├── data
+│   └── extrasGroups.json
+├── db.js
+├── installers
+│   ├── .DS_Store
+│   ├── linux
+│   │   └── install-beyprobridge.sh
+│   ├── macos
+│   │   └── install-beyprobridge.sh
+│   └── windows
+│       └── install-beyprobridge.ps1
+├── local-print-bridge.js
+├── package-lock.json
+├── package.json
+├── public
+│   ├── .DS_Store
+│   ├── bridge
+│   │   ├── beypro-bridge-linux-x64.tar.gz
+│   │   ├── beypro-bridge-mac.zip
+│   │   ├── beypro-bridge-win-x64.zip
+│   │   └── tools
+│   │       └── fix-printer-ip.ps1
+│   └── uploads
+│       ├── catimg_1750592005803.jpg
+│       ├── catimg_1750593382763.jpg
+│       ├── catimg_1750593522685.jpg
+│       ├── catimg_1750595625179.jpg
+│       ├── catimg_1750595707913.jpg
+│       ├── catimg_1750606707225.jpg
+│       ├── catimg_1750617722602.webp
+│       ├── catimg_1750617763177.jpg
+│       ├── catimg_1750617843502.jpg
+│       ├── catimg_1750662740051.jpg
+│       ├── catimg_1750663023220.jpg
+│       ├── catimg_1750663041970.jpg
+│       ├── catimg_1750663066100.webp
+│       ├── catimg_1750663160267.jpg
+│       ├── catimg_1750663959416.jpg
+│       ├── catimg_1750756268438.jpg
+│       ├── catimg_1750756414562.jpg
+│       ├── product_1748152790815.jpg
+│       ├── product_1748331039805.jpg
+│       ├── product_1748502662532.png
+│       ├── product_1748502690873.png
+│       ├── product_1748502722171.jpg
+│       ├── product_1748502761863.png
+│       ├── product_1748689716187.avif
+│       ├── product_1748689803381.webp
+│       ├── product_1748689846610.jpg
+│       ├── product_1750663045023.jpg
+│       ├── product_1750750730471.png
+│       ├── product_1750754970997.png
+│       └── product_1750756295474.jpeg
+├── routes
+│   ├── Autosuppliersorder.js
+│   ├── campaigns.js
+│   ├── categoryImages.js
+│   ├── customerAddresses.js
+│   ├── customers.js
+│   ├── drinks.js
+│   ├── drivers.js
+│   ├── expenses.js
+│   ├── extras-groups.js
+│   ├── ingredient-prices.js
+│   ├── iyzico.js
+│   ├── kitchen.js
+│   ├── lan-printers.js
+│   ├── notifications.js
+│   ├── orders.js
+│   ├── phoneorders.js
+│   ├── printer.js
+│   ├── production.js
+│   ├── products.js
+│   ├── reports.js
+│   ├── settings.js
+│   ├── staff.js
+│   ├── stock.js
+│   ├── subscription.js
+│   ├── suppliers.js
+│   ├── tasks.js
+│   ├── timerScheduler.js
+│   ├── upload.js
+│   ├── userSettings.js
+│   └── yemeksepeti.js
+├── scheduleMailer.js
+├── server.js
+├── staff_management.log
+├── test.js
+├── trendyol.env
+├── trendyol.js
+├── uploads
+│   ├── .DS_Store
+│   └── receipts
+├── utils
+│   ├── cloudinary.js
+│   ├── exportUtils.js
+│   ├── notifications.js
+│   ├── realtime.js
+│   ├── reportDataService.js
+│   ├── sendNoOrderEmail.js
+│   └── socket.js
+└── whatsappBot.js
+
+42 directories, 128 files
