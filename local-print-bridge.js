@@ -56,6 +56,22 @@ param(
   [Parameter(Mandatory=$false)][string]$TempIp,
   [Parameter(Mandatory=$false)][int]$PrefixLength = 24
 )
+// near the top of local-print-bridge.js
+function resolvePowerShellExe() {
+  if (process.platform !== "win32") return "powershell";
+  const win = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  const cands = [
+    path.join(win, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    // when a 32-bit build runs on 64-bit Windows, System32 is redirected, so try Sysnative:
+    path.join(win, "Sysnative", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    "powershell.exe", // PATH
+    "pwsh.exe"        // PowerShell 7 fallback
+  ];
+  for (const p of cands) {
+    try { if (!p.includes("\\") || fs.existsSync(p)) return p; } catch {}
+  }
+  return "powershell.exe";
+}
 
 function Write-Info($msg){ Write-Host "[INFO] $msg" -ForegroundColor Cyan }
 function Write-OK($msg){ Write-Host "[ OK ] $msg" -ForegroundColor Green }
@@ -422,7 +438,7 @@ app.post("/assist/subnet/add", async (req, res) => {
     if (!tempIp) return res.status(400).json({ error: "Could not compute temp IP from printerHost" });
 
     const ps = `New-NetIPAddress -InterfaceAlias "${adapterAlias}" -IPAddress ${tempIp} -PrefixLength ${prefixLength}`;
-    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { windowsHide: true });
+    const child = spawn(resolvePowerShellExe(), ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { windowsHide: true });
 
     let stderr = "";
     child.stderr.on("data", (d) => { stderr += d.toString(); });
@@ -455,7 +471,7 @@ app.post("/assist/subnet/cleanup", async (req, res) => {
     if (!adapterAlias || !tempIp) return res.status(400).json({ error: "adapterAlias and tempIp are required" });
 
     const ps = `Remove-NetIPAddress -InterfaceAlias "${adapterAlias}" -IPAddress ${tempIp} -Confirm:$false`;
-    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { windowsHide: true });
+    const child = spawn(resolvePowerShellExe(), ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { windowsHide: true });
 
     let stderr = "";
     child.stderr.on("data", (d) => { stderr += d.toString(); });
@@ -536,7 +552,7 @@ app.post("/assist/fix-printer", (req, res) => {
       + `,\"-PrefixLength\",\"24\"'`
     ];
 
-    const child = spawn("powershell.exe", psCommandPieces, { windowsHide: true });
+    const child = spawn(resolvePowerShellExe(), psCommandPieces, { windowsHide: true });
     let stderr = "";
     child.stderr.on("data", (d) => { stderr += d.toString(); });
     child.on("error", (e) => {
