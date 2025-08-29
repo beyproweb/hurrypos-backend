@@ -1,177 +1,136 @@
-const express = require('express');
+// server/routes/campaigns.js
+const express = require("express");
 const router = express.Router();
-const { pool } = require('../db');
-// (Optional) keep these only if used elsewhere in this file
-// const { sendEmail } = require('../utils/notifications');
-// const whatsappClient = require('../whatsappBot');
+const nodemailer = require("nodemailer");
+const cheerio = require("cheerio");
 
-const nodemailer = require('nodemailer');
-const cheerio = require('cheerio');
-
-// ✅ Single source of truth for the public API origin used in tracking links.
-//    Set PUBLIC_TRACKING_ORIGIN in prod (e.g., "https://api.beypro.com").
-//    In dev, it falls back to the current request host.
+// ✅ Single, non-duplicated definition. Optionally set in your host env.
+// e.g. "https://api.beypro.com" (no trailing slash)
 const PUBLIC_TRACKING_ORIGIN = process.env.PUBLIC_TRACKING_ORIGIN || null;
 
-// Reuse a single SMTP transporter (avoids reconnecting each send)
-const transporter =
-  global.__MAILER__ ||
-  (global.__MAILER__ = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: String(process.env.SMTP_SECURE || 'false') === 'true',
-    auth: process.env.SMTP_USER
-      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-      : undefined,
-  }));
-
-/** Resolve the absolute origin where tracking routes live */
-function getTrackingOrigin(req) {
-  const originFromReq = `${req.protocol}://${req.get('host')}`;
-  return PUBLIC_TRACKING_ORIGIN || originFromReq;
+/**
+ * Utility: consistent JSON error responses
+ */
+function jsonError(res, code, message, extra = {}) {
+  return res.status(code).json({ ok: false, error: message, ...extra });
 }
 
-/** Build open-pixel URL */
-function buildOpenUrl(trackingOrigin, campaignId, email) {
-  const u = new URL(`/api/campaigns/track/open/${campaignId}`, trackingOrigin);
-  u.searchParams.set('email', email);
-  return u.toString();
-}
+/**
+ * Build transporter from environment
+ * Required env (typical SMTP):
+ *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+ * Optional:
+ *   SMTP_SECURE ("true"|"false"), FROM_EMAIL, FROM_NAME
+ */
+function makeTransporter() {
+  const {
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USER,
+    SMTP_PASS,
+    SMTP_SECURE,
+  } = process.env;
 
-/** Build click-tracking URL wrapping a concrete target URL */
-function buildClickUrl(trackingOrigin, campaignId, email, targetUrl) {
-  const u = new URL(`/api/campaigns/track/click/${campaignId}`, trackingOrigin);
-  u.searchParams.set('email', email);
-  u.searchParams.set('url', targetUrl);
-  return u.toString();
-}
+  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
+    throw new Error(
+      "SMTP credentials missing. Please set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS."
+    );
+  }
 
-/** Rewrite all http(s) anchors to tracked links for a specific recipient and append pixel */
-function rewriteAnchorsWithTracking(rawHtml, trackingOrigin, campaignId, email) {
-  const $ = cheerio.load(rawHtml || '', { decodeEntities: false });
-
-  $('a[href]').each((_, el) => {
-    const $a = $(el);
-    const href = ($a.attr('href') || '').trim();
-
-    // Only wrap absolute http(s) links; skip mailto:, tel:, #, javascript:
-    if (!/^https?:\/\//i.test(href)) return;
-
-    const tracked = buildClickUrl(trackingOrigin, campaignId, email, href);
-    $a.attr('href', tracked);
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT),
+    secure: String(SMTP_SECURE || "false").toLowerCase() === "true",
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
   });
+}
 
-  // Append a 1×1 pixel at end of body (or root if no <body>)
-  const pixelUrl = buildOpenUrl(trackingOrigin, campaignId, email);
-  const pixelTag = `<img src="${pixelUrl}" width="1" height="1" alt="" style="display:none!important;opacity:0" />`;
+/**
+ * Injects a 1x1 tracking pixel if PUBLIC_TRACKING_ORIGIN is set.
+ * Adds at end of <body>. If no body, appends to HTML.
+ */
+function maybeInjectOpenPixel(html, campaignId, recipient) {
+  if (!PUBLIC_TRACKING_ORIGIN) return html;
 
-  if ($('body').length) $('body').append(pixelTag);
-  else $.root().append(pixelTag);
+  const $ = cheerio.load(html || "<html><body></body></html>", null, false);
+
+  const pixelUrl = `${PUBLIC_TRACKING_ORIGIN}/track/open.gif?cid=${encodeURIComponent(
+    campaignId || "unknown"
+  )}&r=${encodeURIComponent(recipient || "")}`;
+
+  const pixel = `<img src="${pixelUrl}" width="1" height="1" style="display:none;opacity:0" alt="" />`;
+
+  if ($("body").length) {
+    $("body").append(pixel);
+  } else {
+    $.root().append(pixel);
+  }
 
   return $.html();
 }
 
-// POST /api/campaigns/email
-// Body: { subject, html, text?, recipients: string[], fromEmail?, fromName?, name? }
-router.post('/email', async (req, res) => {
+/**
+ * POST /api/campaigns/email
+ * Body:
+ * {
+ *   "subject": "Hello",
+ *   "html": "<h1>Hi</h1>",
+ *   "recipients": ["a@b.com","c@d.com"],
+ *   "fromEmail": "no-reply@beypro.com",        // optional (falls back to env FROM_EMAIL)
+ *   "fromName": "Beypro Campaigns",            // optional (falls back to env FROM_NAME)
+ *   "campaignId": "summer-2025"                // optional (used for tracking pixel)
+ * }
+ */
+router.post("/email", async (req, res) => {
   try {
-    const {
-      subject,
-      html,
-      text,
-      recipients,
-      fromEmail,
-      fromName,
-      name,
-    } = req.body || {};
+    const { subject, html, recipients, fromEmail, fromName, campaignId } =
+      req.body || {};
 
-    if (!subject || !html) {
-      return res.status(400).json({ ok: false, error: 'subject and html are required' });
+    if (!subject || typeof subject !== "string") {
+      return jsonError(res, 400, "Missing or invalid 'subject'.");
+    }
+    if (!html || typeof html !== "string") {
+      return jsonError(res, 400, "Missing or invalid 'html'.");
     }
     if (!Array.isArray(recipients) || recipients.length === 0) {
-      return res.status(400).json({ ok: false, error: 'recipients[] is required' });
+      return jsonError(res, 400, "Provide at least one recipient in 'recipients'.");
     }
 
-    // Basic SMTP sanity check (helps early diagnosis)
-    const senderEmail = fromEmail || process.env.SMTP_FROM || process.env.SMTP_USER;
-    if (!senderEmail) {
-      return res.status(400).json({ ok: false, error: 'fromEmail or SMTP_FROM/SMTP_USER must be set' });
-    }
-    const sender = fromName ? `"${fromName}" <${senderEmail}>` : senderEmail;
-
-    // Create campaign shell
-    const campaignName = name || `Campaign ${new Date().toISOString().slice(0, 10)}`;
-    const insertSql = `
-      INSERT INTO campaigns (name, subject, html, text, sent_count, sent_at)
-      VALUES ($1, $2, $3, $4, 0, NULL)
-      RETURNING id, name, subject
-    `;
-    const insertVals = [campaignName, subject, html, text || null];
-    const { rows } = await pool.query(insertSql, insertVals);
-    const campaignId = rows[0].id;
-
-    const trackingOrigin = getTrackingOrigin(req);
-
-    // (Optional) dedupe recipients while preserving order
-    const seen = new Set();
-    const rcpts = recipients
-      .map(r => String(r || '').trim())
-      .filter(r => r && !seen.has(r) && (seen.add(r) || true));
-
-    let sent = 0;
-    const failures = [];
-
-    // Send sequentially (swap to Promise.allSettled if your SMTP allows burst)
-    for (const rcpt of rcpts) {
-      try {
-        const personalizedHtml = rewriteAnchorsWithTracking(
-          html,
-          trackingOrigin,
-          campaignId,
-          rcpt
-        );
-
-        await transporter.sendMail({
-          from: sender,
-          to: rcpt,
-          subject,
-          html: personalizedHtml,
-          text: text || undefined,
-        });
-
-        // If you want explicit "sent" events per recipient, uncomment:
-        // await pool.query(
-        //   `INSERT INTO campaign_events (campaign_id, customer_email, event_type, event_time)
-        //    VALUES ($1, $2, 'sent', NOW())`,
-        //   [campaignId, rcpt]
-        // );
-
-        sent += 1;
-      } catch (e) {
-        failures.push({ email: rcpt, error: e?.message || String(e) });
-      }
+    const FROM_EMAIL = fromEmail || process.env.FROM_EMAIL;
+    const FROM_NAME = fromName || process.env.FROM_NAME || "Beypro";
+    if (!FROM_EMAIL) {
+      return jsonError(res, 400, "No 'fromEmail' provided and FROM_EMAIL env not set.");
     }
 
-    if (sent > 0) {
-      await pool.query(
-        `UPDATE campaigns SET sent_count = $1, sent_at = NOW() WHERE id = $2`,
-        [sent, campaignId]
-      );
+    const transporter = makeTransporter();
+
+    const results = [];
+    for (const rcpt of recipients) {
+      const htmlWithPixel = maybeInjectOpenPixel(html, campaignId, rcpt);
+
+      const info = await transporter.sendMail({
+        from: `"${FROM_NAME}" <${FROM_EMAIL}>`,
+        to: rcpt,
+        subject,
+        html: htmlWithPixel,
+      });
+
+      results.push({
+        to: rcpt,
+        messageId: info.messageId || null,
+        accepted: info.accepted || [],
+        rejected: info.rejected || [],
+        response: info.response || null,
+      });
     }
 
-    return res.json({
-      ok: true,
-      campaignId,
-      name: campaignName,
-      subject,
-      sent,
-      failed: failures.length,
-      failures,
-      trackingOrigin,
-    });
+    return res.status(200).json({ ok: true, sent: results.length, results });
   } catch (err) {
-    console.error('POST /api/campaigns/email error:', err);
-    return res.status(500).json({ ok: false, error: 'internal_error' });
+    // Always return JSON so the frontend never tries to parse HTML
+    return jsonError(res, 500, err.message || "Unknown server error");
   }
 });
 
