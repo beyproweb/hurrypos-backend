@@ -225,6 +225,7 @@ router.post("/", async (req, res) => {
 });
 
 // PUT /api/products/:id
+// PUT /api/products/:id
 router.put("/:id", async (req, res) => {
   const { id } = req.params;
   const {
@@ -246,13 +247,14 @@ router.put("/:id", async (req, res) => {
     selectedExtrasGroup,
   } = req.body;
 
-  const parsedIngredients = JSON.stringify(
-    Array.isArray(ingredients) ? ingredients : []
-  );
-  const parsedExtras = JSON.stringify(Array.isArray(extras) ? extras : []);
-  const parsedGroup = JSON.stringify(
-    Array.isArray(selectedExtrasGroup) ? selectedExtrasGroup : []
-  );
+  // Keep these as JSON strings if your DB columns are TEXT/JSON(B)
+  const parsedIngredients = JSON.stringify(Array.isArray(ingredients) ? ingredients : []);
+  const parsedExtrasJson = JSON.stringify(Array.isArray(extras) ? extras : []);
+
+  // Convert group IDs to a real JS number array for int[] column
+  const toIntArray = (v) =>
+    Array.isArray(v) ? v.map((n) => Number(n)).filter((n) => Number.isFinite(n)) : [];
+  const groupArr = toIntArray(selectedExtrasGroup);
 
   const client = await pool.connect();
   try {
@@ -273,9 +275,9 @@ router.put("/:id", async (req, res) => {
         promo_start = $11,
         promo_end = $12,
         image = $13,
-        ingredients = $14,
-        extras = $15,
-        selected_extras_group = $16
+        ingredients = $14,                 -- TEXT or JSON(B) column
+        extras = $15,                      -- TEXT or JSON(B) column
+        selected_extras_group = COALESCE($16::int[], ARRAY[]::int[])  -- ✅ cast!
       WHERE id = $17
       RETURNING *`,
       [
@@ -292,9 +294,9 @@ router.put("/:id", async (req, res) => {
         promo_start || null,
         promo_end || null,
         image || null,
-        parsedIngredients,
-        parsedExtras,
-        parsedGroup,
+        parsedIngredients,     // stays a string (JSON)
+        parsedExtrasJson,      // stays a string (JSON)
+        groupArr,              // real JS array → ::int[]
         id,
       ]
     );
@@ -309,6 +311,7 @@ router.put("/:id", async (req, res) => {
     client.release();
   }
 });
+
 
 // DELETE /api/extras-groups/:groupId/items/:itemId
 router.delete("/:groupId/items/:itemId", async (req, res) => {
