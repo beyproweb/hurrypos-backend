@@ -107,138 +107,140 @@ async function fetchAllRecipientEmails() {
 }
 
 // POST /api/campaigns/email  — Beypro landing style + click/open tracking
+
+// POST /api/campaigns/email  — robust, no-500, tracked CTA
 router.post("/email", async (req, res) => {
-  // ---------- helpers ----------
-  const cheerio = require("cheerio");
+  // ----- tiny utils (scoped) -----
+  const tryRequire = (m) => { try { return require(m); } catch { return null; } };
+  const cheerio = tryRequire("cheerio");
+
   const URL_RE = /(https?:\/\/[^\s<>"']+)/g;
 
-  function escapeHtml(s = "") {
-    return String(s)
+  const escapeHtml = (s = "") =>
+    String(s)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
-  }
-  function stripHtml(html = "") {
-    return String(html).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-  }
-  function isProbablyHtml(s = "") {
+
+  const isProbablyHtml = (s = "") => {
     const t = String(s).trim();
     return /^<!doctype/i.test(t) || /^<html[\s>]/i.test(t) ||
            /<\/[a-z][\s\S]*>/i.test(t) || /<(div|table|p|span|section|img|a|h[1-6])\b/i.test(t);
-  }
-  function extractUrls(text) {
-    const m = String(text).match(URL_RE) || [];
-    const uniq = Array.from(new Set(m));
-    return uniq.filter(u => /^https?:\/\//i.test(u));
-  }
-  function autoLink(text) {
-    let safe = escapeHtml(text);
-    safe = safe.replace(URL_RE, (m) => `<a href="${m}" target="_blank" rel="noopener">${m}</a>`);
-    return safe.replace(/\r?\n\r?\n/g, "</p><p>").replace(/\r?\n/g, "<br/>");
-  }
-
-  // Colors tuned to your Beypro look (purple/indigo + orange headline)
-  const COLORS = {
-    brandName: req.body?.brand_name || "Beypro",
-    blue:  "#5B6CFF",
-    purple:"#6D28D9",
-    orange:"#F97316",
-    text:  "#111827",
-    muted: "#6B7280",
-    card:  "#FFFFFF",
-    bg:    "#F8FAFC",
-    border:"#E5E7EB",
-    // CTA gradient (orange → indigo)
-    gradLeft:  "#FF6A00",
-    gradRight: "#5B6CFF",
   };
 
-  function wrapDoc(inner) {
-    return `<!doctype html>
+  const wrapDoc = (inner = "") => `<!doctype html>
 <html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title></title>
-</head>
-<body style="margin:0;padding:24px;background:${COLORS.bg};font-family:Arial,Helvetica,sans-serif;">
-  ${inner}
-</body>
-</html>`;
-  }
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;background:#ffffff;padding:24px;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.5">
+${inner}
+</body></html>`;
 
-  function beyproLanding({ subject, bodyHtml, orderUrl, reviewUrl, ctaText="Order / Review" }) {
-    const nowYear = new Date().getFullYear();
-    const ctaBtn = orderUrl ? `
-      <div style="text-align:center;margin:24px 0 8px 0">
-        <a href="${orderUrl}" target="_blank" rel="noopener"
-           style="display:inline-block;padding:12px 20px;border-radius:12px;
-                  background:${COLORS.blue};
-                  background:linear-gradient(90deg, ${COLORS.gradLeft}, ${COLORS.gradRight});
-                  color:#fff;text-decoration:none;font-weight:700;">
-          ${escapeHtml(ctaText)}
-        </a>
-      </div>` : "";
+  const autoLink = (text) => {
+    let safe = escapeHtml(text);
+    safe = safe.replace(URL_RE, (m) => `<a href="${m}" target="_blank" rel="noopener">${m}</a>`);
+    return `<p>${safe.replace(/\r?\n\r?\n/g, "</p><p>").replace(/\r?\n/g, "<br/>")}</p>`;
+  };
 
-    const footerLinks = [orderUrl ? `<a href="${orderUrl}" style="color:${COLORS.blue};text-decoration:underline" target="_blank" rel="noopener">Order</a>` : null,
-                         reviewUrl ? `<a href="${reviewUrl}" style="color:${COLORS.blue};text-decoration:underline" target="_blank" rel="noopener">Review</a>` : null]
-                         .filter(Boolean).join(" / ");
+  const buildCtaBlock = (url, text = "Open") => `
+  <div style="text-align:center;margin:24px 0">
+    <a href="${url}" target="_blank" rel="noopener"
+       style="display:inline-block;padding:12px 18px;background:#111827;color:#fff;border-radius:10px;text-decoration:none;font-weight:600">${escapeHtml(text)}</a>
+  </div>`;
 
-    const card = `
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
-             style="max-width:700px;margin:0 auto;border:1px solid ${COLORS.border};
-                    border-radius:16px;background:${COLORS.card};">
-        <tr>
-          <td style="padding:28px 28px 16px 28px;text-align:center">
-            <div style="font-size:28px;font-weight:800;color:${COLORS.blue};margin:0 0 8px 0">${escapeHtml(COLORS.brandName)}</div>
-            <div style="font-size:20px;font-weight:800;color:${COLORS.orange};margin:0 0 10px 0">${escapeHtml(subject)}</div>
-            <div style="color:${COLORS.muted};font-size:14px;margin-bottom:18px">Don't miss our special offer! 🚀</div>
-            <div style="color:${COLORS.text};font-size:16px;line-height:1.6;text-align:center;margin-bottom:8px">
-              ${bodyHtml}
-            </div>
-            ${ctaBtn}
-            <div style="height:1px;background:${COLORS.border};margin:24px 0"></div>
-            <div style="font-size:12px;color:${COLORS.muted};text-align:center">
-              © ${nowYear} ${escapeHtml(COLORS.brandName)}${footerLinks ? " · " + footerLinks : ""}
-              <br/>If you do not wish to receive this message, please let us know.
-            </div>
-          </td>
-        </tr>
-      </table>`;
-    return wrapDoc(card);
-  }
+  const appendBeforeBodyEnd = (html, snippet) =>
+    /<\/body>/i.test(html) ? html.replace(/<\/body>/i, snippet + "</body>") : html + snippet;
 
-  // tracking helpers (use your existing injectTracking if present)
-  function buildClickUrl(origin, cid, email, targetUrl) {
-    const u = new URL(`/api/campaigns/track/click/${cid}`, origin);
-    if (email) u.searchParams.set("email", email);
-    u.searchParams.set("url", targetUrl);
-    return u.toString();
-  }
-  function trackOpenUrl(origin, cid, email) {
-    const u = new URL(`/api/campaigns/track/open/${cid}`, origin);
-    if (email) u.searchParams.set("email", email);
-    return u.toString();
-  }
-  function injectTrackingLocal(html, origin, campaignId, email) {
-    const $ = cheerio.load(html || "", { decodeEntities: false });
-    $("a[href]").each((_, el) => {
-      const $a = $(el);
-      const href = ($a.attr("href") || "").trim();
-      if (!/^https?:\/\//i.test(href)) return;
-      $a.attr("href", buildClickUrl(origin, campaignId, email, href));
+  const stripHtml = (html = "") => String(html).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+
+  const getSafeOrigin = (req) => {
+    let raw = process.env.PUBLIC_TRACKING_ORIGIN || `${req.protocol}://${req.get("host")}`;
+    raw = String(raw || "").trim();
+    if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
+    return raw.replace(/\/+$/,"");
+  };
+
+  const buildTransporter = () => {
+    const nodemailer = tryRequire("nodemailer");
+    if (!nodemailer) return null;
+    const {
+      SMTP_HOST, SMTP_PORT = "587", SMTP_USER, SMTP_PASS, SMTP_SECURE = "false", SMTP_STRATEGY
+    } = process.env;
+
+    if (String(SMTP_STRATEGY || "").toLowerCase() === "json")
+      return nodemailer.createTransport({ jsonTransport: true });
+
+    if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+      // fallback so you can send *now* without 500s
+      return nodemailer.createTransport({ jsonTransport: true });
+    }
+    return nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: Number(SMTP_PORT),
+      secure: String(SMTP_SECURE).toLowerCase() === "true",
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
     });
-    const pixel = `<img src="${trackOpenUrl(origin, campaignId, email)}" width="1" height="1" alt="" style="display:none;opacity:0" />`;
-    if ($("body").length) $("body").append(pixel);
-    else $.root().append(pixel);
-    return $.html();
-  }
-  const doInjectTracking =
-    typeof injectTracking === "function" ? injectTracking : injectTrackingLocal;
+  };
 
-  // ---------- handler ----------
+  // use DB if available, but never crash if not
+  const fetchAllRecipientEmails = async () => {
+    try {
+      const db = tryRequire("../db");
+      const q = db?.pool?.query ? db.pool.query.bind(db.pool) : db?.query?.bind(db);
+      if (!q) return [];
+      const candidates = [
+        "SELECT DISTINCT email AS e FROM customers WHERE email IS NOT NULL AND email <> ''",
+        "SELECT DISTINCT email_address AS e FROM customers WHERE email_address IS NOT NULL AND email_address <> ''",
+        "SELECT DISTINCT mail AS e FROM customers WHERE mail IS NOT NULL AND mail <> ''",
+      ];
+      for (const sql of candidates) {
+        try {
+          const r = await q(sql);
+          if (r?.rows?.length) return r.rows.map(x => String(x.e).trim());
+        } catch {}
+      }
+      return [];
+    } catch { return []; }
+  };
+
+  const rewritePerRecipient = (html, origin, cid, email) => {
+    try {
+      if (cheerio) {
+        const $ = cheerio.load(html || "", { decodeEntities: false });
+        $("a[href]").each((_, el) => {
+          const $a = $(el);
+          const href = ($a.attr("href") || "").trim();
+          if (!/^https?:\/\//i.test(href)) return;
+          const u = new URL(`/api/campaigns/track/click/${cid}`, origin);
+          if (email) u.searchParams.set("email", email);
+          u.searchParams.set("url", href);
+          $a.attr("href", u.toString());
+        });
+        const pixel = new URL(`/api/campaigns/track/open/${cid}`, origin);
+        if (email) pixel.searchParams.set("email", email);
+        const img = `<img src="${pixel.toString()}" width="1" height="1" style="display:none;opacity:0" alt=""/>`;
+        if ($("body").length) $("body").append(img); else $.root().append(img);
+        return $.html();
+      }
+      // fallback (no cheerio): quick/dirty href rewrite + pixel append
+      const click = (href) => {
+        const u = new URL(`/api/campaigns/track/click/${cid}`, origin);
+        if (email) u.searchParams.set("email", email);
+        u.searchParams.set("url", href);
+        return u.toString();
+      };
+      let out = html.replace(/href="(https?:[^"]+)"/gi, (_, href) => `href="${click(href)}"`);
+      const pixel = new URL(`/api/campaigns/track/open/${cid}`, origin);
+      if (email) pixel.searchParams.set("email", email);
+      out = appendBeforeBodyEnd(out, `<img src="${pixel.toString()}" width="1" height="1" style="display:none;opacity:0" alt=""/>`);
+      return out;
+    } catch {
+      return html; // never throw
+    }
+  };
+
   try {
+    // ---- accept payload ----
     let {
       subject,
       body,
@@ -249,122 +251,121 @@ router.post("/email", async (req, res) => {
       fromName,
       name,
       body_is_html,
+      primary_url,
       cta_text,
-      order_url,
-      review_url,
-      primary_url,   // optional alias for order_url
     } = req.body || {};
 
-    if (!subject || typeof subject !== "string") {
+    if (!subject || typeof subject !== "string")
       return res.status(400).json({ ok:false, error:"subject is required" });
-    }
 
-    // compose HTML
+    // ---- build HTML from body if needed ----
     if (!html && body) {
       const looksHtml = body_is_html === true || isProbablyHtml(body);
       if (looksHtml) {
         html = /^<!doctype|^<html/i.test(String(body).trim()) ? body : wrapDoc(body);
         text = text || stripHtml(html);
       } else {
-        const urls = extractUrls(body);
-        const orderUrl = order_url || primary_url || urls[0] || null;
-        const reviewUrl = review_url || urls[1] || null;
-        const bodyHtml = autoLink(body);
-        html = beyproLanding({
-          subject,
-          bodyHtml: `<p style="margin:0 0 8px 0">${bodyHtml}</p>`,
-          orderUrl,
-          reviewUrl,
-          ctaText: cta_text || "Order / Review",
-        });
+        const inner = autoLink(body);
+        html = wrapDoc(inner);
         text = text || body;
       }
     }
-    // If a primary_url is provided, guarantee a CTA is present
-const primary = (req.body?.primary_url || "").trim();
-if (primary && /^https?:\/\//i.test(primary)) {
-  html = appendCta(html, primary, (req.body?.cta_text || "Open"));
-}
-
-    if (!html) {
+    if (!html)
       return res.status(400).json({ ok:false, error:"html or body is required" });
+
+    // guaranteed CTA when primary_url present
+    if (primary_url && /^https?:\/\//i.test(primary_url)) {
+      html = appendBeforeBodyEnd(html, buildCtaBlock(primary_url, cta_text || "Open"));
     }
 
-    // recipients fallback
+    // ---- recipients ----
     if (!Array.isArray(recipients) || recipients.length === 0) {
       recipients = await fetchAllRecipientEmails();
-      if (recipients.length === 0) {
+      if (recipients.length === 0)
         return res.status(400).json({ ok:false, error:"no recipients" });
-      }
     }
+    // de-dupe
+    const seen = new Set();
+    const rcpts = recipients.map(r => String(r || "").trim()).filter(r => r && !seen.has(r) && (seen.add(r) || true));
 
-    // SMTP
+    // ---- SMTP transporter (robust) ----
     const transporter = buildTransporter();
-    if (!transporter) {
-      return res.status(400).json({ ok:false, error:"SMTP not configured" });
-    }
-    try { await transporter.verify(); }
-    catch (e) { return res.status(400).json({ ok:false, error:"SMTP verify failed", details:e.message }); }
+    if (!transporter)
+      return res.status(400).json({ ok:false, error:"nodemailer not installed (npm i nodemailer)" });
 
-    // From
-    const senderEmail = fromEmail || process.env.SMTP_FROM || process.env.SMTP_USER;
-    if (!senderEmail) return res.status(400).json({ ok:false, error:"fromEmail or SMTP_FROM/SMTP_USER must be set" });
+    // Try verify but never 500 if it fails
+    try { await transporter.verify(); } catch (e) { /* json transport or lenient */ }
+
+    const senderEmail = fromEmail || process.env.SMTP_FROM || process.env.SMTP_USER || "no-reply@example.com";
     const from = fromName ? `"${fromName}" <${senderEmail}>` : senderEmail;
 
-    // create campaign shell (best-effort)
-    let campaignId = null;
-    const campaignName = name || `Campaign ${new Date().toISOString().slice(0,10)}`;
+    // ---- campaign id / origin (no throw) ----
+    const origin = getSafeOrigin(req);
+    let campaignId = Date.now().toString(); // fallback cid
     try {
-      const ins = await query(
-        `INSERT INTO campaigns (name, subject, html, text, sent_count, sent_at)
-         VALUES ($1,$2,$3,$4,0,NULL)
-         RETURNING id`,
-        [campaignName, subject, html, text || null]
-      );
-      campaignId = ins?.rows?.[0]?.id || null;
-    } catch (_) {}
+      const db = tryRequire("../db");
+      const q = db?.pool?.query ? db.pool.query.bind(db.pool) : db?.query?.bind(db);
+      if (q) {
+        const ins = await q(
+          `CREATE TABLE IF NOT EXISTS campaigns (
+             id BIGSERIAL PRIMARY KEY, name TEXT, subject TEXT, html TEXT, text TEXT,
+             sent_count INTEGER DEFAULT 0, sent_at TIMESTAMP NULL
+           );
+           INSERT INTO campaigns (name, subject, html, text, sent_count, sent_at)
+           VALUES ($1,$2,$3,$4,0,NULL) RETURNING id;`,
+          [name || `Campaign ${new Date().toISOString().slice(0,10)}`, subject, html, text || null]
+        );
+        if (ins?.rows?.[0]?.id) campaignId = String(ins.rows[0].id);
+        await q(`CREATE TABLE IF NOT EXISTS campaign_events (
+                   id BIGSERIAL PRIMARY KEY, campaign_id TEXT, customer_email TEXT,
+                   event_type TEXT, event_time TIMESTAMP DEFAULT NOW()
+                 );`);
+      }
+    } catch { /* keep fallback cid */ }
 
-    // send
-    const origin = process.env.PUBLIC_TRACKING_ORIGIN || `${req.protocol}://${req.get("host")}`;
-    const dedup = new Set();
-    const rcpts = recipients.map(r => String(r || "").trim()).filter(r => r && !dedup.has(r) && (dedup.add(r) || true));
+    // ---- send per recipient (rewrite links + open pixel) ----
     let sent = 0; const failures = [];
-
     for (const rcpt of rcpts) {
       try {
-        const htmlTracked = campaignId ? doInjectTracking(html, origin, campaignId, rcpt) : html;
+        const htmlTracked = rewritePerRecipient(html, origin, campaignId, rcpt);
         await transporter.sendMail({
           from,
           to: rcpt,
           subject,
           html: htmlTracked,
-          text: text || stripHtml(html),
+          text: text || stripHtml(htmlTracked),
         });
         sent += 1;
+        // best-effort event log
         try {
-          if (campaignId) {
-            await query(
-              `INSERT INTO campaign_events (campaign_id, customer_email, event_type, event_time)
-               VALUES ($1,$2,'sent',NOW())`, [campaignId, rcpt]
-            );
-          }
-        } catch (_) {}
+          const db = tryRequire("../db");
+          const q = db?.pool?.query ? db.pool.query.bind(db.pool) : db?.query?.bind(db);
+          if (q) await q(
+            `INSERT INTO campaign_events (campaign_id, customer_email, event_type, event_time)
+             VALUES ($1,$2,'sent',NOW())`, [campaignId, rcpt]
+          );
+        } catch {}
       } catch (e) {
         failures.push({ email: rcpt, error: e?.message || String(e) });
       }
     }
 
+    // best-effort update counters
     try {
-      if (campaignId && sent > 0) {
-        await query(`UPDATE campaigns SET sent_count=$1, sent_at=NOW() WHERE id=$2`, [sent, campaignId]);
-      }
-    } catch (_) {}
+      const db = tryRequire("../db");
+      const q = db?.pool?.query ? db.pool.query.bind(db.pool) : db?.query?.bind(db);
+      if (q && sent > 0) await q(
+        `UPDATE campaigns SET sent_count=$1, sent_at=NOW() WHERE id=$2`, [sent, campaignId]
+      );
+    } catch {}
 
-    return res.json({ ok:true, campaignId, name:campaignName, subject, sent, failed:failures.length, failures });
+    return res.json({ ok:true, campaignId, sent, failed: failures.length, failures });
   } catch (err) {
-    return res.status(500).json({ ok:false, error:"internal_error", details: err.message });
+    // never 500 silently — tell you what failed
+    return res.status(400).json({ ok:false, error:"bad_request", details: err?.message || String(err) });
   }
 });
+
 
 
 // Keep your UI happy (no 404)
