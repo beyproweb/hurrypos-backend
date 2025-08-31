@@ -111,8 +111,44 @@ async function fetchAllRecipientEmails() {
  * Accepts your current payload: { subject, body }
  * Optional: { html, text, recipients[], fromEmail, fromName, name }
  */
+// POST /api/campaigns/email
 router.post("/email", async (req, res) => {
+  // --- local helpers (scoped to this route for safety) ---
+  function escapeHtml(s = "") {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+  function isProbablyHtml(s = "") {
+    const t = String(s).trim();
+    return (
+      /^<!doctype/i.test(t) ||
+      /^<html[\s>]/i.test(t) ||
+      /<\/[a-z][\s\S]*>/i.test(t) || // has closing tag somewhere
+      /<(div|table|p|span|section|header|footer|img|a|h[1-6])\b/i.test(t)
+    );
+  }
+  function wrapIfFragment(html = "") {
+    const t = String(html).trim();
+    if (/^<!doctype/i.test(t) || /^<html[\s>]/i.test(t)) return html;
+    return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title></title>
+  </head>
+  <body style="margin:0;background:#ffffff;padding:16px;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.5">
+    ${t}
+  </body>
+</html>`;
+  }
+
   try {
+    // Accepts your current payload: { subject, body }
+    // Optional: { html, text, recipients[], fromEmail, fromName, name, body_is_html }
     let {
       subject,
       body,
@@ -122,37 +158,44 @@ router.post("/email", async (req, res) => {
       fromEmail,
       fromName,
       name,
+      body_is_html,
     } = req.body || {};
 
     if (!subject || typeof subject !== "string") {
       return jsonError(res, 400, "subject is required");
     }
 
+    // Convert body → html when needed, with HTML auto-detect
     if (!html && body) {
-      const safe = escapeHtml(String(body));
-      html = `<!doctype html><html><body style="font-family:Arial,sans-serif;line-height:1.5;padding:12px;">
-        <div>${safe.replace(/\n/g, "<br/>")}</div>
-      </body></html>`;
-      text = text || body;
+      const bodyStr = String(body);
+      const forceHtml = body_is_html === true;
+
+      if (forceHtml || isProbablyHtml(bodyStr)) {
+        // treat provided body as HTML (no escaping)
+        html = wrapIfFragment(bodyStr);
+        text = text || stripHtml(html);
+      } else {
+        // plain text → escape + <br>, then wrap
+        const safe = escapeHtml(bodyStr).replace(/\n/g, "<br/>");
+        html = wrapIfFragment(safe);
+        text = text || bodyStr;
+      }
     }
     if (!html) {
       return jsonError(res, 400, "html or body is required");
     }
 
-    // recipients
+    // Recipients: use provided or fallback to customers table
     if (!Array.isArray(recipients) || recipients.length === 0) {
       recipients = await fetchAllRecipientEmails();
       if (recipients.length === 0) {
-        return jsonError(
-          res,
-          400,
-          "no recipients",
-          { hint: "Pass recipients[] or ensure customers table has emails" }
-        );
+        return jsonError(res, 400, "no recipients", {
+          hint: "Pass recipients[] or ensure customers table has emails",
+        });
       }
     }
 
-    // Transporter
+    // SMTP transporter
     const transporter = buildTransporter();
     if (!transporter) {
       return jsonError(res, 400, "SMTP not configured", {
@@ -160,51 +203,24 @@ router.post("/email", async (req, res) => {
         tip: "For quick dry-run set SMTP_STRATEGY=json",
       });
     }
-
-    // Verify connection (gives clear 400 instead of 500)
     try {
       await transporter.verify();
     } catch (e) {
       return jsonError(res, 400, "SMTP verify failed", { details: e.message });
     }
 
+    // From
     const senderEmail =
       fromEmail || process.env.SMTP_FROM || process.env.SMTP_USER;
+    if (!senderEmail) {
+      return jsonError(res, 400, "fromEmail or SMTP_FROM/SMTP_USER must be set");
+    }
     const from =
       fromName && senderEmail ? `"${fromName}" <${senderEmail}>` : senderEmail;
 
-    if (!from) {
-      return jsonError(res, 400, "fromEmail or SMTP_FROM/SMTP_USER must be set");
-    }
-
-    // Ensure tables (best-effort; won’t 500 if DB missing)
-    try {
-      await query(`
-        CREATE TABLE IF NOT EXISTS campaigns (
-          id BIGSERIAL PRIMARY KEY,
-          name TEXT,
-          subject TEXT,
-          html TEXT,
-          text TEXT,
-          sent_count INTEGER DEFAULT 0,
-          sent_at TIMESTAMP NULL
-        );
-      `);
-      await query(`
-        CREATE TABLE IF NOT EXISTS campaign_events (
-          id BIGSERIAL PRIMARY KEY,
-          campaign_id BIGINT,
-          customer_email TEXT,
-          event_type TEXT,
-          event_time TIMESTAMP DEFAULT NOW()
-        );
-      `);
-    } catch (_) {}
-
-    // Insert campaign shell (best-effort)
+    // Ensure/insert campaign (best-effort)
     let campaignId = null;
-    const campaignName =
-      name || `Campaign ${new Date().toISOString().slice(0, 10)}`;
+    const campaignName = name || `Campaign ${new Date().toISOString().slice(0, 10)}`;
     try {
       const ins = await query(
         `INSERT INTO campaigns (name, subject, html, text, sent_count, sent_at)
@@ -213,9 +229,11 @@ router.post("/email", async (req, res) => {
         [campaignName, subject, html, text || null]
       );
       campaignId = ins?.rows?.[0]?.id || null;
-    } catch (_) {}
+    } catch (_) {
+      // ignore — keep sending without a DB id
+    }
 
-    // de-dupe recipients
+    // De-dupe recipients
     const seen = new Set();
     const rcpts = recipients
       .map((r) => String(r || "").trim())
@@ -225,6 +243,7 @@ router.post("/email", async (req, res) => {
     let sent = 0;
     const failures = [];
 
+    // Send loop
     for (const rcpt of rcpts) {
       try {
         const htmlTracked = campaignId
@@ -240,6 +259,7 @@ router.post("/email", async (req, res) => {
         });
 
         sent += 1;
+        // Optional event log
         try {
           if (campaignId) {
             await query(
@@ -254,6 +274,7 @@ router.post("/email", async (req, res) => {
       }
     }
 
+    // Update campaign counters
     try {
       if (campaignId && sent > 0) {
         await query(
@@ -263,6 +284,7 @@ router.post("/email", async (req, res) => {
       }
     } catch (_) {}
 
+    // Final JSON
     return res.json({
       ok: true,
       campaignId,
@@ -273,7 +295,6 @@ router.post("/email", async (req, res) => {
       failures,
     });
   } catch (err) {
-    // Return the real error to the client so you see why it failed
     return jsonError(res, 500, "internal_error", { details: err.message });
   }
 });
