@@ -369,15 +369,55 @@ ${inner}
 
 
 // Keep your UI happy (no 404)
+// GET /api/campaigns/stats/last — robust type-safe stats
 router.get("/stats/last", async (req, res) => {
+  // local helpers
+  const stripHtml = (html = "") => String(html).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+
+  // get a query function from ../db (pool or direct)
+  let q = null;
   try {
-    const r = await query(
-      `SELECT id, subject, html, text, sent_count, sent_at
-         FROM campaigns
-        WHERE sent_at IS NOT NULL
-        ORDER BY sent_at DESC
-        LIMIT 1`
-    );
+    const db = require("../db");
+    q = db?.pool?.query ? db.pool.query.bind(db.pool) : (typeof db?.query === "function" ? db.query.bind(db) : null);
+  } catch (_) {}
+
+  if (!q) {
+    // No DB? Keep UI happy
+    return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
+  }
+
+  try {
+    // Ensure tables exist (don’t error if already there)
+    await q(`
+      CREATE TABLE IF NOT EXISTS campaigns (
+        id BIGSERIAL PRIMARY KEY,
+        name TEXT,
+        subject TEXT,
+        html TEXT,
+        text TEXT,
+        sent_count INTEGER DEFAULT 0,
+        sent_at TIMESTAMP NULL
+      );
+    `);
+    await q(`
+      CREATE TABLE IF NOT EXISTS campaign_events (
+        id BIGSERIAL PRIMARY KEY,
+        campaign_id TEXT,                 -- TEXT on purpose for compatibility
+        customer_email TEXT,
+        event_type TEXT,                  -- 'sent' | 'open' | 'click'
+        event_time TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    // 1) Find latest campaign that actually sent
+    const r = await q(`
+      SELECT id::text AS id, subject, html, text, sent_count, sent_at
+        FROM campaigns
+       WHERE sent_at IS NOT NULL
+       ORDER BY sent_at DESC
+       LIMIT 1
+    `);
+
     if (!r?.rows?.length) {
       return res.json({
         ok: true,
@@ -388,37 +428,41 @@ router.get("/stats/last", async (req, res) => {
         sent_at: null,
       });
     }
-    const c = r.rows[0];
 
-    let uOpen = 0,
-      uClick = 0;
-    try {
-      const e = await query(
-        `SELECT event_type, COUNT(DISTINCT customer_email) AS u
-           FROM campaign_events
-          WHERE campaign_id = $1 AND event_type IN ('open','click')
-          GROUP BY event_type`,
-        [c.id]
-      );
-      for (const row of e.rows || []) {
-        if (row.event_type === "open") uOpen = Number(row.u || 0);
-        else if (row.event_type === "click") uClick = Number(row.u || 0);
-      }
-    } catch (_) {}
+    const camp = r.rows[0];
+    const sent = Number(camp.sent_count || 0) || 0;
 
-    const sent = Number(c.sent_count || 0);
-    const openRate = sent ? Math.round((uOpen / sent) * 1000) / 10 : 0;
-    const clickRate = sent ? Math.round((uClick / sent) * 1000) / 10 : 0;
+    // 2) Count unique opens and clicks for this campaign id (string compare)
+    const e = await q(
+      `
+      SELECT event_type, COUNT(DISTINCT customer_email) AS u
+        FROM campaign_events
+       WHERE campaign_id::text = $1
+         AND event_type IN ('open','click')
+       GROUP BY event_type
+      `,
+      [camp.id] // id is already text above
+    );
+
+    let uniqueOpens = 0, uniqueClicks = 0;
+    for (const row of e.rows || []) {
+      if (row.event_type === "open") uniqueOpens = Number(row.u || 0);
+      else if (row.event_type === "click") uniqueClicks = Number(row.u || 0);
+    }
+
+    const openRate = sent ? Math.round((uniqueOpens / sent) * 1000) / 10 : 0;
+    const clickRate = sent ? Math.round((uniqueClicks / sent) * 1000) / 10 : 0;
 
     return res.json({
       ok: true,
-      subject: c.subject || "",
-      message: c.text || stripHtml(c.html || ""),
+      subject: camp.subject || "",
+      message: camp.text || stripHtml(camp.html || ""),
       openRate,
       clickRate,
-      sent_at: c.sent_at,
+      sent_at: camp.sent_at,
     });
-  } catch (_) {
+  } catch (err) {
+    // Never break your UI
     return res.json({
       ok: true,
       subject: "",
@@ -426,42 +470,72 @@ router.get("/stats/last", async (req, res) => {
       openRate: 0,
       clickRate: 0,
       sent_at: null,
+      note: "stats_failed: " + (err?.message || String(err)),
     });
   }
 });
+
 
 // trackers (optional)
 const ONE_BY_ONE_GIF = Buffer.from(
   "47494638396101000100800000ffffff00000021f90401000001002c00000000010001000002024401003b",
   "hex"
 );
+
+// 1×1 open pixel
 router.get("/track/open/:campaignId", async (req, res) => {
   const { campaignId } = req.params;
   const email = String(req.query.email || "").slice(0, 256);
   try {
-    await query(
+    const db = require("../db");
+    const q = db?.pool?.query ? db.pool.query.bind(db.pool) : db.query.bind(db);
+    await q(`
+      CREATE TABLE IF NOT EXISTS campaign_events (
+        id BIGSERIAL PRIMARY KEY,
+        campaign_id TEXT,
+        customer_email TEXT,
+        event_type TEXT,
+        event_time TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await q(
       `INSERT INTO campaign_events (campaign_id, customer_email, event_type, event_time)
        VALUES ($1,$2,'open',NOW())`,
-      [campaignId, email]
+      [String(campaignId), email]
     );
   } catch (_) {}
   res.set("Content-Type", "image/gif");
   res.set("Cache-Control", "no-store");
-  return res.send(ONE_BY_ONE_GIF);
+  res.send(Buffer.from("47494638396101000100800000ffffff00000021f90401000001002c00000000010001000002024401003b", "hex"));
 });
+
+// click redirect
 router.get("/track/click/:campaignId", async (req, res) => {
   const { campaignId } = req.params;
   const email = String(req.query.email || "").slice(0, 256);
-  const url = String(req.query.url || "");
+  const target = String(req.query.url || "");
   try {
-    await query(
+    const db = require("../db");
+    const q = db?.pool?.query ? db.pool.query.bind(db.pool) : db.query.bind(db);
+    await q(`
+      CREATE TABLE IF NOT EXISTS campaign_events (
+        id BIGSERIAL PRIMARY KEY,
+        campaign_id TEXT,
+        customer_email TEXT,
+        event_type TEXT,
+        event_time TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await q(
       `INSERT INTO campaign_events (campaign_id, customer_email, event_type, event_time)
        VALUES ($1,$2,'click',NOW())`,
-      [campaignId, email]
+      [String(campaignId), email]
     );
   } catch (_) {}
-  if (!/^https?:\/\//i.test(url)) return res.status(400).send("bad url");
-  return res.redirect(url);
+  if (!/^https?:\/\//i.test(target)) return res.status(400).send("bad url");
+  res.redirect(target);
 });
+
+
 
 module.exports = router;
