@@ -280,6 +280,12 @@ router.post("/email", async (req, res) => {
         text = text || body;
       }
     }
+    // If a primary_url is provided, guarantee a CTA is present
+const primary = (req.body?.primary_url || "").trim();
+if (primary && /^https?:\/\//i.test(primary)) {
+  html = appendCta(html, primary, (req.body?.cta_text || "Open"));
+}
+
     if (!html) {
       return res.status(400).json({ ok:false, error:"html or body is required" });
     }
