@@ -370,11 +370,11 @@ ${inner}
 
 // Keep your UI happy (no 404)
 // GET /api/campaigns/stats/last — robust type-safe stats
+// GET /api/campaigns/stats/last — resilient, adds missing columns, works with TEXT/INT ids
 router.get("/stats/last", async (req, res) => {
-  // local helpers
   const stripHtml = (html = "") => String(html).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 
-  // get a query function from ../db (pool or direct)
+  // get a query fn from ../db (pool or direct)
   let q = null;
   try {
     const db = require("../db");
@@ -382,12 +382,11 @@ router.get("/stats/last", async (req, res) => {
   } catch (_) {}
 
   if (!q) {
-    // No DB? Keep UI happy
     return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
   }
 
   try {
-    // Ensure tables exist (don’t error if already there)
+    // Ensure tables exist
     await q(`
       CREATE TABLE IF NOT EXISTS campaigns (
         id BIGSERIAL PRIMARY KEY,
@@ -402,46 +401,66 @@ router.get("/stats/last", async (req, res) => {
     await q(`
       CREATE TABLE IF NOT EXISTS campaign_events (
         id BIGSERIAL PRIMARY KEY,
-        campaign_id TEXT,                 -- TEXT on purpose for compatibility
+        campaign_id TEXT,                 -- keep TEXT for compatibility with any sender
         customer_email TEXT,
         event_type TEXT,                  -- 'sent' | 'open' | 'click'
         event_time TIMESTAMP DEFAULT NOW()
       );
     `);
 
-    // 1) Find latest campaign that actually sent
-    const r = await q(`
+    // 🧰 Patch older schemas: add columns if they were missing
+    await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS html TEXT`);
+    await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS text TEXT`);
+    await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS sent_count INTEGER DEFAULT 0`);
+    await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS sent_at TIMESTAMP NULL`);
+    await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS subject TEXT`);
+
+    // Pick the most recent actually-sent campaign
+    let r = await q(`
       SELECT id::text AS id, subject, html, text, sent_count, sent_at
         FROM campaigns
-       WHERE sent_at IS NOT NULL
+       WHERE COALESCE(sent_count,0) > 0 AND sent_at IS NOT NULL
        ORDER BY sent_at DESC
        LIMIT 1
     `);
 
+    // Fallback: any latest row if none marked sent yet
     if (!r?.rows?.length) {
-      return res.json({
-        ok: true,
-        subject: "",
-        message: "",
-        openRate: 0,
-        clickRate: 0,
-        sent_at: null,
-      });
+      r = await q(`
+        SELECT id::text AS id, subject, html, text, sent_count, sent_at
+          FROM campaigns
+         ORDER BY COALESCE(sent_at, NOW()) DESC, id DESC
+         LIMIT 1
+      `);
+    }
+
+    if (!r?.rows?.length) {
+      return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
     }
 
     const camp = r.rows[0];
-    const sent = Number(camp.sent_count || 0) || 0;
 
-    // 2) Count unique opens and clicks for this campaign id (string compare)
+    // Determine denominator: prefer campaigns.sent_count; else count distinct 'sent' events
+    let sent = Number(camp.sent_count || 0) || 0;
+    if (!sent) {
+      const s = await q(
+        `SELECT COUNT(DISTINCT customer_email) AS u
+           FROM campaign_events
+          WHERE campaign_id::text = $1
+            AND event_type = 'sent'`,
+        [camp.id]
+      );
+      sent = Number(s?.rows?.[0]?.u || 0);
+    }
+
+    // Count unique opens/clicks
     const e = await q(
-      `
-      SELECT event_type, COUNT(DISTINCT customer_email) AS u
-        FROM campaign_events
-       WHERE campaign_id::text = $1
-         AND event_type IN ('open','click')
-       GROUP BY event_type
-      `,
-      [camp.id] // id is already text above
+      `SELECT event_type, COUNT(DISTINCT customer_email) AS u
+         FROM campaign_events
+        WHERE campaign_id::text = $1
+          AND event_type IN ('open','click')
+        GROUP BY event_type`,
+      [camp.id]
     );
 
     let uniqueOpens = 0, uniqueClicks = 0;
@@ -450,7 +469,7 @@ router.get("/stats/last", async (req, res) => {
       else if (row.event_type === "click") uniqueClicks = Number(row.u || 0);
     }
 
-    const openRate = sent ? Math.round((uniqueOpens / sent) * 1000) / 10 : 0;
+    const openRate  = sent ? Math.round((uniqueOpens / sent) * 1000) / 10 : 0;
     const clickRate = sent ? Math.round((uniqueClicks / sent) * 1000) / 10 : 0;
 
     return res.json({
@@ -462,7 +481,6 @@ router.get("/stats/last", async (req, res) => {
       sent_at: camp.sent_at,
     });
   } catch (err) {
-    // Never break your UI
     return res.json({
       ok: true,
       subject: "",
@@ -474,6 +492,7 @@ router.get("/stats/last", async (req, res) => {
     });
   }
 });
+
 
 
 // trackers (optional)
