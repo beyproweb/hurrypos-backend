@@ -106,14 +106,12 @@ async function fetchAllRecipientEmails() {
   return [];
 }
 
-/**
- * POST /api/campaigns/email
- * Accepts your current payload: { subject, body }
- * Optional: { html, text, recipients[], fromEmail, fromName, name }
- */
-// POST /api/campaigns/email
+// POST /api/campaigns/email  — Beypro landing style + click/open tracking
 router.post("/email", async (req, res) => {
-  // --- local helpers (scoped to this route for safety) ---
+  // ---------- helpers ----------
+  const cheerio = require("cheerio");
+  const URL_RE = /(https?:\/\/[^\s<>"']+)/g;
+
   function escapeHtml(s = "") {
     return String(s)
       .replace(/&/g, "&amp;")
@@ -121,34 +119,126 @@ router.post("/email", async (req, res) => {
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
   }
+  function stripHtml(html = "") {
+    return String(html).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  }
   function isProbablyHtml(s = "") {
     const t = String(s).trim();
-    return (
-      /^<!doctype/i.test(t) ||
-      /^<html[\s>]/i.test(t) ||
-      /<\/[a-z][\s\S]*>/i.test(t) || // has closing tag somewhere
-      /<(div|table|p|span|section|header|footer|img|a|h[1-6])\b/i.test(t)
-    );
+    return /^<!doctype/i.test(t) || /^<html[\s>]/i.test(t) ||
+           /<\/[a-z][\s\S]*>/i.test(t) || /<(div|table|p|span|section|img|a|h[1-6])\b/i.test(t);
   }
-  function wrapIfFragment(html = "") {
-    const t = String(html).trim();
-    if (/^<!doctype/i.test(t) || /^<html[\s>]/i.test(t)) return html;
+  function extractUrls(text) {
+    const m = String(text).match(URL_RE) || [];
+    const uniq = Array.from(new Set(m));
+    return uniq.filter(u => /^https?:\/\//i.test(u));
+  }
+  function autoLink(text) {
+    let safe = escapeHtml(text);
+    safe = safe.replace(URL_RE, (m) => `<a href="${m}" target="_blank" rel="noopener">${m}</a>`);
+    return safe.replace(/\r?\n\r?\n/g, "</p><p>").replace(/\r?\n/g, "<br/>");
+  }
+
+  // Colors tuned to your Beypro look (purple/indigo + orange headline)
+  const COLORS = {
+    brandName: req.body?.brand_name || "Beypro",
+    blue:  "#5B6CFF",
+    purple:"#6D28D9",
+    orange:"#F97316",
+    text:  "#111827",
+    muted: "#6B7280",
+    card:  "#FFFFFF",
+    bg:    "#F8FAFC",
+    border:"#E5E7EB",
+    // CTA gradient (orange → indigo)
+    gradLeft:  "#FF6A00",
+    gradRight: "#5B6CFF",
+  };
+
+  function wrapDoc(inner) {
     return `<!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title></title>
-  </head>
-  <body style="margin:0;background:#ffffff;padding:16px;font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.5">
-    ${t}
-  </body>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title></title>
+</head>
+<body style="margin:0;padding:24px;background:${COLORS.bg};font-family:Arial,Helvetica,sans-serif;">
+  ${inner}
+</body>
 </html>`;
   }
 
+  function beyproLanding({ subject, bodyHtml, orderUrl, reviewUrl, ctaText="Order / Review" }) {
+    const nowYear = new Date().getFullYear();
+    const ctaBtn = orderUrl ? `
+      <div style="text-align:center;margin:24px 0 8px 0">
+        <a href="${orderUrl}" target="_blank" rel="noopener"
+           style="display:inline-block;padding:12px 20px;border-radius:12px;
+                  background:${COLORS.blue};
+                  background:linear-gradient(90deg, ${COLORS.gradLeft}, ${COLORS.gradRight});
+                  color:#fff;text-decoration:none;font-weight:700;">
+          ${escapeHtml(ctaText)}
+        </a>
+      </div>` : "";
+
+    const footerLinks = [orderUrl ? `<a href="${orderUrl}" style="color:${COLORS.blue};text-decoration:underline" target="_blank" rel="noopener">Order</a>` : null,
+                         reviewUrl ? `<a href="${reviewUrl}" style="color:${COLORS.blue};text-decoration:underline" target="_blank" rel="noopener">Review</a>` : null]
+                         .filter(Boolean).join(" / ");
+
+    const card = `
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+             style="max-width:700px;margin:0 auto;border:1px solid ${COLORS.border};
+                    border-radius:16px;background:${COLORS.card};">
+        <tr>
+          <td style="padding:28px 28px 16px 28px;text-align:center">
+            <div style="font-size:28px;font-weight:800;color:${COLORS.blue};margin:0 0 8px 0">${escapeHtml(COLORS.brandName)}</div>
+            <div style="font-size:20px;font-weight:800;color:${COLORS.orange};margin:0 0 10px 0">${escapeHtml(subject)}</div>
+            <div style="color:${COLORS.muted};font-size:14px;margin-bottom:18px">Don't miss our special offer! 🚀</div>
+            <div style="color:${COLORS.text};font-size:16px;line-height:1.6;text-align:center;margin-bottom:8px">
+              ${bodyHtml}
+            </div>
+            ${ctaBtn}
+            <div style="height:1px;background:${COLORS.border};margin:24px 0"></div>
+            <div style="font-size:12px;color:${COLORS.muted};text-align:center">
+              © ${nowYear} ${escapeHtml(COLORS.brandName)}${footerLinks ? " · " + footerLinks : ""}
+              <br/>If you do not wish to receive this message, please let us know.
+            </div>
+          </td>
+        </tr>
+      </table>`;
+    return wrapDoc(card);
+  }
+
+  // tracking helpers (use your existing injectTracking if present)
+  function buildClickUrl(origin, cid, email, targetUrl) {
+    const u = new URL(`/api/campaigns/track/click/${cid}`, origin);
+    if (email) u.searchParams.set("email", email);
+    u.searchParams.set("url", targetUrl);
+    return u.toString();
+  }
+  function trackOpenUrl(origin, cid, email) {
+    const u = new URL(`/api/campaigns/track/open/${cid}`, origin);
+    if (email) u.searchParams.set("email", email);
+    return u.toString();
+  }
+  function injectTrackingLocal(html, origin, campaignId, email) {
+    const $ = cheerio.load(html || "", { decodeEntities: false });
+    $("a[href]").each((_, el) => {
+      const $a = $(el);
+      const href = ($a.attr("href") || "").trim();
+      if (!/^https?:\/\//i.test(href)) return;
+      $a.attr("href", buildClickUrl(origin, campaignId, email, href));
+    });
+    const pixel = `<img src="${trackOpenUrl(origin, campaignId, email)}" width="1" height="1" alt="" style="display:none;opacity:0" />`;
+    if ($("body").length) $("body").append(pixel);
+    else $.root().append(pixel);
+    return $.html();
+  }
+  const doInjectTracking =
+    typeof injectTracking === "function" ? injectTracking : injectTrackingLocal;
+
+  // ---------- handler ----------
   try {
-    // Accepts your current payload: { subject, body }
-    // Optional: { html, text, recipients[], fromEmail, fromName, name, body_is_html }
     let {
       subject,
       body,
@@ -159,68 +249,65 @@ router.post("/email", async (req, res) => {
       fromName,
       name,
       body_is_html,
+      cta_text,
+      order_url,
+      review_url,
+      primary_url,   // optional alias for order_url
     } = req.body || {};
 
     if (!subject || typeof subject !== "string") {
-      return jsonError(res, 400, "subject is required");
+      return res.status(400).json({ ok:false, error:"subject is required" });
     }
 
-    // Convert body → html when needed, with HTML auto-detect
+    // compose HTML
     if (!html && body) {
-      const bodyStr = String(body);
-      const forceHtml = body_is_html === true;
-
-      if (forceHtml || isProbablyHtml(bodyStr)) {
-        // treat provided body as HTML (no escaping)
-        html = wrapIfFragment(bodyStr);
+      const looksHtml = body_is_html === true || isProbablyHtml(body);
+      if (looksHtml) {
+        html = /^<!doctype|^<html/i.test(String(body).trim()) ? body : wrapDoc(body);
         text = text || stripHtml(html);
       } else {
-        // plain text → escape + <br>, then wrap
-        const safe = escapeHtml(bodyStr).replace(/\n/g, "<br/>");
-        html = wrapIfFragment(safe);
-        text = text || bodyStr;
+        const urls = extractUrls(body);
+        const orderUrl = order_url || primary_url || urls[0] || null;
+        const reviewUrl = review_url || urls[1] || null;
+        const bodyHtml = autoLink(body);
+        html = beyproLanding({
+          subject,
+          bodyHtml: `<p style="margin:0 0 8px 0">${bodyHtml}</p>`,
+          orderUrl,
+          reviewUrl,
+          ctaText: cta_text || "Order / Review",
+        });
+        text = text || body;
       }
     }
     if (!html) {
-      return jsonError(res, 400, "html or body is required");
+      return res.status(400).json({ ok:false, error:"html or body is required" });
     }
 
-    // Recipients: use provided or fallback to customers table
+    // recipients fallback
     if (!Array.isArray(recipients) || recipients.length === 0) {
       recipients = await fetchAllRecipientEmails();
       if (recipients.length === 0) {
-        return jsonError(res, 400, "no recipients", {
-          hint: "Pass recipients[] or ensure customers table has emails",
-        });
+        return res.status(400).json({ ok:false, error:"no recipients" });
       }
     }
 
-    // SMTP transporter
+    // SMTP
     const transporter = buildTransporter();
     if (!transporter) {
-      return jsonError(res, 400, "SMTP not configured", {
-        required: ["SMTP_HOST", "SMTP_USER", "SMTP_PASS"],
-        tip: "For quick dry-run set SMTP_STRATEGY=json",
-      });
+      return res.status(400).json({ ok:false, error:"SMTP not configured" });
     }
-    try {
-      await transporter.verify();
-    } catch (e) {
-      return jsonError(res, 400, "SMTP verify failed", { details: e.message });
-    }
+    try { await transporter.verify(); }
+    catch (e) { return res.status(400).json({ ok:false, error:"SMTP verify failed", details:e.message }); }
 
     // From
-    const senderEmail =
-      fromEmail || process.env.SMTP_FROM || process.env.SMTP_USER;
-    if (!senderEmail) {
-      return jsonError(res, 400, "fromEmail or SMTP_FROM/SMTP_USER must be set");
-    }
-    const from =
-      fromName && senderEmail ? `"${fromName}" <${senderEmail}>` : senderEmail;
+    const senderEmail = fromEmail || process.env.SMTP_FROM || process.env.SMTP_USER;
+    if (!senderEmail) return res.status(400).json({ ok:false, error:"fromEmail or SMTP_FROM/SMTP_USER must be set" });
+    const from = fromName ? `"${fromName}" <${senderEmail}>` : senderEmail;
 
-    // Ensure/insert campaign (best-effort)
+    // create campaign shell (best-effort)
     let campaignId = null;
-    const campaignName = name || `Campaign ${new Date().toISOString().slice(0, 10)}`;
+    const campaignName = name || `Campaign ${new Date().toISOString().slice(0,10)}`;
     try {
       const ins = await query(
         `INSERT INTO campaigns (name, subject, html, text, sent_count, sent_at)
@@ -229,27 +316,17 @@ router.post("/email", async (req, res) => {
         [campaignName, subject, html, text || null]
       );
       campaignId = ins?.rows?.[0]?.id || null;
-    } catch (_) {
-      // ignore — keep sending without a DB id
-    }
+    } catch (_) {}
 
-    // De-dupe recipients
-    const seen = new Set();
-    const rcpts = recipients
-      .map((r) => String(r || "").trim())
-      .filter((r) => r && !seen.has(r) && (seen.add(r) || true));
+    // send
+    const origin = process.env.PUBLIC_TRACKING_ORIGIN || `${req.protocol}://${req.get("host")}`;
+    const dedup = new Set();
+    const rcpts = recipients.map(r => String(r || "").trim()).filter(r => r && !dedup.has(r) && (dedup.add(r) || true));
+    let sent = 0; const failures = [];
 
-    const origin = PUBLIC_TRACKING_ORIGIN;
-    let sent = 0;
-    const failures = [];
-
-    // Send loop
     for (const rcpt of rcpts) {
       try {
-        const htmlTracked = campaignId
-          ? injectTracking(html, origin, campaignId, rcpt)
-          : html;
-
+        const htmlTracked = campaignId ? doInjectTracking(html, origin, campaignId, rcpt) : html;
         await transporter.sendMail({
           from,
           to: rcpt,
@@ -257,15 +334,12 @@ router.post("/email", async (req, res) => {
           html: htmlTracked,
           text: text || stripHtml(html),
         });
-
         sent += 1;
-        // Optional event log
         try {
           if (campaignId) {
             await query(
               `INSERT INTO campaign_events (campaign_id, customer_email, event_type, event_time)
-               VALUES ($1,$2,'sent',NOW())`,
-              [campaignId, rcpt]
+               VALUES ($1,$2,'sent',NOW())`, [campaignId, rcpt]
             );
           }
         } catch (_) {}
@@ -274,30 +348,18 @@ router.post("/email", async (req, res) => {
       }
     }
 
-    // Update campaign counters
     try {
       if (campaignId && sent > 0) {
-        await query(
-          `UPDATE campaigns SET sent_count = $1, sent_at = NOW() WHERE id = $2`,
-          [sent, campaignId]
-        );
+        await query(`UPDATE campaigns SET sent_count=$1, sent_at=NOW() WHERE id=$2`, [sent, campaignId]);
       }
     } catch (_) {}
 
-    // Final JSON
-    return res.json({
-      ok: true,
-      campaignId,
-      name: campaignName,
-      subject,
-      sent,
-      failed: failures.length,
-      failures,
-    });
+    return res.json({ ok:true, campaignId, name:campaignName, subject, sent, failed:failures.length, failures });
   } catch (err) {
-    return jsonError(res, 500, "internal_error", { details: err.message });
+    return res.status(500).json({ ok:false, error:"internal_error", details: err.message });
   }
 });
+
 
 // Keep your UI happy (no 404)
 router.get("/stats/last", async (req, res) => {
