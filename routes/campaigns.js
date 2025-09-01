@@ -563,6 +563,20 @@ router.get("/stats/by/:campaignId", async (req, res) => {
 
 
 
+router.get("/events/recent", async (req, res) => {
+  try {
+    const r = await q(`SELECT campaign_id, customer_email, event_type, event_time
+                       FROM campaign_events
+                       ORDER BY event_time DESC, id DESC
+                       LIMIT 25`);
+    const mem = [...recentEvents.entries()].map(([id, rec]) => ({
+      campaign_id: id, opens: rec.opens.size, clicks: rec.clicks.size, last: rec.last
+    }));
+    res.json({ ok:true, db:r?.rows || [], memory: mem });
+  } catch (e) {
+    res.json({ ok:true, db:[], memory:[...recentEvents.keys()] });
+  }
+});
 
 
 // trackers (optional)
