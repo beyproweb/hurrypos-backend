@@ -2,34 +2,43 @@
 const express = require("express");
 const router = express.Router();
 // ===== In-memory fallback for events (works even if DB write fails) =====
-const recentEvents = new Map(); // Map<campaignId, { opens:Set<string>, clicks:Set<string>, last: Date }>
+// ===== in-memory events (so stats work even if DB insert fails) =====
+const recentEvents = new Map(); // Map<cid, {sent:Set, opens:Set, clicks:Set, last:Date}>
 
 function rememberEvent(cid, type, email) {
   if (!cid) return;
   const id = String(cid);
-  const rec = recentEvents.get(id) || { opens: new Set(), clicks: new Set(), last: new Date() };
-  if (type === "open" && email) rec.opens.add(String(email));
+  const rec = recentEvents.get(id) || { sent: new Set(), opens: new Set(), clicks: new Set(), last: new Date() };
+  if (type === "sent" && email)  rec.sent.add(String(email));
+  if (type === "open" && email)  rec.opens.add(String(email));
   if (type === "click" && email) rec.clicks.add(String(email));
   rec.last = new Date();
   recentEvents.set(id, rec);
 }
-
 function getRecentCounts(cid) {
-  const rec = recentEvents.get(String(cid));
-  if (!rec) return { opens: 0, clicks: 0 };
-  return { opens: rec.opens.size, clicks: rec.clicks.size };
+  const r = recentEvents.get(String(cid));
+  return r ? { sent: r.sent.size, opens: r.opens.size, clicks: r.clicks.size } : { sent: 0, opens: 0, clicks: 0 };
 }
 
-// Try to obtain a query function no matter how your db is wired
+// Safe origin (never throws)
+function getSafeOrigin(req) {
+  let raw = process.env.PUBLIC_TRACKING_ORIGIN || `${req.protocol}://${req.get("host")}`;
+  raw = String(raw || "").trim();
+  if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
+  return raw.replace(/\/+$/,'');
+}
+
+// DB helper (works whether you export pool.query or query)
 async function q(sql, params = []) {
   try { if (typeof query === "function") return await query(sql, params); } catch {}
   try {
     const db = require("../db");
     if (db?.pool?.query) return await db.pool.query(sql, params);
-    if (db?.query) return await db.query(sql, params);
+    if (db?.query)       return await db.query(sql, params);
   } catch {}
-  return null; // no DB, caller should fall back to memory
+  return null;
 }
+
 
 // Try to support either { pool } or direct client export from ../db
 let query = async () => ({ rows: [] });
@@ -397,116 +406,119 @@ ${inner}
 
 
 
-// Keep your UI happy (no 404)
-// GET /api/campaigns/stats/last — robust: works with mixed id types + falls back to events
-// GET /api/campaigns/stats/last — prefers newest events, then newest sent_at
-// GET /api/campaigns/stats/last — prefer newest events, merge DB + memory counts
 router.get("/stats/last", async (req, res) => {
-  const stripHtml = (html = "") => String(html).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-
+  const stripHtml = (h="") => String(h).replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
   try {
-    // Ensure minimal schema (no-op if exists)
     await q(`CREATE TABLE IF NOT EXISTS campaigns (
-      id BIGSERIAL PRIMARY KEY,
-      name TEXT, subject TEXT, html TEXT, text TEXT,
+      id BIGSERIAL PRIMARY KEY, name TEXT, subject TEXT, html TEXT, text TEXT,
       sent_count INTEGER DEFAULT 0, sent_at TIMESTAMP NULL
     )`);
     await q(`CREATE TABLE IF NOT EXISTS campaign_events (
-      id BIGSERIAL PRIMARY KEY,
-      campaign_id TEXT, customer_email TEXT,
+      id BIGSERIAL PRIMARY KEY, campaign_id TEXT, customer_email TEXT,
       event_type TEXT, event_time TIMESTAMP DEFAULT NOW()
     )`);
 
-    // Latest by sent_at
+    // newest by sent_at (if any)
     let camp = null;
-    const r1 = await q(`
-      SELECT id::text AS id, subject, html, text, sent_count, sent_at
-        FROM campaigns
-       WHERE sent_at IS NOT NULL
-       ORDER BY sent_at DESC
-       LIMIT 1
-    `);
+    const r1 = await q(`SELECT id::text id, subject, html, text, sent_count, sent_at
+                        FROM campaigns WHERE sent_at IS NOT NULL
+                        ORDER BY sent_at DESC LIMIT 1`);
     if (r1?.rows?.length) camp = r1.rows[0];
 
-    // Latest by any event
-    let latestEvent = null;
-    const r2 = await q(`
-      SELECT campaign_id::text AS id, MAX(event_time) AS last_event_time
-        FROM campaign_events
-       GROUP BY campaign_id
-       ORDER BY MAX(event_time) DESC
-       LIMIT 1
-    `);
-    if (r2?.rows?.length) latestEvent = r2.rows[0];
-
-    // Prefer the one with the newer timestamp
-    if (latestEvent && (!camp || (camp.sent_at && new Date(latestEvent.last_event_time) > new Date(camp.sent_at)))) {
-      const r3 = await q(
-        `SELECT id::text AS id, subject, html, text, sent_count, sent_at
-           FROM campaigns WHERE id::text = $1 LIMIT 1`,
-        [latestEvent.id]
-      );
-      camp = r3?.rows?.[0] || {
-        id: latestEvent.id, subject: "", html: "", text: "", sent_count: 0, sent_at: latestEvent.last_event_time
-      };
+    // newest by any event
+    const r2 = await q(`SELECT campaign_id::text id, MAX(event_time) t
+                        FROM campaign_events GROUP BY campaign_id
+                        ORDER BY MAX(event_time) DESC LIMIT 1`);
+    if (r2?.rows?.length) {
+      const ev = r2.rows[0];
+      if (!camp || (camp.sent_at && new Date(ev.t) > new Date(camp.sent_at))) {
+        const r3 = await q(`SELECT id::text id, subject, html, text, sent_count, sent_at
+                            FROM campaigns WHERE id::text=$1 LIMIT 1`, [ev.id]);
+        camp = r3?.rows?.[0] || { id: ev.id, subject:"", html:"", text:"", sent_count:0, sent_at: ev.t };
+      }
     }
-
-    // If still none, try newest memory record
+    // if still nothing, but we have in-memory events
     if (!camp && recentEvents.size) {
-      const newest = [...recentEvents.entries()]
-        .sort((a, b) => b[1].last - a[1].last)[0];
-      if (newest) camp = { id: newest[0], subject: "", html: "", text: "", sent_count: 0, sent_at: newest[1].last };
+      const [id, rec] = [...recentEvents.entries()].sort((a,b)=>b[1].last - a[1].last)[0];
+      camp = { id, subject:"", html:"", text:"", sent_count:0, sent_at: rec.last };
     }
+    if (!camp) return res.json({ ok:true, subject:"", message:"", openRate:0, clickRate:0, sent_at:null });
 
-    if (!camp) {
-      return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
-    }
-
-    // Denominator: prefer campaigns.sent_count, else count 'sent' events
+    // denominator: sent_count → DB 'sent' events → memory 'sent'
     let sent = Number(camp.sent_count || 0) || 0;
     if (!sent) {
-      const s = await q(
-        `SELECT COUNT(DISTINCT customer_email) AS u
-           FROM campaign_events
-          WHERE campaign_id::text = $1 AND event_type = 'sent'`,
-        [camp.id]
-      );
+      const s = await q(`SELECT COUNT(DISTINCT customer_email) u
+                         FROM campaign_events WHERE campaign_id::text=$1 AND event_type='sent'`, [camp.id]);
       sent = Number(s?.rows?.[0]?.u || 0);
     }
-
-    // Unique opens/clicks from DB
-    let dbOpens = 0, dbClicks = 0;
-    const e = await q(
-      `SELECT event_type, COUNT(DISTINCT customer_email) AS u
-         FROM campaign_events
-        WHERE campaign_id::text = $1 AND event_type IN ('open','click')
-        GROUP BY event_type`,
-      [camp.id]
-    );
-    for (const row of e?.rows || []) {
-      if (row.event_type === "open")  dbOpens = Number(row.u || 0);
-      if (row.event_type === "click") dbClicks = Number(row.u || 0);
+    if (!sent) {
+      const mem = getRecentCounts(camp.id);
+      sent = mem.sent || 0;
     }
 
-    // Merge in-memory counts (so you see % even if DB write was blocked)
+    // numerators: DB uniques merged with memory
+    let dbO=0, dbC=0;
+    const e = await q(`SELECT event_type, COUNT(DISTINCT customer_email) u
+                       FROM campaign_events
+                       WHERE campaign_id::text=$1 AND event_type IN ('open','click')
+                       GROUP BY event_type`, [camp.id]);
+    for (const row of e?.rows || []) {
+      if (row.event_type === "open")  dbO = Number(row.u || 0);
+      if (row.event_type === "click") dbC = Number(row.u || 0);
+    }
     const mem = getRecentCounts(camp.id);
-    const uniqueOpens  = Math.max(dbOpens,  mem.opens);
-    const uniqueClicks = Math.max(dbClicks, mem.clicks);
+    const uOpen  = Math.max(dbO, mem.opens);
+    const uClick = Math.max(dbC, mem.clicks);
 
-    const openRate  = sent ? Math.round((uniqueOpens  / sent) * 1000) / 10 : 0;
-    const clickRate = sent ? Math.round((uniqueClicks / sent) * 1000) / 10 : 0;
+    const openRate  = sent ? Math.round((uOpen  / sent) * 1000) / 10 : 0;
+    const clickRate = sent ? Math.round((uClick / sent) * 1000) / 10 : 0;
 
     return res.json({
-      ok: true,
+      ok:true,
       subject: camp.subject || "",
       message: camp.text || stripHtml(camp.html || ""),
       openRate, clickRate, sent_at: camp.sent_at
     });
-  } catch (err) {
-    return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
+  } catch {
+    return res.json({ ok:true, subject:"", message:"", openRate:0, clickRate:0, sent_at:null });
   }
 });
 
+// OPEN pixel
+router.get("/track/open/:cid", async (req, res) => {
+  const cid = String(req.params.cid || "");
+  const email = String(req.query.email || "").slice(0,256);
+  try {
+    await q(`CREATE TABLE IF NOT EXISTS campaign_events (
+      id BIGSERIAL PRIMARY KEY, campaign_id TEXT, customer_email TEXT,
+      event_type TEXT, event_time TIMESTAMP DEFAULT NOW()
+    )`);
+    await q(`INSERT INTO campaign_events (campaign_id, customer_email, event_type)
+             VALUES ($1,$2,'open')`, [cid, email]);
+  } catch {}
+  rememberEvent(cid, "open", email);
+  res.set("Content-Type","image/gif");
+  res.set("Cache-Control","no-store");
+  res.send(Buffer.from("47494638396101000100800000ffffff00000021f90401000001002c00000000010001000002024401003b","hex"));
+});
+
+// CLICK redirect
+router.get("/track/click/:cid", async (req, res) => {
+  const cid   = String(req.params.cid || "");
+  const email = String(req.query.email || "").slice(0,256);
+  const url   = String(req.query.url || "");
+  try {
+    await q(`CREATE TABLE IF NOT EXISTS campaign_events (
+      id BIGSERIAL PRIMARY KEY, campaign_id TEXT, customer_email TEXT,
+      event_type TEXT, event_time TIMESTAMP DEFAULT NOW()
+    )`);
+    await q(`INSERT INTO campaign_events (campaign_id, customer_email, event_type)
+             VALUES ($1,$2,'click')`, [cid, email]);
+  } catch {}
+  rememberEvent(cid, "click", email);
+  if (!/^https?:\/\//i.test(url)) return res.status(400).send("bad url");
+  res.redirect(302, url);
+});
 
 // GET /api/campaigns/stats/by/:campaignId — exact campaign
 router.get("/stats/by/:campaignId", async (req, res) => {
