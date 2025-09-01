@@ -383,6 +383,8 @@ ${inner}
              VALUES ($1,$2,'sent',NOW())`, [campaignId, rcpt]
           );
         } catch {}
+         // in-memory denominator (critical fallback)
+ rememberEvent(campaignId, "sent", rcpt);
       } catch (e) {
         failures.push({ email: rcpt, error: e?.message || String(e) });
       }
@@ -451,6 +453,11 @@ router.get("/stats/last", async (req, res) => {
                          FROM campaign_events WHERE campaign_id::text=$1 AND event_type='sent'`, [camp.id]);
       sent = Number(s?.rows?.[0]?.u || 0);
     }
+     // final fallback: in-memory 'sent' (so % shows even if DB missed writes)
+ if (!sent) {
+   const mem = getRecentCounts(camp.id);
+   sent = mem.sent || 0;
+ }
     if (!sent) {
       const mem = getRecentCounts(camp.id);
       sent = mem.sent || 0;
