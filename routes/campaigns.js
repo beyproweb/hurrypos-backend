@@ -369,129 +369,169 @@ ${inner}
 
 
 // Keep your UI happy (no 404)
-// GET /api/campaigns/stats/last — robust type-safe stats
-// GET /api/campaigns/stats/last — resilient, adds missing columns, works with TEXT/INT ids
+// GET /api/campaigns/stats/last — robust: works with mixed id types + falls back to events
+// GET /api/campaigns/stats/last — prefers newest events, then newest sent_at
 router.get("/stats/last", async (req, res) => {
   const stripHtml = (html = "") => String(html).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 
-  // get a query fn from ../db (pool or direct)
   let q = null;
   try {
     const db = require("../db");
-    q = db?.pool?.query ? db.pool.query.bind(db.pool) : (typeof db?.query === "function" ? db.query.bind(db) : null);
-  } catch (_) {}
-
-  if (!q) {
-    return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
-  }
+    q = db?.pool?.query ? db.pool.query.bind(db.pool) :
+        (typeof db?.query === "function" ? db.query.bind(db) : null);
+  } catch {}
+  if (!q) return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
 
   try {
-    // Ensure tables exist
-    await q(`
-      CREATE TABLE IF NOT EXISTS campaigns (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT,
-        subject TEXT,
-        html TEXT,
-        text TEXT,
-        sent_count INTEGER DEFAULT 0,
-        sent_at TIMESTAMP NULL
-      );
-    `);
-    await q(`
-      CREATE TABLE IF NOT EXISTS campaign_events (
-        id BIGSERIAL PRIMARY KEY,
-        campaign_id TEXT,                 -- keep TEXT for compatibility with any sender
-        customer_email TEXT,
-        event_type TEXT,                  -- 'sent' | 'open' | 'click'
-        event_time TIMESTAMP DEFAULT NOW()
-      );
-    `);
-
-    // 🧰 Patch older schemas: add columns if they were missing
+    // Ensure schema
+    await q(`CREATE TABLE IF NOT EXISTS campaigns (
+      id BIGSERIAL PRIMARY KEY, name TEXT, subject TEXT, html TEXT, text TEXT,
+      sent_count INTEGER DEFAULT 0, sent_at TIMESTAMP NULL
+    )`);
+    await q(`CREATE TABLE IF NOT EXISTS campaign_events (
+      id BIGSERIAL PRIMARY KEY, campaign_id TEXT, customer_email TEXT,
+      event_type TEXT, event_time TIMESTAMP DEFAULT NOW()
+    )`);
     await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS html TEXT`);
     await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS text TEXT`);
     await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS sent_count INTEGER DEFAULT 0`);
     await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS sent_at TIMESTAMP NULL`);
     await q(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS subject TEXT`);
 
-    // Pick the most recent actually-sent campaign
-    let r = await q(`
-      SELECT id::text AS id, subject, html, text, sent_count, sent_at
-        FROM campaigns
-       WHERE COALESCE(sent_count,0) > 0 AND sent_at IS NOT NULL
-       ORDER BY sent_at DESC
-       LIMIT 1
-    `);
-
-    // Fallback: any latest row if none marked sent yet
-    if (!r?.rows?.length) {
-      r = await q(`
+    // Latest campaign by sent_at
+    let camp = null;
+    {
+      const r = await q(`
         SELECT id::text AS id, subject, html, text, sent_count, sent_at
           FROM campaigns
-         ORDER BY COALESCE(sent_at, NOW()) DESC, id DESC
+         WHERE sent_at IS NOT NULL
+         ORDER BY sent_at DESC
          LIMIT 1
       `);
+      if (r?.rows?.length) camp = r.rows[0];
     }
 
-    if (!r?.rows?.length) {
+    // Latest event (open/click/sent) campaign_id + timestamp
+    let latestEvent = null;
+    {
+      const e = await q(`
+        SELECT campaign_id::text AS id, MAX(event_time) AS last_event_time
+          FROM campaign_events
+         GROUP BY campaign_id
+         ORDER BY MAX(event_time) DESC
+         LIMIT 1
+      `);
+      if (e?.rows?.length) latestEvent = e.rows[0];
+    }
+
+    // If we have a latest event that’s newer than the last sent_at row (or no camp row), prefer the event’s campaign
+    if (latestEvent && (!camp || (camp.sent_at && new Date(latestEvent.last_event_time) > new Date(camp.sent_at)))) {
+      const r2 = await q(
+        `SELECT id::text AS id, subject, html, text, sent_count, sent_at
+           FROM campaigns WHERE id::text = $1 LIMIT 1`,
+        [latestEvent.id]
+      );
+      camp = r2?.rows?.[0] || { id: latestEvent.id, subject: "", html: "", text: "", sent_count: 0, sent_at: latestEvent.last_event_time };
+    }
+
+    if (!camp) {
       return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
     }
 
-    const camp = r.rows[0];
-
-    // Determine denominator: prefer campaigns.sent_count; else count distinct 'sent' events
+    // denominator
     let sent = Number(camp.sent_count || 0) || 0;
     if (!sent) {
       const s = await q(
         `SELECT COUNT(DISTINCT customer_email) AS u
            FROM campaign_events
-          WHERE campaign_id::text = $1
-            AND event_type = 'sent'`,
+          WHERE campaign_id::text = $1 AND event_type = 'sent'`,
         [camp.id]
       );
       sent = Number(s?.rows?.[0]?.u || 0);
     }
 
-    // Count unique opens/clicks
-    const e = await q(
+    // unique opens/clicks
+    const e2 = await q(
       `SELECT event_type, COUNT(DISTINCT customer_email) AS u
          FROM campaign_events
-        WHERE campaign_id::text = $1
-          AND event_type IN ('open','click')
+        WHERE campaign_id::text = $1 AND event_type IN ('open','click')
         GROUP BY event_type`,
       [camp.id]
     );
-
-    let uniqueOpens = 0, uniqueClicks = 0;
-    for (const row of e.rows || []) {
-      if (row.event_type === "open") uniqueOpens = Number(row.u || 0);
-      else if (row.event_type === "click") uniqueClicks = Number(row.u || 0);
+    let uo = 0, uc = 0;
+    for (const row of e2.rows || []) {
+      if (row.event_type === "open") uo = Number(row.u || 0);
+      if (row.event_type === "click") uc = Number(row.u || 0);
     }
 
-    const openRate  = sent ? Math.round((uniqueOpens / sent) * 1000) / 10 : 0;
-    const clickRate = sent ? Math.round((uniqueClicks / sent) * 1000) / 10 : 0;
+    const openRate  = sent ? Math.round((uo / sent) * 1000) / 10 : 0;
+    const clickRate = sent ? Math.round((uc / sent) * 1000) / 10 : 0;
 
     return res.json({
       ok: true,
       subject: camp.subject || "",
       message: camp.text || stripHtml(camp.html || ""),
-      openRate,
-      clickRate,
-      sent_at: camp.sent_at,
+      openRate, clickRate, sent_at: camp.sent_at
     });
-  } catch (err) {
-    return res.json({
-      ok: true,
-      subject: "",
-      message: "",
-      openRate: 0,
-      clickRate: 0,
-      sent_at: null,
-      note: "stats_failed: " + (err?.message || String(err)),
-    });
+  } catch {
+    return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
   }
 });
+
+// GET /api/campaigns/stats/by/:campaignId — exact campaign
+router.get("/stats/by/:campaignId", async (req, res) => {
+  const id = String(req.params.campaignId || "");
+  const stripHtml = (html = "") => String(html).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  let q = null;
+  try {
+    const db = require("../db");
+    q = db?.pool?.query ? db.pool.query.bind(db.pool) :
+        (typeof db?.query === "function" ? db.query.bind(db) : null);
+  } catch {}
+  if (!q) return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
+
+  try {
+    const r = await q(`SELECT id::text AS id, subject, html, text, sent_count, sent_at FROM campaigns WHERE id::text = $1 LIMIT 1`, [id]);
+    const camp = r?.rows?.[0] || { id, subject: "", html: "", text: "", sent_count: 0, sent_at: null };
+
+    let sent = Number(camp.sent_count || 0) || 0;
+    if (!sent) {
+      const s = await q(
+        `SELECT COUNT(DISTINCT customer_email) AS u
+           FROM campaign_events
+          WHERE campaign_id::text = $1 AND event_type = 'sent'`,
+        [id]
+      );
+      sent = Number(s?.rows?.[0]?.u || 0);
+    }
+
+    const e = await q(
+      `SELECT event_type, COUNT(DISTINCT customer_email) AS u
+         FROM campaign_events
+        WHERE campaign_id::text = $1 AND event_type IN ('open','click')
+        GROUP BY event_type`,
+      [id]
+    );
+    let uo = 0, uc = 0;
+    for (const row of e.rows || []) {
+      if (row.event_type === "open") uo = Number(row.u || 0);
+      else if (row.event_type === "click") uc = Number(row.u || 0);
+    }
+    const openRate  = sent ? Math.round((uo / sent) * 1000) / 10 : 0;
+    const clickRate = sent ? Math.round((uc / sent) * 1000) / 10 : 0;
+
+    return res.json({
+      ok: true,
+      subject: camp.subject || "",
+      message: camp.text || stripHtml(camp.html || ""),
+      openRate, clickRate, sent_at: camp.sent_at
+    });
+  } catch (err) {
+    return res.json({ ok: true, subject: "", message: "", openRate: 0, clickRate: 0, sent_at: null });
+  }
+});
+
+
 
 
 
@@ -502,58 +542,41 @@ const ONE_BY_ONE_GIF = Buffer.from(
 );
 
 // 1×1 open pixel
+// 1x1 pixel
 router.get("/track/open/:campaignId", async (req, res) => {
-  const { campaignId } = req.params;
-  const email = String(req.query.email || "").slice(0, 256);
+  const cid = String(req.params.campaignId || "");
+  const email = String(req.query.email || "").slice(0,256);
   try {
     const db = require("../db");
     const q = db?.pool?.query ? db.pool.query.bind(db.pool) : db.query.bind(db);
-    await q(`
-      CREATE TABLE IF NOT EXISTS campaign_events (
-        id BIGSERIAL PRIMARY KEY,
-        campaign_id TEXT,
-        customer_email TEXT,
-        event_type TEXT,
-        event_time TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    await q(
-      `INSERT INTO campaign_events (campaign_id, customer_email, event_type, event_time)
-       VALUES ($1,$2,'open',NOW())`,
-      [String(campaignId), email]
-    );
-  } catch (_) {}
-  res.set("Content-Type", "image/gif");
-  res.set("Cache-Control", "no-store");
-  res.send(Buffer.from("47494638396101000100800000ffffff00000021f90401000001002c00000000010001000002024401003b", "hex"));
+    await q(`CREATE TABLE IF NOT EXISTS campaign_events (
+      id BIGSERIAL PRIMARY KEY, campaign_id TEXT, customer_email TEXT,
+      event_type TEXT, event_time TIMESTAMP DEFAULT NOW()
+    )`);
+    await q(`INSERT INTO campaign_events (campaign_id, customer_email, event_type) VALUES ($1,$2,'open')`, [cid, email]);
+  } catch {}
+  res.set("Content-Type","image/gif");
+  res.set("Cache-Control","no-store");
+  res.send(Buffer.from("47494638396101000100800000ffffff00000021f90401000001002c00000000010001000002024401003b","hex"));
 });
 
-// click redirect
 router.get("/track/click/:campaignId", async (req, res) => {
-  const { campaignId } = req.params;
-  const email = String(req.query.email || "").slice(0, 256);
-  const target = String(req.query.url || "");
+  const cid = String(req.params.campaignId || "");
+  const email = String(req.query.email || "").slice(0,256);
+  const url = String(req.query.url || "");
   try {
     const db = require("../db");
     const q = db?.pool?.query ? db.pool.query.bind(db.pool) : db.query.bind(db);
-    await q(`
-      CREATE TABLE IF NOT EXISTS campaign_events (
-        id BIGSERIAL PRIMARY KEY,
-        campaign_id TEXT,
-        customer_email TEXT,
-        event_type TEXT,
-        event_time TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    await q(
-      `INSERT INTO campaign_events (campaign_id, customer_email, event_type, event_time)
-       VALUES ($1,$2,'click',NOW())`,
-      [String(campaignId), email]
-    );
-  } catch (_) {}
-  if (!/^https?:\/\//i.test(target)) return res.status(400).send("bad url");
-  res.redirect(target);
+    await q(`CREATE TABLE IF NOT EXISTS campaign_events (
+      id BIGSERIAL PRIMARY KEY, campaign_id TEXT, customer_email TEXT,
+      event_type TEXT, event_time TIMESTAMP DEFAULT NOW()
+    )`);
+    await q(`INSERT INTO campaign_events (campaign_id, customer_email, event_type) VALUES ($1,$2,'click')`, [cid, email]);
+  } catch {}
+  if (!/^https?:\/\//i.test(url)) return res.status(400).send("bad url");
+  res.redirect(url);
 });
+
 
 
 
