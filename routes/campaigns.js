@@ -486,7 +486,7 @@ router.get("/list", async (req, res) => {
     rows = [];
   }
 
-  const fromDb = rows.map((c) => {
+ const fromDb = rows.map((c) => {
   const idStr = String(c.id);
   const mem = getRecentCounts(idStr);
   const meta = recentCampaignMeta.get(idStr) || {}; // 👈 subject/message fallback
@@ -519,6 +519,7 @@ router.get("/list", async (req, res) => {
     clickRate,
   };
 });
+
 
 
   // Merge memory-only campaigns if DB didn’t persist yet
