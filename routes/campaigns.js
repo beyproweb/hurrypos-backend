@@ -5,7 +5,23 @@ const router = express.Router();
 /* =========================================================
    In-memory fallback so stats work even if DB writes fail
    ========================================================= */
+/* =========================================================
+   In-memory fallback so stats work even if DB writes fail
+   ========================================================= */
 const recentEvents = new Map(); // Map<cid, {sent:Set, opens:Set, clicks:Set, last:Date}>
+
+// NEW: keep campaign meta so UI can show subject & message
+const recentCampaignMeta = new Map(); // Map<cid, {subject, message, sent_at:Date}>
+
+function rememberCampaignMeta(cid, subject, message, sentAt = new Date()) {
+  if (!cid) return;
+  recentCampaignMeta.set(String(cid), {
+    subject: String(subject || ""),
+    message: String(message || ""),
+    sent_at: sentAt,
+  });
+}
+
 function rememberEvent(cid, type, email) {
   if (!cid) return;
   const id = String(cid);
@@ -18,12 +34,7 @@ function rememberEvent(cid, type, email) {
   rec.last = new Date();
   recentEvents.set(id, rec);
 }
-function getRecentCounts(cid) {
-  const r = recentEvents.get(String(cid));
-  return r
-    ? { sent: r.sent.size, opens: r.opens.size, clicks: r.clicks.size }
-    : { sent: 0, opens: 0, clicks: 0 };
-}
+
 
 /* =========================================================
    DB helper (fail loud in debug routes; graceful in prod)
