@@ -219,25 +219,75 @@ async function fetchAllRecipientEmails() {
 }
 
 // GET /api/campaigns/list - last 20 campaigns
+// GET /api/campaigns/list - last 20 campaigns with open/click rates
 router.get("/list", async (req, res) => {
   try {
+    // Ensure tables (best effort)
+    try {
+      await q(`CREATE TABLE IF NOT EXISTS campaigns (
+        id BIGSERIAL PRIMARY KEY, name TEXT, subject TEXT, html TEXT, text TEXT,
+        sent_count INTEGER DEFAULT 0, sent_at TIMESTAMP NULL
+      )`);
+      await q(`CREATE TABLE IF NOT EXISTS campaign_events (
+        id BIGSERIAL PRIMARY KEY, campaign_id TEXT, customer_email TEXT,
+        event_type TEXT, event_time TIMESTAMP DEFAULT NOW()
+      )`);
+    } catch (_) {}
+
+    // Pull last 20 campaigns
     const r = await q(
-      `SELECT id::text id, subject, text, html, sent_count, sent_at
-       FROM campaigns
-       WHERE sent_at IS NOT NULL
-       ORDER BY sent_at DESC
+      `SELECT
+         c.id::text AS id,
+         c.subject,
+         c.text,
+         c.html,
+         c.sent_count,
+         c.sent_at,
+         /* denominator: prefer stored sent_count, else count 'sent' events */
+         COALESCE(NULLIF(c.sent_count, 0),
+           (SELECT COUNT(DISTINCT ce.customer_email)
+            FROM campaign_events ce
+            WHERE ce.campaign_id::text = c.id::text AND ce.event_type='sent')
+         ) AS sent_denom,
+         /* numerators */
+         (SELECT COUNT(DISTINCT ce.customer_email)
+            FROM campaign_events ce
+            WHERE ce.campaign_id::text = c.id::text AND ce.event_type='open') AS u_open,
+         (SELECT COUNT(DISTINCT ce.customer_email)
+            FROM campaign_events ce
+            WHERE ce.campaign_id::text = c.id::text AND ce.event_type='click') AS u_click
+       FROM campaigns c
+       WHERE c.sent_at IS NOT NULL
+       ORDER BY c.sent_at DESC
        LIMIT 20`
     );
-    const campaigns = (r?.rows || []).map(c => ({
-      id: c.id,
-      subject: c.subject || "",
-      message: c.text || stripHtml(c.html || ""),
-      sent_at: c.sent_at,
-      sent_count: c.sent_count || 0,
-    }));
-    res.json({ ok: true, campaigns });
+
+    const rows = r?.rows || [];
+
+    // Merge with in-memory recentEvents (take max of DB vs memory)
+    const campaigns = rows.map((c) => {
+      const mem = getRecentCounts(c.id);
+      const sent = Number(c.sent_denom || 0);
+      const opens = Math.max(Number(c.u_open || 0), Number(mem.opens || 0));
+      const clicks = Math.max(Number(c.u_click || 0), Number(mem.clicks || 0));
+
+      const openRate = sent ? Math.round((opens / sent) * 1000) / 10 : 0;
+      const clickRate = sent ? Math.round((clicks / sent) * 1000) / 10 : 0;
+
+      return {
+        id: String(c.id),
+        subject: c.subject || "",
+        message: c.text || stripHtml(c.html || ""),
+        sent_at: c.sent_at,
+        sent_count: Number(c.sent_count || 0),
+        openRate,
+        clickRate,
+      };
+    });
+
+    return res.json({ ok: true, campaigns });
   } catch (e) {
-    res.json({ ok: false, error: e?.message || "failed to fetch" });
+    return res.json({ ok: false, error: e?.message || "failed to fetch campaigns" });
   }
 });
 
