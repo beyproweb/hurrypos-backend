@@ -487,22 +487,39 @@ router.get("/list", async (req, res) => {
   }
 
   const fromDb = rows.map((c) => {
-    const mem = getRecentCounts(c.id);
-    const sent = Number(c.sent_denom || 0);
-    const opens = Math.max(Number(c.u_open || 0), Number(mem.opens || 0));
-    const clicks = Math.max(Number(c.u_click || 0), Number(mem.clicks || 0));
-    const openRate = sent ? Math.round((opens / sent) * 1000) / 10 : 0;
-    const clickRate = sent ? Math.round((clicks / sent) * 1000) / 10 : 0;
-    return {
-      id: String(c.id),
-      subject: c.subject || "",
-      message: c.text || stripHtml(c.html || ""),
-      sent_at: c.sent_at,
-      sent_count: Number(c.sent_count || 0),
-      openRate,
-      clickRate,
-    };
-  });
+  const idStr = String(c.id);
+  const mem = getRecentCounts(idStr);
+  const meta = recentCampaignMeta.get(idStr) || {}; // 👈 subject/message fallback
+
+  const sent = Number(c.sent_denom || 0);
+  const opens = Math.max(Number(c.u_open || 0), Number(mem.opens || 0));
+  const clicks = Math.max(Number(c.u_click || 0), Number(mem.clicks || 0));
+  const openRate = sent ? Math.round((opens / sent) * 1000) / 10 : 0;
+  const clickRate = sent ? Math.round((clicks / sent) * 1000) / 10 : 0;
+
+  // Prefer DB fields; if blank/NULL, fallback to meta (then stripHtml(html))
+  const subject =
+    (c.subject && String(c.subject).trim()) ||
+    (meta.subject && String(meta.subject).trim()) ||
+    "";
+
+  const msgFromDb = (c.text && String(c.text).trim()) || stripHtml(c.html || "");
+  const message =
+    (msgFromDb && String(msgFromDb).trim()) ||
+    (meta.message && String(meta.message).trim()) ||
+    "";
+
+  return {
+    id: idStr,
+    subject,
+    message,
+    sent_at: c.sent_at || meta.sent_at || null,  // date fallback too
+    sent_count: Number(c.sent_count || 0),
+    openRate,
+    clickRate,
+  };
+});
+
 
   // Merge memory-only campaigns if DB didn’t persist yet
   const known = new Set(fromDb.map(c => c.id));
