@@ -234,7 +234,10 @@ router.get("/list", async (req, res) => {
       )`);
     } catch (_) {}
 
-    // Pull last 20 campaigns
+    // Pull last 20, ordering by "most recently active":
+    // - prefer sent_at
+    // - else most recent event_time
+    // - else newest id
     const r = await q(
       `SELECT
          c.id::text AS id,
@@ -243,37 +246,35 @@ router.get("/list", async (req, res) => {
          c.html,
          c.sent_count,
          c.sent_at,
-         /* denominator: prefer stored sent_count, else count 'sent' events */
          COALESCE(NULLIF(c.sent_count, 0),
            (SELECT COUNT(DISTINCT ce.customer_email)
-            FROM campaign_events ce
-            WHERE ce.campaign_id::text = c.id::text AND ce.event_type='sent')
+              FROM campaign_events ce
+              WHERE ce.campaign_id::text = c.id::text AND ce.event_type='sent')
          ) AS sent_denom,
-         /* numerators */
          (SELECT COUNT(DISTINCT ce.customer_email)
             FROM campaign_events ce
             WHERE ce.campaign_id::text = c.id::text AND ce.event_type='open') AS u_open,
          (SELECT COUNT(DISTINCT ce.customer_email)
             FROM campaign_events ce
-            WHERE ce.campaign_id::text = c.id::text AND ce.event_type='click') AS u_click
+            WHERE ce.campaign_id::text = c.id::text AND ce.event_type='click') AS u_click,
+         (SELECT MAX(event_time)
+            FROM campaign_events ce
+            WHERE ce.campaign_id::text = c.id::text) AS last_event
        FROM campaigns c
-       WHERE c.sent_at IS NOT NULL
-       ORDER BY c.sent_at DESC
+       ORDER BY
+         COALESCE(c.sent_at, (SELECT MAX(event_time) FROM campaign_events ce WHERE ce.campaign_id::text = c.id::text)) DESC NULLS LAST,
+         c.id DESC
        LIMIT 20`
     );
 
     const rows = r?.rows || [];
-
-    // Merge with in-memory recentEvents (take max of DB vs memory)
     const campaigns = rows.map((c) => {
       const mem = getRecentCounts(c.id);
       const sent = Number(c.sent_denom || 0);
       const opens = Math.max(Number(c.u_open || 0), Number(mem.opens || 0));
       const clicks = Math.max(Number(c.u_click || 0), Number(mem.clicks || 0));
-
       const openRate = sent ? Math.round((opens / sent) * 1000) / 10 : 0;
       const clickRate = sent ? Math.round((clicks / sent) * 1000) / 10 : 0;
-
       return {
         id: String(c.id),
         subject: c.subject || "",
@@ -290,6 +291,7 @@ router.get("/list", async (req, res) => {
     return res.json({ ok: false, error: e?.message || "failed to fetch campaigns" });
   }
 });
+
 
 
 /* =========================================================
