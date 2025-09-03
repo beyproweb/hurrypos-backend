@@ -218,6 +218,30 @@ async function fetchAllRecipientEmails() {
   return [];
 }
 
+// GET /api/campaigns/list - last 20 campaigns
+router.get("/list", async (req, res) => {
+  try {
+    const r = await q(
+      `SELECT id::text id, subject, text, html, sent_count, sent_at
+       FROM campaigns
+       WHERE sent_at IS NOT NULL
+       ORDER BY sent_at DESC
+       LIMIT 20`
+    );
+    const campaigns = (r?.rows || []).map(c => ({
+      id: c.id,
+      subject: c.subject || "",
+      message: c.text || stripHtml(c.html || ""),
+      sent_at: c.sent_at,
+      sent_count: c.sent_count || 0,
+    }));
+    res.json({ ok: true, campaigns });
+  } catch (e) {
+    res.json({ ok: false, error: e?.message || "failed to fetch" });
+  }
+});
+
+
 /* =========================================================
    POST /api/campaigns/email
    - robust input handling
@@ -672,5 +696,7 @@ router.get("/track/click/:cid", async (req, res) => {
   if (!/^https?:\/\//i.test(url)) return res.status(400).send("bad url");
   return res.redirect(302, url);
 });
+
+
 
 module.exports = router;
