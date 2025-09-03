@@ -35,6 +35,14 @@ function rememberEvent(cid, type, email) {
   recentEvents.set(id, rec);
 }
 
+// Put this just below recentEvents / recentCampaignMeta:
+function getRecentCounts(cid) {
+  const r = recentEvents.get(String(cid));
+  return r
+    ? { sent: r.sent.size, opens: r.opens.size, clicks: r.clicks.size }
+    : { sent: 0, opens: 0, clicks: 0 };
+}
+
 
 /* =========================================================
    DB helper (fail loud in debug routes; graceful in prod)
