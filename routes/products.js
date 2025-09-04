@@ -277,7 +277,7 @@ router.put("/:id", async (req, res) => {
         image = $13,
         ingredients = $14,                 -- TEXT or JSON(B) column
         extras = $15,                      -- TEXT or JSON(B) column
-        selected_extras_group = COALESCE($16::int[], ARRAY[]::int[])  -- ✅ cast!
+        selected_extras_group = $16  -- ✅ cast!
       WHERE id = $17
       RETURNING *`,
       [
