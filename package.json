@@ -6,15 +6,16 @@
   "main": "index.js",
   "bin": "local-print-bridge.js",
   "scripts": {
-    "build:win":   "pkg . --targets node18-win-x64   --compress GZip --output dist/beypro-bridge-win-x64.exe",
-    "build:mac":   "pkg . --targets node18-macos-x64 --compress GZip --output dist/beypro-bridge-macos-x64",
-    "build:linux": "pkg . --targets node18-linux-x64 --compress GZip --output dist/beypro-bridge-linux-x64",
+    "build:win":   "pkg . --targets node18-win-x64   --compress GZip --output dist/beypro-bridge-win-x64-v1.0.4.exe",
+    "build:mac":   "pkg . --targets node18-macos-x64 --compress GZip --output dist/beypro-bridge-macos-x64-v1.0.4",
+    "build:linux": "pkg . --targets node18-linux-x64 --compress GZip --output dist/beypro-bridge-linux-x64-v1.0.4",
+
     "build:all":   "npm run build:win && npm run build:mac && npm run build:linux",
 
-    "pack:win":   "mkdir -p public/bridge && zip -j public/bridge/beypro-bridge-win-x64.zip dist/beypro-bridge-win-x64.exe installers/windows/install-beyprobridge.ps1 installers/windows/install-beyprobridge.cmd",
-    "pack:mac":   "mkdir -p public/bridge && (cd dist && zip -9 ../public/bridge/beypro-bridge-mac.zip beypro-bridge-macos-x64 ../installers/macos/install-beyprobridge.sh)",
-    "pack:linux": "mkdir -p public/bridge && (cd dist && tar -czf ../public/bridge/beypro-bridge-linux-x64.tar.gz beypro-bridge-linux-x64 ../installers/linux/install-beyprobridge.sh)",
-    "pack:all":   "npm run pack:win && npm run pack:mac && npm run pack:linux"
+    "pack:win":    "mkdir -p public/bridge && zip -j public/bridge/beypro-bridge-win-x64-v1.0.4.zip dist/beypro-bridge-win-x64-v1.0.4.exe installers/windows/install-beyprobridge.ps1 installers/windows/install-beyprobridge.cmd",
+    "pack:mac":    "mkdir -p public/bridge && (cd dist && zip -9 ../public/bridge/beypro-bridge-mac-v1.0.4.zip beypro-bridge-macos-x64-v1.0.4 ../installers/macos/install-beyprobridge.sh)",
+    "pack:linux":  "mkdir -p public/bridge && (cd dist && tar -czf ../public/bridge/beypro-bridge-linux-x64-v1.0.4.tar.gz beypro-bridge-linux-x64-v1.0.4 ../installers/linux/install-beyprobridge.sh)",
+    "pack:all":    "npm run pack:win && npm run pack:mac && npm run pack:linux"
   },
   "dependencies": {
     "axios": "^1.8.4",
