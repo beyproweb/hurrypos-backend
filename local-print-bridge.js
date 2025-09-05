@@ -7,6 +7,16 @@ const fs = require("fs");
 const { spawn } = require("child_process");
 const path = require("path");
 
+/* NEW: optional serialport import (graceful if missing) */
+let SerialPort, listSerialPorts;
+try {
+  const sp = require("serialport");
+  SerialPort = sp.SerialPort || sp; // compat
+  listSerialPorts = sp.list;
+} catch {
+  // serialport not installed — USB endpoints will error with guidance
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -564,6 +574,115 @@ app.post("/assist/fix-printer", (req, res) => {
     });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/* -----------------------------------------------------------------------
+   NEW: USB endpoints (generic ESC/POS over USB-Serial)
+   ----------------------------------------------------------------------- */
+
+/** GET /usb/list
+ * Lists available serial ports. Many thermal printers expose a CDC/ACM
+ * serial interface over USB. Pick the one that looks like the printer.
+ */
+app.get("/usb/list", async (_req, res) => {
+  try {
+    if (!listSerialPorts) {
+      return res.status(501).json({
+        error: "USB support not installed. Run: npm i serialport",
+      });
+    }
+    const ports = await listSerialPorts();
+    const mapped = ports.map(p => ({
+      path: p.path,
+      manufacturer: p.manufacturer || null,
+      serialNumber: p.serialNumber || null,
+      vendorId: p.vendorId || null,
+      productId: p.productId || null,
+      friendlyName: [p.manufacturer, p.serialNumber].filter(Boolean).join(" ") || null,
+    }));
+    res.json({ ok: true, ports: mapped });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/** POST /usb/print-raw
+ * Body: { path: "/dev/ttyUSB0" | "COM5", baudRate?: 9600, content: "text or escpos" }
+ * Sends ESC/POS bytes directly over the serial port.
+ */
+app.post("/usb/print-raw", async (req, res) => {
+  try {
+    if (!SerialPort) {
+      return res.status(501).json({
+        error: "USB support not installed. Run: npm i serialport",
+      });
+    }
+    const { path: devicePath, baudRate = 9600, content } = req.body || {};
+    if (!devicePath || !content) {
+      return res.status(400).json({ error: "path and content are required" });
+    }
+
+    // Build ESC/POS payload
+    const ESC = Buffer.from([0x1b]);
+    const GS  = Buffer.from([0x1d]);
+    const init = Buffer.from([0x1b, 0x40]); // ESC @
+    const lf   = Buffer.from("\n");
+    const cut  = Buffer.concat([GS, Buffer.from("V"), Buffer.from([66, 3])]);
+    const payload = Buffer.isBuffer(content) ? content : Buffer.from(String(content), "utf8");
+    const toSend = Buffer.concat([init, payload, lf, lf, cut]);
+
+    // Open, write, close
+    const port = new SerialPort({ path: devicePath, baudRate, autoOpen: false });
+    await new Promise((resolve, reject) => port.open(err => err ? reject(err) : resolve()));
+    await new Promise((resolve, reject) => port.write(toSend, err => err ? reject(err) : resolve()));
+    await new Promise((resolve) => port.drain(() => resolve()));
+    await new Promise((resolve) => port.close(() => resolve()));
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/** POST /usb/print-test
+ * Body: { path, baudRate?, title? }
+ */
+app.post("/usb/print-test", async (req, res) => {
+  try {
+    if (!SerialPort) {
+      return res.status(501).json({ error: "USB support not installed. Run: npm i serialport" });
+    }
+    const { path: devicePath, baudRate = 9600, title = "Beypro USB Test" } = req.body || {};
+    if (!devicePath) return res.status(400).json({ error: "path is required" });
+
+    const ESC = Buffer.from([0x1b]);
+    const GS  = Buffer.from([0x1d]);
+    const init   = Buffer.from([0x1b, 0x40]);
+    const center = Buffer.from([0x1b, 0x61, 0x01]);
+    const normal = Buffer.from([0x1b, 0x21, 0x00]);
+    const bold   = Buffer.from([0x1b, 0x45, 0x01]);
+    const boldOff= Buffer.from([0x1b, 0x45, 0x00]);
+    const lf     = Buffer.from("\n");
+    const cut    = Buffer.concat([GS, Buffer.from("V"), Buffer.from([66, 3])]);
+
+    const lines = Buffer.concat([
+      init, center,
+      bold, Buffer.from(String(title).toUpperCase(), "utf8"), boldOff, lf, lf,
+      normal, Buffer.from(new Date().toLocaleString(), "utf8"), lf, lf,
+      Buffer.from("USB ESC/POS OK ✅", "utf8"), lf, lf,
+      cut
+    ]);
+
+    const port = new SerialPort({ path: devicePath, baudRate, autoOpen: false });
+    await new Promise((resolve, reject) => port.open(err => err ? reject(err) : resolve()));
+    await new Promise((resolve, reject) => port.write(lines, err => err ? reject(err) : resolve()));
+    await new Promise((resolve) => port.drain(() => resolve()));
+    await new Promise((resolve) => port.close(() => resolve()));
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
