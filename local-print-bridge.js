@@ -190,6 +190,38 @@ public class RawPrinterHelper {
 "@
 `;
 
+// --- Add near other routes in local-print-bridge.js ---
+app.get("/probe", async (req, res) => {
+  const host = req.query.host;
+  const ports = String(req.query.ports || "9100").split(",").map(p => Number(p)||0).filter(Boolean);
+  const timeoutMs = Number(req.query.timeoutMs || 1200);
+  if (!host || !ports.length) return res.status(400).json({ error: "host and ports required" });
+
+  const net = require("net");
+  const tryPort = (port) => new Promise((resolve) => {
+    const s = new net.Socket();
+    let done = false;
+    const finish = (ok) => { if (done) return; done = true; try { s.destroy(); } catch {}; resolve(ok); };
+    s.setTimeout(timeoutMs, () => finish(false));
+    s.once("error", () => finish(false));
+    s.connect(port, host, () => { finish(true); });
+  });
+
+  const open = [];
+  for (const p of ports) { if (await tryPort(p)) open.push({ port: p }); }
+  res.json({ ok: true, open, sameSubnet: null }); // simple version
+});
+
+app.get("/discover", async (_req, res) => {
+  // Minimal placeholder: no scan, just return empty array so UI doesn't crash
+  res.json({ ok: true, results: [] });
+});
+
+app.post("/assist/subnet/add", (_req, res) => res.status(501).json({ error: "Not implemented yet" }));
+app.post("/assist/subnet/open", (_req, res) => res.status(501).json({ error: "Not implemented yet" }));
+app.post("/assist/subnet/cleanup", (_req, res) => res.status(501).json({ error: "Not implemented yet" }));
+app.post("/router/reserve", (_req, res) => res.status(501).json({ error: "Not implemented yet" }));
+
 app.get("/spooler/list", async (req, res) => {
   if (process.platform !== "win32") return res.status(501).json({ error: "Windows only" });
   try {

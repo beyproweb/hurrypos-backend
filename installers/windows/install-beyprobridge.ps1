@@ -1,16 +1,11 @@
 <#
 .SYNOPSIS
-  Temporarily add a secondary IP on Windows so you can reach a LAN receipt printer
-  stuck on a different subnet (e.g., 192.168.123.100), open its web UI, switch it
-  to DHCP (or set a proper static in your main LAN), then remove the temp IP.
+  Setup Beypro LAN printer and USB print bridge on Windows
 
-.EXAMPLE
-  powershell -ExecutionPolicy Bypass -File .\fix-printer-ip.ps1 -PrinterHost 192.168.123.100
-
-.OPTIONAL
-  -AdapterAlias "Ethernet"  # use a specific NIC; otherwise auto-selects the primary IPv4 adapter
-  -TempIp 192.168.123.50    # override the temp IP on that subnet (default picks .50 / .51 / .52…)
-  -PrefixLength 24
+.DESCRIPTION
+  1. Temporarily adds a secondary IP to access LAN printers (e.g. 192.168.123.100)
+  2. Installs and runs the USB Print Bridge locally
+  3. Sets up autostart on Windows boot
 #>
 
 param(
@@ -40,7 +35,7 @@ if(-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrat
   exit
 }
 
-# --- Helpers ---
+# --- Helper functions ---
 function Get-PrimaryIPv4Adapter {
   if($AdapterAlias){
     $a = Get-NetAdapter -Name $AdapterAlias -ErrorAction SilentlyContinue
@@ -48,10 +43,8 @@ function Get-PrimaryIPv4Adapter {
     Write-Err "Adapter '$AdapterAlias' not found or not Up."
     exit 1
   }
-  # Prefer adapter with a default gateway (active internet)
   $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -and $_.IPv4DefaultGateway } | Select-Object -First 1
   if($cfg){ return (Get-NetAdapter -InterfaceIndex $cfg.InterfaceIndex) }
-  # Fallback: first Up adapter with IPv4
   $a2 = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
   return $a2
 }
@@ -69,7 +62,6 @@ function Pick-TempIp([string]$printerHost){
   foreach($ip in $candidates){
     $used = (Get-NetIPAddress -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $ip })
     if(-not $used){
-      # quick ping check; if already responds, skip
       if(-not (Test-Connection -Quiet -Count 1 -TimeoutSeconds 1 -ErrorAction SilentlyContinue $ip)){
         return $ip
       }
@@ -79,7 +71,47 @@ function Pick-TempIp([string]$printerHost){
   exit 1
 }
 
-# --- Begin ---
+function Ensure-BeyproUsbBridge {
+  $bridgeExe = "$env:ProgramData\BeyproBridge\beypro-bridge.exe"
+  $bridgeZip = "beypro-bridge.zip"
+  $startupLnk = "$env:AppData\Microsoft\Windows\Start Menu\Programs\Startup\Beypro USB Bridge.lnk"
+
+  if (-not (Test-Path (Split-Path $bridgeExe))) {
+    New-Item -ItemType Directory -Path (Split-Path $bridgeExe) -Force | Out-Null
+  }
+
+  if (-not (Test-Path $bridgeExe)) {
+    if (-not (Test-Path $bridgeZip)) {
+      Write-Err "Missing $bridgeZip — cannot install USB bridge."
+      return
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($bridgeZip, (Split-Path $bridgeExe))
+    Write-OK "Extracted USB Bridge to $bridgeExe"
+  }
+
+  if (-not (Test-Path $startupLnk)) {
+    $ws = New-Object -ComObject WScript.Shell
+    $shortcut = $ws.CreateShortcut($startupLnk)
+    $shortcut.TargetPath = $bridgeExe
+    $shortcut.WorkingDirectory = (Split-Path $bridgeExe)
+    $shortcut.WindowStyle = 7
+    $shortcut.Description = "Beypro USB Print Bridge"
+    $shortcut.Save()
+    Write-OK "Startup shortcut created for USB bridge"
+  }
+
+  $running = Get-Process | Where-Object { $_.Path -eq $bridgeExe }
+  if (-not $running) {
+    Start-Process -FilePath $bridgeExe -WindowStyle Hidden
+    Write-OK "Started Beypro USB Bridge"
+  } else {
+    Write-Info "USB Bridge is already running"
+  }
+}
+
+# --- MAIN EXECUTION ---
+
 Write-Info "Target printer: $PrinterHost"
 $primary = Get-PrimaryIPv4Adapter
 if(-not $primary){ Write-Err "No active IPv4 adapter found."; exit 1 }
@@ -88,41 +120,36 @@ Write-OK "Using adapter: $($primary.Name)"
 $chosenTemp = Pick-TempIp $PrinterHost
 Write-Info "Temporary IP candidate: $chosenTemp/$PrefixLength"
 
-# Add temp IP
-try{
+try {
   New-NetIPAddress -InterfaceAlias $primary.Name -IPAddress $chosenTemp -PrefixLength $PrefixLength -ErrorAction Stop | Out-Null
   Write-OK "Added secondary IP $chosenTemp to '$($primary.Name)'"
-}catch{
+} catch {
   Write-Err "Failed to add temp IP: $($_.Exception.Message)"
-  Write-Err "If this persists, ensure PowerShell is running as Administrator."
   exit 1
 }
 
-# Try connectivity to the printer host/port 9100 to confirm reachability
-try{
+try {
   $test = Test-NetConnection -ComputerName $PrinterHost -Port 80 -WarningAction SilentlyContinue
   if($test.TcpTestSucceeded){
     Write-OK "Port 80 reachable — opening printer web UI…"
-  }else{
-    Write-Info "Port 80 not reachable (some models use other mgmt ports). Will try to open HTTP anyway."
+  } else {
+    Write-Info "Port 80 not reachable. Will try to open printer UI anyway."
   }
-}catch{}
+} catch {}
 
-# Open browser to printer UI
 Start-Process "http://$PrinterHost" | Out-Null
-Write-Info "In the printer web UI, set IP mode to DHCP (recommended) or assign a static in your main LAN."
-Write-Info "After saving & rebooting the printer, press ENTER here to remove the temp IP."
+Write-Info "Set DHCP or assign static IP in the printer UI. Press ENTER when done to clean up."
 [void][System.Console]::ReadLine()
 
-# Cleanup temp IP
-try{
+try {
   Remove-NetIPAddress -InterfaceAlias $primary.Name -IPAddress $chosenTemp -Confirm:$false -ErrorAction Stop
   Write-OK "Removed temporary IP $chosenTemp from '$($primary.Name)'"
-}catch{
+} catch {
   Write-Err "Failed to remove temp IP: $($_.Exception.Message)"
-  Write-Info "You can remove it later with:"
-  Write-Host "  Remove-NetIPAddress -InterfaceAlias `"$($primary.Name)`" -IPAddress $chosenTemp -Confirm:`$false" -ForegroundColor Yellow
 }
 
-Write-OK "Done. Now the printer should be on your main LAN (same subnet as the PC)."
-Write-Info "Tip: In Beypro, click 'Find Printers' and then 'Test Print'."
+# ✅ Ensure USB Bridge is installed and running
+Ensure-BeyproUsbBridge
+
+Write-OK "Setup complete. Beypro USB Bridge is installed and running."
+Write-Info "You can now detect USB printers from your browser at http://127.0.0.1:7777/usb/list"
