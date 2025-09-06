@@ -1,6 +1,6 @@
 # installers/windows/install-beyprobridge.ps1
 param(
-  [string]$ZipUrl = "https://<YOUR_RENDER_HOST>/bridge/beypro-bridge-win-x64-v1.0.4.zip"
+  [string]$ZipUrl = "https://hurrypos-backend.onrender.com/bridge/beypro-bridge-win-x64-v1.0.4.zip"
 )
 
 function Write-Info($m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
