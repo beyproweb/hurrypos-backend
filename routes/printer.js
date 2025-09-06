@@ -1,161 +1,202 @@
 // routes/printer.js
+// ESC/POS printer routes for Beypro backend
+// Works with USB, Serial, and Network printers.
+// Mounted in server.js as: app.use('/api/printer-settings', printerRoutes);
+
 const express = require("express");
 const router = express.Router();
 
-// Robust JSON parsing for this router
-router.use(express.json({ limit: "256kb" }));
-
-// ✅ Correctly import pool from ../db
-let pool = null;
+const escpos = require("escpos");
 try {
-  // Your db.js exports { pool }, so destructure it:
-  ({ pool } = require("../db"));
+  escpos.USB = require("escpos-usb");
 } catch (e) {
-  console.warn(
-    "printer.js: DB module not available; will use file fallback. Reason:",
-    e?.message || e
-  );
+  // keep going; USB listing/printing will throw a helpful error later
+}
+escpos.Network = require("escpos-network");
+escpos.Serial = require("escpos-serialport");
+
+const { SerialPort } = require("serialport");
+
+// ---------- helpers ----------
+function toHex(n) {
+  if (typeof n !== "number") return null;
+  return "0x" + n.toString(16).padStart(4, "0");
+}
+function parseHex(h) {
+  if (typeof h === "number") return h;
+  if (typeof h !== "string") return null;
+  const s = h.toLowerCase().replace(/^0x/, "");
+  const v = parseInt(s, 16);
+  return Number.isFinite(v) ? v : null;
+}
+function cleanErr(e) {
+  return (e && (e.message || e.toString())) || "unknown";
+}
+function makeDevice({ iface, vendorId, productId, path, baudRate, host, port }) {
+  if (iface === "usb") {
+    if (!escpos.USB) throw new Error("USB support not available (install escpos-usb and libusb).");
+    const v = parseHex(vendorId);
+    const p = parseHex(productId);
+    if (v == null || p == null) throw new Error("Provide vendorId and productId like '0x04b8' and '0x0e15'.");
+    return new escpos.USB(v, p);
+  }
+  if (iface === "serial") {
+    if (!path) throw new Error("Provide serial 'path' (e.g., /dev/ttyUSB0 or COM3).");
+    return new escpos.Serial(path, { baudRate: baudRate || 9600 });
+  }
+  if (iface === "network") {
+    if (!host) throw new Error("Provide network 'host' (printer IP).");
+    return new escpos.Network(host, port || 9100);
+  }
+  throw new Error("Unsupported interface. Use one of: usb | serial | network");
 }
 
-const fs = require("fs");
-const path = require("path");
-const DATA_DIR = path.join(__dirname, "..", "data");
-const DATA_FILE = path.join(DATA_DIR, "printer_settings.json");
+// ---------- routes ----------
 
+// Health
+router.get("/status", (req, res) => {
+  res.json({ ok: true, message: "Printer routes alive" });
+});
 
-// ---- DEFAULTS (keep in sync with frontend) ----
-const DEFAULT_LAYOUT = {
-  shopAddress: "",
-  receiptWidth: "80mm",
-  customReceiptWidth: "",
-  receiptHeight: "",
-  fontSize: 14,
-  lineHeight: 1.2,
-  alignment: "left",
-  showLogo: false,
-  showHeader: false,
-  showFooter: false,
-  showQr: false,
-  headerText: "",
-  footerText: "",
-  showPacketCustomerInfo: false,
-  extras: [],
-};
+// List printers (USB + Serial)
+router.get("/printers", async (req, res) => {
+  const out = { usb: [], serial: [], tips: [] };
 
-function mergeWithDefaults(saved) {
-  const merged = { ...DEFAULT_LAYOUT, ...(saved || {}) };
-  if (!Array.isArray(merged.extras)) merged.extras = [];
-  merged.extras = merged.extras
-    .filter(e => e && typeof e === "object")
-    .map(e => ({ label: String(e.label || ""), value: String(e.value || "") }));
-  merged.fontSize = Number(merged.fontSize) || DEFAULT_LAYOUT.fontSize;
-  merged.lineHeight = Number(merged.lineHeight) || DEFAULT_LAYOUT.lineHeight;
-  if (!["left","center","right"].includes(merged.alignment)) merged.alignment = "left";
-  if (!merged.receiptWidth) merged.receiptWidth = "80mm";
-  return merged;
-}
-
-// ---------- File fallback ----------
-function ensureDataFile() {
+  // USB
   try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({}, null, 2));
-  } catch (e) { console.warn("ensureDataFile failed:", e?.message || e); }
-}
-function readFileStore() {
-  try {
-    ensureDataFile();
-    const raw = fs.readFileSync(DATA_FILE, "utf8");
-    return JSON.parse(raw || "{}");
-  } catch (e) { console.warn("readFileStore failed:", e?.message || e); return {}; }
-}
-function writeFileStore(obj) {
-  try {
-    ensureDataFile();
-    fs.writeFileSync(DATA_FILE, JSON.stringify(obj || {}, null, 2));
-    return true;
-  } catch (e) { console.warn("writeFileStore failed:", e?.message || e); return false; }
-}
-
-// ---------- DB helpers ----------
-async function ensureTable() {
-  if (!pool) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS printer_settings (
-      shop_id    TEXT PRIMARY KEY,
-      layout     JSONB NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-}
-
-// Unified handlers (work with or without shopId)
-async function handleGet(req, res, shopId) {
-  const key = shopId || "default";
-
-  // Try DB
-  if (pool) {
-    try {
-      await ensureTable();
-      const { rows } = await pool.query("SELECT layout FROM printer_settings WHERE shop_id = $1", [key]);
-      if (rows.length) return res.json({ layout: mergeWithDefaults(rows[0].layout), source: "db" });
-      // fall back to file
-      const store = readFileStore();
-      if (store[key]) return res.json({ layout: mergeWithDefaults(store[key]), source: "file" });
-      return res.json({ layout: DEFAULT_LAYOUT, source: "default" });
-    } catch (e) {
-      console.error("GET printer-settings DB error:", e?.message || e);
+    if (!escpos.USB) {
+      out.tips.push("USB module not loaded. Install 'escpos-usb' and system libusb.");
+    } else {
+      const list = escpos.USB.findPrinter?.() || [];
+      out.usb = list.map((p, idx) => ({
+        id: `usb-${idx}`,
+        vendorId: toHex(p?.deviceDescriptor?.idVendor),
+        productId: toHex(p?.deviceDescriptor?.idProduct),
+      }));
+      if (out.usb.length === 0) {
+        out.tips.push("No USB printers detected. On macOS/Linux, install/libusb and replug; on Windows, install the driver.");
+      }
     }
+  } catch (e) {
+    out.tips.push("USB error: " + cleanErr(e));
   }
 
-  // File fallback
-  const store = readFileStore();
-  if (store[key]) return res.json({ layout: mergeWithDefaults(store[key]), source: "file" });
-  return res.json({ layout: DEFAULT_LAYOUT, source: "default" });
-}
-
-async function handlePut(req, res, shopId) {
-  const key = shopId || "default";
-  const incoming = req.body?.layout;
-  if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
-    return res.status(400).json({ error: "layout object is required" });
-  }
-  const cleaned = mergeWithDefaults(incoming);
-
-  // Try DB
-  if (pool) {
-    try {
-      await ensureTable();
-      await pool.query(
-        `INSERT INTO printer_settings (shop_id, layout, updated_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (shop_id) DO UPDATE SET layout = EXCLUDED.layout, updated_at = NOW()`,
-        [key, cleaned]
-      );
-      return res.json({ ok: true, layout: cleaned, target: "db" });
-    } catch (e) {
-      console.error("PUT printer-settings DB error:", e?.message || e);
+  // Serial
+  try {
+    const ports = await SerialPort.list();
+    out.serial = ports
+      .filter(p => /usb|serial|tty|COM/i.test([p.path, p.friendlyName, p.manufacturer].join(" ")))
+      .map((p, idx) => ({
+        id: `serial-${idx}`,
+        path: p.path,
+        manufacturer: p.manufacturer || "",
+        friendlyName: p.friendlyName || "",
+      }));
+    if (out.serial.length === 0) {
+      out.tips.push("No Serial ports detected. Many USB printers expose a serial interface on macOS (e.g. /dev/tty.usbserial-*).");
     }
+  } catch (e) {
+    out.tips.push("Serial error: " + cleanErr(e));
   }
 
-  // File fallback
-  const store = readFileStore();
-  store[key] = cleaned;
-  const ok = writeFileStore(store);
-  if (!ok) return res.status(500).json({ error: "Failed to save printer settings (file fallback)" });
-  return res.json({ ok: true, layout: cleaned, target: "file" });
-}
+  res.json({ ok: true, printers: out });
+});
 
-// ---- Routes without shopId (your frontend will use these) ----
-router.get("/", (req, res) => { handleGet(req, res, null); });
-router.put("/", (req, res) => { handlePut(req, res, null); });
+// Legacy alias to keep old clients alive (your previous bridge queried /usb/list)
+router.get("/usb/list", async (req, res) => {
+  try {
+    if (!escpos.USB) throw new Error("USB module not loaded. Install 'escpos-usb' and libusb.");
+    const list = escpos.USB.findPrinter?.() || [];
+    const usb = list.map((p, idx) => ({
+      id: `usb-${idx}`,
+      vendorId: toHex(p?.deviceDescriptor?.idVendor),
+      productId: toHex(p?.deviceDescriptor?.idProduct),
+    }));
+    res.json({ ok: true, usb });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: cleanErr(e) });
+  }
+});
 
-// ---- Also support routes WITH shopId (backwards compatible) ----
-router.get("/:shopId", (req, res) => { handleGet(req, res, req.params.shopId); });
-router.put("/:shopId", (req, res) => { handlePut(req, res, req.params.shopId); });
+// Print
+// Body:
+// {
+//   interface: "usb" | "serial" | "network",
+//   vendorId?: "0x04b8", productId?: "0x0e15",   // USB
+//   path?: "/dev/ttyUSB0" | "COM3", baudRate?: 9600, // Serial
+//   host?: "192.168.1.50", port?: 9100,          // Network
+//   content: "Your text\n",
+//   encoding?: "cp857" | "cp437" | "gb18030" | "utf8",
+//   align?: "lt" | "ct" | "rt",
+//   cut?: true, cashdraw?: false
+// }
+router.post("/print", async (req, res) => {
+  const {
+    interface: iface,
+    vendorId,
+    productId,
+    path,
+    baudRate,
+    host,
+    port,
+    content = "",
+    encoding = "cp857", // default Turkish-friendly
+    align = "lt",
+    cut = true,
+    cashdraw = false,
+  } = req.body || {};
 
-// Optional: reset to defaults
-router.post("/:shopId/reset", async (req, res) => handlePut({ ...req, body: { layout: DEFAULT_LAYOUT } }, res, req.params.shopId));
-router.post("/reset", async (req, res) => handlePut({ ...req, body: { layout: DEFAULT_LAYOUT } }, res, null));
+  if (!content || typeof content !== "string") {
+    return res.status(400).json({ ok: false, error: "Missing 'content' string." });
+  }
+
+  let device;
+  try {
+    device = makeDevice({ iface, vendorId, productId, path, baudRate, host, port });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: cleanErr(e) });
+  }
+
+  device.open(err => {
+    if (err) return res.status(500).json({ ok: false, error: "Failed to open device: " + cleanErr(err) });
+
+    try {
+      const printer = new escpos.Printer(device, { encoding });
+
+      // Basic print
+      printer.align(align).style("a").size(1, 1);
+      printer.text(content.endsWith("\n") ? content : content + "\n");
+
+      if (cashdraw) printer.cashdraw(2); // pin 2 is common
+      if (cut) printer.cut();
+
+      printer.close(); // this also closes the device
+      return res.json({ ok: true });
+    } catch (e2) {
+      return res.status(500).json({ ok: false, error: "Print error: " + cleanErr(e2) });
+    }
+  });
+});
+
+// Quick test ticket
+// Body (optional): { interface, vendorId, productId, path, baudRate, host, port }
+router.post("/test", async (req, res) => {
+  const body = req.body || {};
+  body.content =
+`*** BEYPRO TEST ***
+ĞÜŞİÖÇ ğüşiöç (cp857)
+-------------------------
+Item A        2 × 50.00
+Item B        1 × 99.90
+-------------------------
+TOTAL             199.90 TL
+
+${new Date().toLocaleString()}
+`;
+  body.cut = true;
+  body.encoding = body.encoding || "cp857";
+  req.body = body;
+  return router.handle({ ...req, url: "/print", method: "POST" }, res);
+});
 
 module.exports = router;
