@@ -1,80 +1,85 @@
-# installers/windows/install-beyprobridge.ps1
+# install-beypro-bridge.ps1
+# Run as Admin: Right-click > Run with PowerShell
+# Downloads & installs Beypro Bridge, auto-starts at login.
+
 param(
-  [string]$ZipUrl = "https://hurrypos-backend.onrender.com/bridge/beypro-bridge-win-x64-v1.0.4.zip"
+  [string]$BridgeUrl = "https://pos.beypro.com/bridge/beypro-bridge-win-x64-v1.0.5.zip",
+  [string]$InstallDir = "C:\Program Files\BeyproBridge",
+  [int]$Port = 7777
 )
 
 function Write-Info($m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
 function Write-OK($m){ Write-Host "[ OK ] $m" -ForegroundColor Green }
 function Write-Err($m){ Write-Host "[ERR] $m" -ForegroundColor Red }
 
-# Admin
+# --- Admin check ---
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if(-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)){
-  Write-Info "Re-launching with Administrator rights…"
-  Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",$PSCommandPath,"-ZipUrl",$ZipUrl
-  exit
+  Write-Err "Please re-run PowerShell as Administrator."; exit 1
 }
 
-$destDir = "$env:ProgramData\BeyproBridge"
-$exePath = Join-Path $destDir "beypro-bridge-win-x64-v1.0.4.exe"
-$startupLnk = "$env:AppData\Microsoft\Windows\Start Menu\Programs\Startup\Beypro USB Bridge.lnk"
-$tmpZip = Join-Path $env:TEMP "beypro-bridge.zip"
+# --- Prep dirs ---
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+$zip = Join-Path $env:TEMP "beypro-bridge.zip"
 
-# Kill old processes on port 7777 and any old exe paths
+# --- Download ---
+Write-Info "Downloading Bridge from $BridgeUrl"
 try {
-  $conns = Get-NetTCPConnection -LocalPort 7777 -ErrorAction SilentlyContinue
-  if ($conns) {
-    foreach ($c in $conns) {
-      try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue } catch {}
-    }
+  Invoke-WebRequest -Uri $BridgeUrl -OutFile $zip
+  Write-OK "Downloaded"
+} catch {
+  Write-Err "Download failed: $($_.Exception.Message)"; exit 1
+}
+
+# --- Unzip ---
+Write-Info "Extracting to $InstallDir"
+try {
+  Expand-Archive -Path $zip -DestinationPath $InstallDir -Force
+  Remove-Item $zip -Force
+  Write-OK "Extracted"
+} catch {
+  Write-Err "Extract failed: $($_.Exception.Message)"; exit 1
+}
+
+# Find executable (bridge.exe)
+$exe = Get-ChildItem -Path $InstallDir -Recurse -Filter "bridge.exe" | Select-Object -First 1
+if(-not $exe){ Write-Err "bridge.exe not found in $InstallDir"; exit 1 }
+
+# --- Firewall rule ---
+$ruleName = "Beypro Bridge $Port"
+if(-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)){
+  New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow | Out-Null
+  Write-OK "Firewall rule added for TCP $Port"
+} else {
+  Write-Info "Firewall rule already exists"
+}
+
+# --- Scheduled Task (auto-start at logon) ---
+$taskName = "BeyproBridge"
+$act = New-ScheduledTaskAction -Execute $exe.FullName -Argument ""
+$trg = New-ScheduledTaskTrigger -AtLogOn
+$pri = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -RunLevel Highest
+try {
+  if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null
   }
-} catch {}
-
-Get-Process | Where-Object { $_.Path -like "$destDir\*.exe" } | ForEach-Object {
-  try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
-}
-
-# Remove old dir & shortcut
-if (Test-Path $startupLnk) { Remove-Item $startupLnk -Force -ErrorAction SilentlyContinue }
-if (Test-Path $destDir) { Remove-Item $destDir -Recurse -Force -ErrorAction SilentlyContinue }
-New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-
-# Download latest zip
-Write-Info "Downloading: $ZipUrl"
-try {
-  Invoke-WebRequest -Uri $ZipUrl -OutFile $tmpZip -UseBasicParsing -Headers @{"Cache-Control"="no-cache"}
-  Write-OK "Downloaded bridge zip"
+  Register-ScheduledTask -TaskName $taskName -Action $act -Trigger $trg -Principal $pri | Out-Null
+  Write-OK "Scheduled Task '$taskName' created"
 } catch {
-  Write-Err "Failed to download zip: $($_.Exception.Message)"
-  exit 1
+  Write-Err "Task creation failed: $($_.Exception.Message)"; exit 1
 }
 
-# Extract
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::ExtractToDirectory($tmpZip, $destDir)
-Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+# --- Desktop shortcut ---
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\Beypro Bridge.lnk")
+$Shortcut.TargetPath = $exe.FullName
+$Shortcut.WorkingDirectory = $InstallDir
+$Shortcut.IconLocation = "$($exe.FullName),0"
+$Shortcut.Save()
+Write-OK "Desktop shortcut created"
 
-# Create startup shortcut
-$ws = New-Object -ComObject WScript.Shell
-$sc = $ws.CreateShortcut($startupLnk)
-$sc.TargetPath = $exePath
-$sc.WorkingDirectory = $destDir
-$sc.WindowStyle = 7
-$sc.Description = "Beypro USB Print Bridge"
-$sc.Save()
-Write-OK "Startup shortcut created"
+# --- Start now ---
+Write-Info "Starting Bridge…"
+Start-Process -FilePath $exe.FullName
 
-# Start now
-Start-Process -FilePath $exePath -WindowStyle Hidden
-Start-Sleep -Seconds 2
-
-# Verify
-try {
-  $ping = Invoke-WebRequest -Uri "http://127.0.0.1:7777/ping" -UseBasicParsing -Headers @{"Cache-Control"="no-cache"}
-  Write-OK "Bridge /ping: $($ping.Content)"
-} catch {
-  Write-Err "Bridge not responding on /ping. Check Windows Firewall or port 7777."
-}
-
-Write-OK "Install complete."
-Write-Info "Open http://127.0.0.1:7777/win/printers or /usb/list to test."
+Write-OK "Done! Bridge is running at http://127.0.0.1:$Port"

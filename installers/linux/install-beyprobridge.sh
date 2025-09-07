@@ -1,32 +1,48 @@
 #!/usr/bin/env bash
+# sudo bash install_beypro_bridge.sh
+
 set -euo pipefail
-if [ "$(id -u)" -ne 0 ]; then
-  echo "Run with sudo:  sudo bash installers/linux/install-beyprobridge.sh"; exit 1
-fi
-APP_DIR="/opt/beypro-bridge"
-BIN_SRC="dist/beypro-bridge-linux-x64"
-TARGET_BIN="$APP_DIR/beypro-bridge"
+BRIDGE_URL="https://pos.beypro.com/bridge/beypro-bridge-linux-x64-v1.0.5.tar.gz"
+INSTALL_DIR="/opt/beypro-bridge"
 SERVICE="/etc/systemd/system/beypro-bridge.service"
-echo "Installing Beypro Bridge (Linux systemd)..."
-mkdir -p "$APP_DIR"
-if [ ! -f "$BIN_SRC" ]; then echo "ERROR: $BIN_SRC not found. Run npm run build:linux first."; exit 1; fi
-cp -f "$BIN_SRC" "$TARGET_BIN"
-chmod +x "$TARGET_BIN"
-cat > "$SERVICE" <<UNIT
+PORT=7777
+
+echo "[INFO] Installing deps (libusb)…"
+if command -v apt-get >/dev/null; then
+  apt-get update && apt-get install -y libusb-1.0-0
+elif command -v yum >/dev/null; then
+  yum install -y libusbx || yum install -y libusb
+fi
+
+echo "[INFO] Downloading Bridge…"
+mkdir -p "$INSTALL_DIR"
+curl -L "$BRIDGE_URL" | tar -xz -C "$INSTALL_DIR"
+
+EXE="$(find "$INSTALL_DIR" -type f -name bridge -perm -111 | head -n1)"
+if [[ -z "$EXE" ]]; then
+  echo "[ERR] 'bridge' executable not found in $INSTALL_DIR"; exit 1
+fi
+
+echo "[INFO] Writing systemd service"
+cat > "$SERVICE" <<EOF
 [Unit]
-Description=Beypro Bridge (LAN printer helper)
-After=network-online.target
-Wants=network-online.target
+Description=Beypro Bridge (USB Thermal Printer)
+After=network.target
+
 [Service]
-ExecStart=$TARGET_BIN
+Type=simple
+ExecStart=$EXE
 Restart=always
+Environment=PORT=$PORT
+WorkingDirectory=$INSTALL_DIR
 User=root
-WorkingDirectory=$APP_DIR
+
 [Install]
 WantedBy=multi-user.target
-UNIT
+EOF
+
 systemctl daemon-reload
-systemctl enable beypro-bridge
-systemctl restart beypro-bridge
-echo "✅ Installed to $TARGET_BIN"
-echo "✅ Service enabled (beypro-bridge)."
+systemctl enable beypro-bridge.service
+systemctl restart beypro-bridge.service
+
+echo "[OK] Bridge running. Check: curl http://127.0.0.1:$PORT/status || curl http://127.0.0.1:$PORT/printers"

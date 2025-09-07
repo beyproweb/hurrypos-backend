@@ -1,29 +1,48 @@
 #!/usr/bin/env bash
+# chmod +x install_beypro_bridge.command ; ./install_beypro_bridge.command
+
 set -euo pipefail
-APP_DIR="$HOME/Applications/BeyproBridge"
-BIN_SRC="dist/beypro-bridge-macos-x64"
-TARGET_BIN="$APP_DIR/beypro-bridge"
+BRIDGE_URL="https://pos.beypro.com/bridge/beypro-bridge-mac-universal-v1.0.5.tar.gz"
+APPDIR="/Applications/BeyproBridge"
+TMP="$(mktemp -d)"
 PLIST="$HOME/Library/LaunchAgents/com.beypro.bridge.plist"
-echo "Installing Beypro Bridge (macOS per-user)..."
-mkdir -p "$APP_DIR"
-if [ ! -f "$BIN_SRC" ]; then
-  echo "ERROR: $BIN_SRC not found. Run npm run build:mac first."; exit 1
+PORT=7777
+
+echo "[INFO] Downloading Bridge…"
+curl -L "$BRIDGE_URL" -o "$TMP/bridge.tgz"
+
+echo "[INFO] Installing to $APPDIR"
+sudo mkdir -p "$APPDIR"
+sudo tar -xzf "$TMP/bridge.tgz" -C "$APPDIR"
+rm -rf "$TMP"
+
+# Find executable (bridge)
+EXE="$(/usr/bin/find "$APPDIR" -type f -perm +111 -name bridge -maxdepth 2 2>/dev/null | head -n1)"
+if [[ -z "$EXE" ]]; then
+  echo "[ERR] 'bridge' executable not found in $APPDIR"; exit 1
 fi
-cp -f "$BIN_SRC" "$TARGET_BIN"
-chmod +x "$TARGET_BIN"
-cat > "$PLIST" <<PLIST
+sudo xattr -dr com.apple.quarantine "$APPDIR" || true
+
+echo "[INFO] Writing LaunchAgent: $PLIST"
+cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.beypro.bridge</string>
-  <key>ProgramArguments</key><array><string>$TARGET_BIN</string></array>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$EXE</string>
+  </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$HOME/Library/Logs/beypro-bridge.out.log</string>
-  <key>StandardErrorPath</key><string>$HOME/Library/Logs/beypro-bridge.err.log</string>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/beypro-bridge.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/beypro-bridge.err</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PORT</key><string>$PORT</string></dict>
 </dict></plist>
-PLIST
+EOF
+
 launchctl unload "$PLIST" >/dev/null 2>&1 || true
-launchctl load -w "$PLIST"
-echo "✅ Installed to $TARGET_BIN"
-echo "✅ Auto-start enabled (launchd)."
+launchctl load "$PLIST"
+echo "[OK] Bridge loaded. Listening on http://127.0.0.1:$PORT"
