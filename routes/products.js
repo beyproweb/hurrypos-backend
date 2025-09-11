@@ -220,91 +220,146 @@ router.post("/", async (req, res) => {
 
 // PUT /api/products/:id
 // PUT /api/products/:id
-router.put("/:id", async (req, res) => {
-  const { id } = req.params;
-  const {
-    name,
-    price,
-    category,
-    preparation_time,
-    description,
-    discount_type,
-    discount_value,
-    visible,
-    tags,
-    allergens,
-    promo_start,
-    promo_end,
-    image,
-    ingredients,
-    extras,
-    selectedExtrasGroup,
-  } = req.body;
+router.put(
+  "/api/products/:id",
+  upload.single("image"), // ok if no file is sent
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const id = Number(req.params.id);
 
-  // Keep these as JSON strings if your DB columns are TEXT/JSON(B)
-  const parsedIngredients = JSON.stringify(Array.isArray(ingredients) ? ingredients : []);
-  const parsedExtrasJson = JSON.stringify(Array.isArray(extras) ? extras : []);
-
-  // Convert group IDs to a real JS number array for int[] column
-  const toIntArray = (v) =>
-    Array.isArray(v) ? v.map((n) => Number(n)).filter((n) => Number.isFinite(n)) : [];
-  const groupArr = toIntArray(selectedExtrasGroup);
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    const result = await client.query(
-      `UPDATE products SET
-        name = $1,
-        price = $2,
-        category = $3,
-        preparation_time = $4,
-        description = $5,
-        discount_type = $6,
-        discount_value = $7,
-        visible = $8,
-        tags = $9,
-        allergens = $10,
-        promo_start = $11,
-        promo_end = $12,
-        image = $13,
-        ingredients = $14,                 -- TEXT or JSON(B) column
-        extras = $15,                      -- TEXT or JSON(B) column
-        selected_extras_group = $16  -- ✅ cast!
-      WHERE id = $17
-      RETURNING *`,
-      [
+      // If the form is multipart, non-file fields arrive as strings:
+      const {
         name,
-        parseFloat(price) || 0,
+        price,
         category,
-        preparation_time ? parseInt(preparation_time) : null,
+        preparation_time,
         description,
-        discount_type || "none",
-        parseFloat(discount_value) || 0,
-        typeof visible === "boolean" ? visible : visible === "true",
+        visible,
+        discount_type,
+        discount_value,
         tags,
         allergens,
+        promo_start,
+        promo_end,
+        // Arrays coming as JSON strings:
+        ingredients,
+        extras,
+        extras_group_ids, // ← array of group IDs
+      } = req.body;
+
+      // Parse arrays that come as JSON strings (safe if already arrays)
+      const parseMaybeJson = (v) => {
+        if (v == null || v === "") return [];
+        if (Array.isArray(v)) return v;
+        try { return JSON.parse(v); } catch { return []; }
+      };
+
+      const ingredientsArr = parseMaybeJson(ingredients);       // [{id, qty}...]
+      const extrasArr = parseMaybeJson(extras);                 // [extraId, ...] or [{id, price}...]
+      const extrasGroupIds = parseMaybeJson(extras_group_ids);  // [groupId, ...]
+
+      // Convert types that PG needs strictly
+      const priceNum = price === "" || price == null ? null : Number(price);
+      const prepTimeNum = preparation_time === "" || preparation_time == null ? null : Number(preparation_time);
+      const visibleBool = typeof visible === "boolean"
+        ? visible
+        : String(visible).toLowerCase() !== "false"; // treat "true"/"1"/undefined as true
+
+      // Optional: handle image upload if you store on Cloudinary/S3/etc.
+      // If you store raw buffer in DB, do it here. Otherwise, use your existing uploader.
+      let image_url = null;
+      if (req.file) {
+        // TODO: replace with your uploader; the line below is a placeholder
+        // image_url = await uploadToCloud(req.file);
+        // For now, prevent crashes if you haven't wired this yet:
+        image_url = null;
+      }
+
+      await client.query("BEGIN");
+
+      // 1) Update main product
+      const updateSql = `
+        UPDATE products SET
+          name = $1,
+          price = $2,
+          category = $3,
+          preparation_time = $4,
+          description = $5,
+          visible = $6,
+          discount_type = $7,
+          discount_value = $8,
+          tags = $9,
+          allergens = $10,
+          promo_start = $11,
+          promo_end = $12,
+          image_url = COALESCE($13, image_url) -- keep old if no new image
+        WHERE id = $14
+        RETURNING id
+      `;
+      const updateVals = [
+        name ?? "",
+        priceNum,
+        category ?? "",
+        prepTimeNum,
+        description ?? "",
+        visibleBool,
+        discount_type ?? "none",
+        discount_value === "" || discount_value == null ? 0 : Number(discount_value),
+        tags ?? "",
+        allergens ?? "",
         promo_start || null,
         promo_end || null,
-        image || null,
-        parsedIngredients,     // stays a string (JSON)
-        parsedExtrasJson,      // stays a string (JSON)
-        groupArr,              // real JS array → ::int[]
+        image_url, // null will keep prior via COALESCE
         id,
-      ]
-    );
+      ];
+      const upRes = await client.query(updateSql, updateVals);
+      if (upRes.rowCount === 0) throw new Error("Product not found");
 
-    await client.query("COMMIT");
-    res.json(result.rows[0]);
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("❌ Error updating product:", err);
-    res.status(500).json({ error: "Failed to update product" });
-  } finally {
-    client.release();
+      // 2) Replace product_extras pivot (adapt table/columns to yours)
+      // If your extras have prices per product, store them; otherwise store just extra_id.
+      await client.query(`DELETE FROM product_extras WHERE product_id = $1`, [id]);
+      for (const e of extrasArr) {
+        const extraId = typeof e === "object" ? e.id : e;
+        const extraPrice = typeof e === "object" && e.price != null ? Number(e.price) : null;
+        await client.query(
+          `INSERT INTO product_extras (product_id, extra_id, price_override) VALUES ($1, $2, $3)`,
+          [id, Number(extraId), extraPrice]
+        );
+      }
+
+      // 3) Replace product_extras_groups pivot (adapt table/columns to yours)
+      await client.query(`DELETE FROM product_extras_groups WHERE product_id = $1`, [id]);
+      for (const gid of extrasGroupIds) {
+        await client.query(
+          `INSERT INTO product_extras_groups (product_id, group_id) VALUES ($1, $2)`,
+          [id, Number(gid)]
+        );
+      }
+
+      // 4) Optionally replace product_ingredients pivot if you maintain costs
+      await client.query(`DELETE FROM product_ingredients WHERE product_id = $1`, [id]);
+      for (const ing of ingredientsArr) {
+        if (!ing?.id) continue;
+        await client.query(
+          `INSERT INTO product_ingredients (product_id, ingredient_id, qty) VALUES ($1, $2, $3)`,
+          [id, Number(ing.id), Number(ing.qty ?? 0)]
+        );
+      }
+
+      await client.query("COMMIT");
+      res.json({ ok: true, id });
+
+    } catch (err) {
+      await client.query("ROLLBACK");
+      // Return the real error so you can see EXACTLY what broke
+      console.error("PUT /api/products error:", err);
+      res.status(400).json({ ok: false, error: String(err.message || err) });
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
 
 // DELETE /api/extras-groups/:groupId/items/:itemId
