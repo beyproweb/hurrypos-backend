@@ -226,6 +226,7 @@ router.post("/", async (req, res) => {
 
 // PUT /api/products/:id
 // PUT /api/products/:id
+// PUT /api/products/:id  — robust to TEXT vs JSON(B) vs INT[] schemas
 router.put("/:id", async (req, res) => {
   const { id } = req.params;
   const {
@@ -247,60 +248,119 @@ router.put("/:id", async (req, res) => {
     selectedExtrasGroup,
   } = req.body;
 
-  // Keep these as JSON strings if your DB columns are TEXT/JSON(B)
-  const parsedIngredients = JSON.stringify(Array.isArray(ingredients) ? ingredients : []);
-  const parsedExtrasJson = JSON.stringify(Array.isArray(extras) ? extras : []);
+  // Normalize inputs
+  const safeNumber = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+  const prepTime = preparation_time !== null && preparation_time !== undefined
+    ? (Number.isFinite(Number(preparation_time)) ? Number(preparation_time) : null)
+    : null;
 
-  // Convert group IDs to a real JS number array for int[] column
-  const toIntArray = (v) =>
-    Array.isArray(v) ? v.map((n) => Number(n)).filter((n) => Number.isFinite(n)) : [];
-  const groupArr = toIntArray(selectedExtrasGroup);
+  const ingArr   = Array.isArray(ingredients) ? ingredients : [];
+  const extraArr = Array.isArray(extras) ? extras : [];
+  const groupArr = Array.isArray(selectedExtrasGroup)
+    ? selectedExtrasGroup.map(n => Number(n)).filter(n => Number.isFinite(n))
+    : [];
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    const result = await client.query(
-      `UPDATE products SET
-        name = $1,
-        price = $2,
-        category = $3,
-        preparation_time = $4,
-        description = $5,
-        discount_type = $6,
-        discount_value = $7,
-        visible = $8,
-        tags = $9,
-        allergens = $10,
-        promo_start = $11,
-        promo_end = $12,
-        image = $13,
-        ingredients = $14,                 -- TEXT or JSON(B) column
-        extras = $15,                      -- TEXT or JSON(B) column
-        selected_extras_group = $16  -- ✅ cast!
-      WHERE id = $17
-      RETURNING *`,
-      [
-        name,
-        parseFloat(price) || 0,
-        category,
-        preparation_time ? parseInt(preparation_time) : null,
-        description,
-        discount_type || "none",
-        parseFloat(discount_value) || 0,
-        typeof visible === "boolean" ? visible : visible === "true",
-        tags,
-        allergens,
-        promo_start || null,
-        promo_end || null,
-        image || null,
-        parsedIngredients,     // stays a string (JSON)
-        parsedExtrasJson,      // stays a string (JSON)
-        groupArr,              // real JS array → ::int[]
-        id,
-      ]
+    // Look up actual column types so we cast correctly
+    const typeRes = await client.query(
+      `
+      SELECT column_name, data_type, udt_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'products'
+        AND column_name IN ('ingredients','extras','selected_extras_group')
+      `
     );
 
+    const col = {};
+    for (const r of typeRes.rows) {
+      col[r.column_name] = { data_type: r.data_type, udt_name: r.udt_name };
+    }
+    const isJsonLike  = (c) => c && (c.data_type === "json" || c.data_type === "jsonb");
+    const isIntArray  = (c) => c && c.data_type === "ARRAY" && c.udt_name === "_int4"; // integer[]
+    const isTextLike  = (c) => c && (c.data_type === "text" || c.data_type.startsWith("character"));
+
+    // Build dynamic SET parts & values for the 3 tricky columns
+    const setParts = [
+      "name = $1",
+      "price = $2",
+      "category = $3",
+      "preparation_time = $4",
+      "description = $5",
+      "discount_type = $6",
+      "discount_value = $7",
+      "visible = $8",
+      "tags = $9",
+      "allergens = $10",
+      "promo_start = $11",
+      "promo_end = $12",
+      "image = $13",
+    ];
+    const vals = [
+      name,
+      safeNumber(price, 0),
+      category,
+      prepTime,
+      description,
+      discount_type || "none",
+      safeNumber(discount_value, 0),
+      typeof visible === "boolean" ? visible : visible === "true",
+      tags,
+      allergens,
+      promo_start || null,
+      promo_end || null,
+      image || null,
+    ];
+
+    // ingredients
+    if (isJsonLike(col.ingredients)) {
+      setParts.push(`ingredients = $${vals.length + 1}::jsonb`);
+      vals.push(JSON.stringify(ingArr));
+    } else {
+      // TEXT / VARCHAR fallback
+      setParts.push(`ingredients = $${vals.length + 1}`);
+      vals.push(JSON.stringify(ingArr));
+    }
+
+    // extras
+    if (isJsonLike(col.extras)) {
+      setParts.push(`extras = $${vals.length + 1}::jsonb`);
+      vals.push(JSON.stringify(extraArr));
+    } else {
+      // TEXT / VARCHAR fallback
+      setParts.push(`extras = $${vals.length + 1}`);
+      vals.push(JSON.stringify(extraArr));
+    }
+
+    // selected_extras_group
+    if (isIntArray(col.selected_extras_group)) {
+      setParts.push(`selected_extras_group = $${vals.length + 1}::int[]`);
+      vals.push(groupArr);
+    } else if (isJsonLike(col.selected_extras_group)) {
+      setParts.push(`selected_extras_group = $${vals.length + 1}::jsonb`);
+      vals.push(JSON.stringify(groupArr));
+    } else if (isTextLike(col.selected_extras_group)) {
+      setParts.push(`selected_extras_group = $${vals.length + 1}`);
+      vals.push(JSON.stringify(groupArr)); // store as JSON string in TEXT
+    } else {
+      // Safe default: store JSON string
+      setParts.push(`selected_extras_group = $${vals.length + 1}`);
+      vals.push(JSON.stringify(groupArr));
+    }
+
+    // WHERE id
+    const sql = `
+      UPDATE products
+      SET ${setParts.join(", ")}
+      WHERE id = $${vals.length + 1}
+      RETURNING *
+    `;
+    vals.push(id);
+
+    const result = await client.query(sql, vals);
     await client.query("COMMIT");
     res.json(result.rows[0]);
   } catch (err) {
@@ -311,6 +371,7 @@ router.put("/:id", async (req, res) => {
     client.release();
   }
 });
+
 
 
 // DELETE /api/extras-groups/:groupId/items/:itemId
