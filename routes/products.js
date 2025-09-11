@@ -138,6 +138,7 @@ router.get("/:id", async (req, res) => {
 });
 
 // POST /api/products
+// POST /api/products
 router.post("/", async (req, res) => {
   try {
     const {
@@ -159,33 +160,25 @@ router.post("/", async (req, res) => {
       selectedExtrasGroup,
     } = req.body;
 
+    // keep ingredients/extras as JSON strings (as your table stores TEXT/JSONB)
     let parsedIngredients = "[]";
     let parsedExtras = "[]";
-    let parsedGroup = "[]";
 
     try {
-      parsedIngredients = JSON.stringify(
-        Array.isArray(ingredients) ? ingredients : []
-      );
+      parsedIngredients = JSON.stringify(Array.isArray(ingredients) ? ingredients : []);
     } catch {
       return res.status(400).json({ error: "Invalid ingredients format" });
     }
-
     try {
       parsedExtras = JSON.stringify(Array.isArray(extras) ? extras : []);
     } catch {
       return res.status(400).json({ error: "Invalid extras format" });
     }
 
-    try {
-      parsedGroup = JSON.stringify(
-        Array.isArray(selectedExtrasGroup) ? selectedExtrasGroup : []
-      );
-    } catch {
-      return res
-        .status(400)
-        .json({ error: "Invalid selectedExtrasGroup format" });
-    }
+    // BUT: groups should be an int[] (to match your PUT behavior)
+    const toIntArray = (v) =>
+      Array.isArray(v) ? v.map((n) => Number(n)).filter((n) => Number.isFinite(n)) : [];
+    const groupArr = toIntArray(selectedExtrasGroup); // e.g., [1,2,5]
 
     const result = await pool.query(
       `INSERT INTO products (
@@ -211,9 +204,9 @@ router.post("/", async (req, res) => {
         promo_start || null,
         promo_end || null,
         image_url,
-        parsedIngredients,
-        parsedExtras,
-        parsedGroup,
+        parsedIngredients, // JSON (TEXT/JSONB)
+        parsedExtras,      // JSON (TEXT/JSONB)
+        groupArr,          // <-- int[] not JSON string
       ]
     );
 
@@ -223,6 +216,7 @@ router.post("/", async (req, res) => {
     res.status(500).json({ error: "Failed to create product" });
   }
 });
+
 
 // PUT /api/products/:id
 // PUT /api/products/:id
