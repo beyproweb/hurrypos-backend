@@ -28,6 +28,33 @@ app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 // Serve downloadable Beypro Bridge binaries
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
+// 1) Always serve the latest bridge files (no cache)
+app.use(
+  "/bridge",
+  express.static(path.join(__dirname, "public/bridge"), {
+    etag: true,
+    lastModified: true,
+    cacheControl: false,
+    setHeaders: (res) => {
+      res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+    },
+  })
+);
+
+// 2) Safety net: if any old link hits /installers/*, redirect it to the right file
+app.get("/installers/windows/*", (req, res) => {
+  res.redirect(302, "/bridge/beypro-bridge-win-x64.zip");
+});
+app.get("/installers/macos/*", (req, res) => {
+  // we serve the x64 package; installer uses Rosetta automatically on M-series
+  res.redirect(302, "/bridge/beypro-bridge-mac-x64.tar.gz");
+});
+app.get("/installers/linux/*", (req, res) => {
+  res.redirect(302, "/bridge/beypro-bridge-linux-x64.tar.gz");
+});
+
 const taskRoutes = require("./routes/tasks");
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
