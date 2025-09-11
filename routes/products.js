@@ -138,7 +138,6 @@ router.get("/:id", async (req, res) => {
 });
 
 // POST /api/products
-// POST /api/products
 router.post("/", async (req, res) => {
   try {
     const {
@@ -160,25 +159,33 @@ router.post("/", async (req, res) => {
       selectedExtrasGroup,
     } = req.body;
 
-    // keep ingredients/extras as JSON strings (as your table stores TEXT/JSONB)
     let parsedIngredients = "[]";
     let parsedExtras = "[]";
+    let parsedGroup = "[]";
 
     try {
-      parsedIngredients = JSON.stringify(Array.isArray(ingredients) ? ingredients : []);
+      parsedIngredients = JSON.stringify(
+        Array.isArray(ingredients) ? ingredients : []
+      );
     } catch {
       return res.status(400).json({ error: "Invalid ingredients format" });
     }
+
     try {
       parsedExtras = JSON.stringify(Array.isArray(extras) ? extras : []);
     } catch {
       return res.status(400).json({ error: "Invalid extras format" });
     }
 
-    // BUT: groups should be an int[] (to match your PUT behavior)
-    const toIntArray = (v) =>
-      Array.isArray(v) ? v.map((n) => Number(n)).filter((n) => Number.isFinite(n)) : [];
-    const groupArr = toIntArray(selectedExtrasGroup); // e.g., [1,2,5]
+    try {
+      parsedGroup = JSON.stringify(
+        Array.isArray(selectedExtrasGroup) ? selectedExtrasGroup : []
+      );
+    } catch {
+      return res
+        .status(400)
+        .json({ error: "Invalid selectedExtrasGroup format" });
+    }
 
     const result = await pool.query(
       `INSERT INTO products (
@@ -204,9 +211,9 @@ router.post("/", async (req, res) => {
         promo_start || null,
         promo_end || null,
         image_url,
-        parsedIngredients, // JSON (TEXT/JSONB)
-        parsedExtras,      // JSON (TEXT/JSONB)
-        groupArr,          // <-- int[] not JSON string
+        parsedIngredients,
+        parsedExtras,
+        parsedGroup,
       ]
     );
 
@@ -217,99 +224,91 @@ router.post("/", async (req, res) => {
   }
 });
 
-
 // PUT /api/products/:id
 // PUT /api/products/:id
-// products.js
-router.put('/:id', async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) {
-    return res.status(400).json({ ok: false, error: 'Invalid product id' });
-  }
+router.put("/:id", async (req, res) => {
+  const { id } = req.params;
+  const {
+    name,
+    price,
+    category,
+    preparation_time,
+    description,
+    discount_type,
+    discount_value,
+    visible,
+    tags,
+    allergens,
+    promo_start,
+    promo_end,
+    image,
+    ingredients,
+    extras,
+    selectedExtrasGroup,
+  } = req.body;
 
+  // Keep these as JSON strings if your DB columns are TEXT/JSON(B)
+  const parsedIngredients = JSON.stringify(Array.isArray(ingredients) ? ingredients : []);
+  const parsedExtrasJson = JSON.stringify(Array.isArray(extras) ? extras : []);
+
+  // Convert group IDs to a real JS number array for int[] column
+  const toIntArray = (v) =>
+    Array.isArray(v) ? v.map((n) => Number(n)).filter((n) => Number.isFinite(n)) : [];
+  const groupArr = toIntArray(selectedExtrasGroup);
+
+  const client = await pool.connect();
   try {
-    const {
-      name,
-      price,
-      category,
-      preparation_time,
-      description,
-      image,
-      ingredients,
-      extras,              // <- comes as string/array when you add extras
-      discount_type,
-      discount_value,
-      visible,
-      tags,
-      allergens,
-      promo_start,
-      promo_end,
-    } = req.body;
+    await client.query("BEGIN");
 
-    // Normalize possible FormData/stringified JSON
-    const parseMaybeJson = (v, fallback) => {
-      if (v == null || v === '') return fallback;
-      if (typeof v === 'string') {
-        try { return JSON.parse(v); } catch { return fallback; }
-      }
-      return v;
-    };
-
-    const normIngredients = parseMaybeJson(ingredients, []);
-    const normExtras = parseMaybeJson(extras, []); // <- critical: avoid 500 when extras present
-
-    const normPrice = price == null || price === '' ? null : Number(price);
-    const normPrep = preparation_time == null || preparation_time === '' ? null : Number(preparation_time);
-    const normDiscountValue = discount_value == null || discount_value === '' ? 0 : Number(discount_value);
-    const normVisible = typeof visible === 'string' ? visible === 'true' : (visible ?? true);
-
-    const sql = `
-      UPDATE products SET
+    const result = await client.query(
+      `UPDATE products SET
         name = $1,
         price = $2,
         category = $3,
         preparation_time = $4,
         description = $5,
-        image = $6,
-        ingredients = $7::jsonb,
-        extras = $8::jsonb,
-        discount_type = $9,
-        discount_value = $10,
-        visible = $11,
-        tags = $12,
-        allergens = $13,
-        promo_start = $14,
-        promo_end = $15,
-        updated_at = NOW()
-      WHERE id = $16
-      RETURNING *;
-    `;
+        discount_type = $6,
+        discount_value = $7,
+        visible = $8,
+        tags = $9,
+        allergens = $10,
+        promo_start = $11,
+        promo_end = $12,
+        image = $13,
+        ingredients = $14,                 -- TEXT or JSON(B) column
+        extras = $15,                      -- TEXT or JSON(B) column
+        selected_extras_group = $16  -- ✅ cast!
+      WHERE id = $17
+      RETURNING *`,
+      [
+        name,
+        parseFloat(price) || 0,
+        category,
+        preparation_time ? parseInt(preparation_time) : null,
+        description,
+        discount_type || "none",
+        parseFloat(discount_value) || 0,
+        typeof visible === "boolean" ? visible : visible === "true",
+        tags,
+        allergens,
+        promo_start || null,
+        promo_end || null,
+        image || null,
+        parsedIngredients,     // stays a string (JSON)
+        parsedExtrasJson,      // stays a string (JSON)
+        groupArr,              // real JS array → ::int[]
+        id,
+      ]
+    );
 
-    const params = [
-      name ?? '',
-      normPrice,
-      category ?? '',
-      normPrep,
-      description ?? '',
-      image ?? null,
-      JSON.stringify(normIngredients),
-      JSON.stringify(normExtras), // <- store as jsonb
-      (discount_type && discount_type !== '') ? discount_type : 'none',
-      normDiscountValue,
-      normVisible,
-      tags ?? '',
-      allergens ?? '',
-      promo_start || null,
-      promo_end || null,
-      id,
-    ];
-
-    const { rows } = await pool.query(sql, params);
-    if (!rows.length) return res.status(404).json({ ok: false, error: 'Product not found' });
-    res.json({ ok: true, data: rows[0] });
+    await client.query("COMMIT");
+    res.json(result.rows[0]);
   } catch (err) {
-    console.error('PUT /api/products/:id error:', err);
-    res.status(500).json({ ok: false, error: 'Internal Server Error', detail: err.message });
+    await client.query("ROLLBACK");
+    console.error("❌ Error updating product:", err);
+    res.status(500).json({ error: "Failed to update product" });
+  } finally {
+    client.release();
   }
 });
 
