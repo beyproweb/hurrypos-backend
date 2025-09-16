@@ -744,38 +744,23 @@ router.put('/:id', async (req, res) => {
 
 
 // POST /orders/:id/close
+// POST /orders/:id/close
 router.post("/:id/close", async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // 1. Double-check all items are delivered (optional, or skip if frontend guarantees this)
-    // const itemsRes = await client.query(
-    //   `SELECT COUNT(*) FROM order_items WHERE order_id = $1 AND kitchen_status != 'delivered'`,
-    //   [id]
-    // );
-    // if (parseInt(itemsRes.rows[0].count, 10) > 0) {
-    //   await client.query("ROLLBACK");
-    //   return res.status(400).json({ error: "Not all items delivered" });
-    // }
-
-    // 2. Set order status to closed
     const result = await client.query(
-  `UPDATE orders
-   SET status = 'closed'
-   WHERE id = $1
-   RETURNING *`,
-  [id]
-);
-
+      `UPDATE orders SET status = 'closed' WHERE id = $1 RETURNING *`,
+      [id]
+    );
 
     if (result.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
     }
 
-    // 3. (Optional) Free the table if order has a table_number
     const order = result.rows[0];
     if (order.table_number) {
       await client.query(
@@ -784,20 +769,18 @@ router.post("/:id/close", async (req, res) => {
       );
     }
 
-    // 4. (Optional) Deduct stock for ingredients/extras if not done by kitchen
-
     await client.query("COMMIT");
     emitOrderUpdate(io);
-    res.json({ message: "✅ Order closed, stock updated, and table freed." });
++   io.emit("order_closed", { orderId: Number(order.id) }); // 🔥 NEW EVENT
+    res.json({ message: "✅ Order closed" });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error in closing order:", err);
-    res.status(500).json({ error: "Failed to close and update stock." });
+    res.status(500).json({ error: "Failed to close order" });
   } finally {
     client.release();
   }
 });
-
 
 
 // Add to routes/orders.js or a debug file
