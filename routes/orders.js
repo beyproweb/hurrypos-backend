@@ -203,7 +203,7 @@ router.post("/", async (req, res) => {
 
     if (hasItems) {
       await saveOrderItems(order.id, items);
-      await updateStockForOrder(items);
+
       dlog("POST /orders saved items", { id: order.id, count: items.length });
     }
 
