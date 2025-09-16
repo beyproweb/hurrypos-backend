@@ -972,7 +972,7 @@ router.post("/sub-orders", async (req, res) => {
     }));
 
     await saveOrderItems(order_id, itemsWithReceipt);
-    await updateStockForOrder(itemsWithReceipt);
+
 
     const uniqueIds = itemsWithReceipt.map((i) => i.unique_id);
 
