@@ -203,6 +203,7 @@ router.post("/", async (req, res) => {
 
     if (hasItems) {
       await saveOrderItems(order.id, items);
+      await updateStockForOrder(items);
       dlog("POST /orders saved items", { id: order.id, count: items.length });
     }
 
@@ -557,6 +558,7 @@ router.post("/order-items", async (req, res) => {
 
   try {
     await saveOrderItems(order_id, preparedItems);
+    await updateStockForOrder(preparedItems);
      // --- ADD THIS BLOCK:
     const orderRes = await pool.query("SELECT status FROM orders WHERE id = $1", [order_id]);
     if (["closed", "occupied"].includes(orderRes.rows[0]?.status)) {
@@ -970,6 +972,7 @@ router.post("/sub-orders", async (req, res) => {
     }));
 
     await saveOrderItems(order_id, itemsWithReceipt);
+    await updateStockForOrder(itemsWithReceipt);
 
     const uniqueIds = itemsWithReceipt.map((i) => i.unique_id);
 
