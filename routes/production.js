@@ -24,26 +24,41 @@ router.post('/production-log', async (req, res) => {
     for (const ing of ingredients) {
       const quantityUsed = parseFloat(ing.amountPerBatch) * batch_count;
 
+      // Always log what we are about to do
+      console.log("🧾 Deducting ingredient:", {
+        recipeIngredient: ing.name,
+        unit: ing.unit,
+        batchCount,
+        quantityUsed
+      });
+
+      // Insert usage log
       await client.query(
         `INSERT INTO ingredient_usages (production_id, ingredient_name, quantity_used, unit)
          VALUES ($1, $2, $3, $4)`,
         [productionId, ing.name, quantityUsed, ing.unit]
       );
 
-await client.query(
-  `UPDATE stock
-   SET quantity = quantity - $1
-   WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)`,
-  [quantityUsed, ing.name, ing.unit]
-);
+      // Update stock
+      const updateRes = await client.query(
+        `UPDATE stock
+         SET quantity = quantity - $1
+         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+         RETURNING id, name, quantity, unit`,
+        [quantityUsed, ing.name, ing.unit]
+      );
 
+      if (updateRes.rowCount === 0) {
+        console.warn(`⚠️ No stock row matched for ingredient "${ing.name}" (${ing.unit}). Deduction skipped!`);
+      } else {
+        console.log("📉 Stock deducted:", updateRes.rows[0]);
+      }
     }
 
-    // 3. Add finished product to stock (only once!)
+    // 3. Add finished product to stock (optional)
     const producedQty = base_quantity * batch_count;
-    console.log(`📦 Adding to stock → ${product_name}: +${producedQty} ${product_unit}`);
-
-
+    console.log(`📦 Produced → ${product_name}: +${producedQty} ${product_unit}`);
+    // (Product itself is still added to stock later via frontend modal)
 
     await client.query('COMMIT');
     res.status(200).json({ message: 'Production logged and stock updated.' });
@@ -56,6 +71,7 @@ await client.query(
     client.release();
   }
 });
+
 
 router.get('/recipes', async (req, res) => {
   try {
