@@ -2,76 +2,114 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 
-router.post('/production-log', async (req, res) => {
-  const { product_name, base_quantity, batch_count, ingredients, produced_by, product_unit } = req.body;
-  console.log('📥 Incoming production request:', req.body);
+// POST /stock - Add or merge quantity; if from_production, also log production & deduct ingredients
+router.post("/", async (req, res) => {
+  const { name, quantity, unit, supplier_id, from_production } = req.body;
+
+  const trimmedName = (name || '').trim();
+  const trimmedUnit = (unit || '').trim();
+  const parsedQty = parseFloat(quantity);
+
+  if (!trimmedName || !parsedQty || parsedQty <= 0 || !trimmedUnit) {
+    return res.status(400).json({ error: "Missing or invalid fields." });
+  }
 
   const client = await pool.connect();
-
   try {
     await client.query('BEGIN');
 
-    // 1. Log production
-    const result = await client.query(
-      `INSERT INTO production_logs (product_name, quantity_produced, produced_by)
-       VALUES ($1, $2, $3) RETURNING id`,
-      [product_name, base_quantity * batch_count, produced_by || 'system']
-    );
-
-    const productionId = result.rows[0].id;
-
-    // 2. Deduct ingredients and log usage
-    for (const ing of ingredients) {
-      const quantityUsed = parseFloat(ing.amountPerBatch) * batch_count;
-
-      // Always log what we are about to do
-      console.log("🧾 Deducting ingredient:", {
-        recipeIngredient: ing.name,
-        unit: ing.unit,
-        batchCount,
-        quantityUsed
-      });
-
-      // Insert usage log
-      await client.query(
-        `INSERT INTO ingredient_usages (production_id, ingredient_name, quantity_used, unit)
-         VALUES ($1, $2, $3, $4)`,
-        [productionId, ing.name, quantityUsed, ing.unit]
+    if (from_production) {
+      // 1) Try to find a recipe by product name (case-insensitive)
+      const recipeRes = await client.query(
+        `SELECT id, name, base_quantity, output_unit
+         FROM recipes
+         WHERE LOWER(name) = LOWER($1)
+         LIMIT 1`,
+        [trimmedName]
       );
 
-      // Update stock
-      const updateRes = await client.query(
-        `UPDATE stock
-         SET quantity = quantity - $1
-         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
-         RETURNING id, name, quantity, unit`,
-        [quantityUsed, ing.name, ing.unit]
-      );
+      if (recipeRes.rows.length) {
+        const recipe = recipeRes.rows[0];
 
-      if (updateRes.rowCount === 0) {
-        console.warn(`⚠️ No stock row matched for ingredient "${ing.name}" (${ing.unit}). Deduction skipped!`);
+        if (!recipe.base_quantity || Number(recipe.base_quantity) <= 0) {
+          console.warn("⚠️ Recipe has invalid base_quantity, skipping deduction:", recipe);
+        } else {
+          const batchCount = parsedQty / Number(recipe.base_quantity);
+
+          // 2) Log production
+          const prodLog = await client.query(
+            `INSERT INTO production_logs (product_name, quantity_produced, produced_by)
+             VALUES ($1, $2, $3)
+             RETURNING id`,
+            [recipe.name, parsedQty, 'system'] // produced_by can be adapted
+          );
+          const productionId = prodLog.rows[0].id;
+
+          // 3) Fetch ingredients for that recipe
+          const ingsRes = await client.query(
+            `SELECT ingredient_name, amount_per_batch, unit
+             FROM recipe_ingredients
+             WHERE recipe_id = $1`,
+            [recipe.id]
+          );
+
+          // 4) Deduct each ingredient
+          for (const row of ingsRes.rows) {
+            const ingName = row.ingredient_name;
+            const ingUnit = row.unit;
+            const amountPerBatch = Number(row.amount_per_batch) || 0;
+            const quantityUsed = amountPerBatch * batchCount;
+
+            // Insert usage log
+            await client.query(
+              `INSERT INTO ingredient_usages (production_id, ingredient_name, quantity_used, unit)
+               VALUES ($1, $2, $3, $4)`,
+              [productionId, ingName, quantityUsed, ingUnit]
+            );
+
+            // Deduct from stock by (name, unit)
+            const upd = await client.query(
+              `UPDATE stock
+               SET quantity = quantity - $1
+               WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+               RETURNING id, name, quantity, unit`,
+              [quantityUsed, ingName, ingUnit]
+            );
+
+            if (upd.rowCount === 0) {
+              console.warn(`⚠️ No stock row matched for ingredient "${ingName}" (${ingUnit}). Deduction skipped!`);
+            } else {
+              console.log("📉 Stock deducted:", upd.rows[0]);
+            }
+          }
+        }
       } else {
-        console.log("📉 Stock deducted:", updateRes.rows[0]);
+        console.warn(`⚠️ from_production=true but no recipe found for "${trimmedName}". Skipping deduction.`);
       }
     }
 
-    // 3. Add finished product to stock (optional)
-    const producedQty = base_quantity * batch_count;
-    console.log(`📦 Produced → ${product_name}: +${producedQty} ${product_unit}`);
-    // (Product itself is still added to stock later via frontend modal)
+    // 5) Upsert finished product stock
+    const upsertRes = await client.query(
+      `INSERT INTO stock (name, quantity, unit, supplier_id)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (name, unit)
+       DO UPDATE SET
+         quantity = stock.quantity + EXCLUDED.quantity,
+         supplier_id = EXCLUDED.supplier_id
+       RETURNING *`,
+      [trimmedName, parsedQty, trimmedUnit, supplier_id || null]
+    );
 
     await client.query('COMMIT');
-    res.status(200).json({ message: 'Production logged and stock updated.' });
-
-  } catch (err) {
+    return res.json(upsertRes.rows[0]);
+  } catch (error) {
     await client.query('ROLLBACK');
-    console.error('❌ Production logging failed:', err);
-    res.status(500).json({ error: 'Internal error during production log.' });
+    console.error("❌ Error inserting/updating stock (with production fallback):", error);
+    return res.status(500).json({ error: "Internal stock insert error." });
   } finally {
     client.release();
   }
 });
-
 
 
 router.get('/recipes', async (req, res) => {
