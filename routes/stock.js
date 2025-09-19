@@ -81,19 +81,94 @@ router.get("/:id", async (req, res) => {
 });
 
 // POST /stock - Add or merge quantity if item already exists
+// stock.js
 router.post("/", async (req, res) => {
-  const { name, quantity, unit, supplier_id } = req.body;
+  const { name, quantity, unit, supplier_id, from_production } = req.body;
 
-  const trimmedName = name.trim();
-  const trimmedUnit = unit.trim();
+  const trimmedName = (name || '').trim();
+  const trimmedUnit = (unit || '').trim();
   const parsedQty = parseFloat(quantity);
 
   if (!trimmedName || !parsedQty || parsedQty <= 0 || !trimmedUnit) {
     return res.status(400).json({ error: "Missing or invalid fields." });
   }
 
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+
+    if (from_production) {
+      console.log("🧾 from_production flow for:", { name: trimmedName, quantity: parsedQty, unit: trimmedUnit });
+
+      // 1) Find recipe by product name
+      const recipeRes = await client.query(
+        `SELECT id, name, base_quantity, output_unit
+         FROM recipes
+         WHERE LOWER(name) = LOWER($1)
+         LIMIT 1`,
+        [trimmedName]
+      );
+
+      if (recipeRes.rows.length) {
+        const recipe = recipeRes.rows[0];
+
+        if (!recipe.base_quantity || Number(recipe.base_quantity) <= 0) {
+          console.warn("⚠️ Recipe has invalid base_quantity, skipping deduction:", recipe);
+        } else {
+          const batchCount = parsedQty / Number(recipe.base_quantity);
+
+          // 2) Log production
+          const prodLog = await client.query(
+            `INSERT INTO production_logs (product_name, quantity_produced, produced_by)
+             VALUES ($1, $2, $3)
+             RETURNING id`,
+            [recipe.name, parsedQty, 'system']
+          );
+          const productionId = prodLog.rows[0].id;
+
+          // 3) Fetch ingredients
+          const ingsRes = await client.query(
+            `SELECT ingredient_name, amount_per_batch, unit
+             FROM recipe_ingredients
+             WHERE recipe_id = $1`,
+            [recipe.id]
+          );
+
+          // 4) Deduct each ingredient by (name, unit)
+          for (const row of ingsRes.rows) {
+            const ingName = row.ingredient_name;
+            const ingUnit = row.unit;
+            const amountPerBatch = Number(row.amount_per_batch) || 0;
+            const quantityUsed = amountPerBatch * batchCount;
+
+            await client.query(
+              `INSERT INTO ingredient_usages (production_id, ingredient_name, quantity_used, unit)
+               VALUES ($1, $2, $3, $4)`,
+              [productionId, ingName, quantityUsed, ingUnit]
+            );
+
+            const upd = await client.query(
+              `UPDATE stock
+               SET quantity = quantity - $1
+               WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+               RETURNING id, name, quantity, unit`,
+              [quantityUsed, ingName, ingUnit]
+            );
+
+            if (upd.rowCount === 0) {
+              console.warn(`⚠️ No stock row matched for ingredient "${ingName}" (${igUnit}). Deduction skipped!`);
+            } else {
+              console.log("📉 Stock deducted:", upd.rows[0]);
+            }
+          }
+        }
+      } else {
+        console.warn(`⚠️ from_production=true but no recipe found for "${trimmedName}". Skipping deduction.`);
+      }
+    }
+
+    // 5) Upsert finished product stock
+    const upsertRes = await client.query(
       `INSERT INTO stock (name, quantity, unit, supplier_id)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (name, unit)
@@ -104,12 +179,17 @@ router.post("/", async (req, res) => {
       [trimmedName, parsedQty, trimmedUnit, supplier_id || null]
     );
 
-    res.json(result.rows[0]);
+    await client.query('COMMIT');
+    return res.json(upsertRes.rows[0]);
   } catch (error) {
-    console.error("❌ Error inserting/updating stock:", error);
-    res.status(500).json({ error: "Internal stock insert error." });
+    await client.query('ROLLBACK');
+    console.error("❌ Error inserting/updating stock (with production fallback):", error);
+    return res.status(500).json({ error: "Internal stock insert error." });
+  } finally {
+    client.release();
   }
 });
+
 
 // PATCH /stock/:id - Update stock item
 // PATCH /stock/:id - Update stock item and emit alerts only when needed
