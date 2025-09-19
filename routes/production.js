@@ -30,12 +30,13 @@ router.post('/production-log', async (req, res) => {
         [productionId, ing.name, quantityUsed, ing.unit]
       );
 
-      await client.query(
+await client.query(
   `UPDATE stock
    SET quantity = quantity - $1
-   WHERE LOWER(name) = LOWER($2)`,
-  [quantityUsed, ing.name]
+   WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)`,
+  [quantityUsed, ing.name, ing.unit]
 );
+
     }
 
     // 3. Add finished product to stock (only once!)
