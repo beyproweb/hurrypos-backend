@@ -57,10 +57,18 @@ router.post("/", async (req, res) => {
     const groupId = groupRes.rows[0].id;
     for (const item of items) {
       if (!item.name) continue;
-      await client.query(
-        "INSERT INTO extras_group_items (group_id, ingredient_name, price) VALUES ($1, $2, $3)",
-        [groupId, item.name, item.price || 0]
-      );
+     await client.query(
+  `INSERT INTO extras_group_items (group_id, ingredient_name, amount, unit, price)
+   VALUES ($1, $2, $3, $4, $5)`,
+  [
+    groupId,
+    item.name,
+    item.amount || 1,
+    item.unit || "",
+    item.price || 0
+  ]
+);
+
     }
     await client.query("COMMIT");
     res.json({ success: true, id: groupId });
