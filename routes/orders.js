@@ -909,6 +909,7 @@ async function updateStockForOrder(orderItems) {
   }
 }
 
+
 // GET order items by order ID
 router.get("/:id/items", async (req, res) => {
   const { id } = req.params;
