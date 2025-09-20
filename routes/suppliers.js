@@ -188,13 +188,14 @@ router.post("/transactions", upload.single("receipt"), async (req, res) => {
 });
 
 
-// 📌 GET /suppliers/ingredients - Get distinct ingredients + units from stock
+// 📌 GET /suppliers/ingredients - must come BEFORE /:id
 router.get("/ingredients", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT DISTINCT name, unit
+      `SELECT name, unit
        FROM stock
        WHERE name IS NOT NULL AND name <> ''
+       GROUP BY name, unit
        ORDER BY LOWER(name) ASC`
     );
     res.json(result.rows);
@@ -203,6 +204,7 @@ router.get("/ingredients", async (req, res) => {
     res.status(500).json({ error: "Database error" });
   }
 });
+
 
 
 // GET /suppliers/:id - Get a single supplier
