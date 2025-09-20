@@ -315,17 +315,18 @@ router.put("/:id/pay", async (req, res) => {
 router.get("/ingredients", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT DISTINCT LOWER(name) AS name, unit
+      `SELECT DISTINCT name, unit
        FROM stock
        WHERE name IS NOT NULL AND name <> ''
-       ORDER BY name ASC`
+       ORDER BY LOWER(name) ASC`
     );
     res.json(result.rows);
   } catch (err) {
-    console.error("❌ Error fetching ingredients list:", err);
+    console.error("❌ Error fetching ingredients list:", err.message);
     res.status(500).json({ error: "Database error" });
   }
 });
+
 
   return router;
 };
