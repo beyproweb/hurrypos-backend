@@ -311,5 +311,21 @@ router.put("/:id/pay", async (req, res) => {
   }
 });
 
+// 📌 GET /suppliers/ingredients - Get distinct ingredients + units from stock
+router.get("/ingredients", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT LOWER(name) AS name, unit
+       FROM stock
+       WHERE name IS NOT NULL AND name <> ''
+       ORDER BY name ASC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching ingredients list:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
   return router;
 };
