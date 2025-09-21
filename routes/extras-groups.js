@@ -102,13 +102,18 @@ router.put("/:id", async (req, res) => {
       "UPDATE extras_groups SET group_name = $1 WHERE id = $2",
       [group_name, id]
     );
-    await client.query("DELETE FROM extras_group_items WHERE group_id = $1", [id]);
-    for (const item of items) {
-      if (!item.name) continue;
-      await client.query(
-        "INSERT INTO extras_group_items (group_id, ingredient_name, price) VALUES ($1, $2, $3)",
-        [id, item.name, item.price || 0]
-      );
+    await client.query(
+  `INSERT INTO extras_group_items (group_id, ingredient_name, amount, unit, price)
+   VALUES ($1, $2, $3, $4, $5)`,
+  [
+    id,
+    item.name,
+    item.amount || 1,
+    item.unit || "",
+    item.price || 0
+  ]
+);
+
     }
     await client.query("COMMIT");
     res.json({ success: true });
