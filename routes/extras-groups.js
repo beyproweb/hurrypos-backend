@@ -9,17 +9,25 @@ router.get("/", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        g.id,
-        g.group_name,
-        COALESCE(
-          json_agg(json_build_object('id', i.id, 'name', i.ingredient_name, 'extraPrice', i.price))
-          FILTER (WHERE i.id IS NOT NULL),
-          '[]'
-        ) AS items
-      FROM extras_groups g
-      LEFT JOIN extras_group_items i ON i.group_id = g.id
-      GROUP BY g.id, g.group_name
-      ORDER BY g.id ASC
+  g.id,
+  g.group_name,
+  COALESCE(
+    json_agg(
+      json_build_object(
+        'id', i.id,
+        'name', i.ingredient_name,
+        'price', i.price,
+        'amount', i.amount,
+        'unit', i.unit
+      )
+    ) FILTER (WHERE i.id IS NOT NULL),
+    '[]'
+  ) AS items
+FROM extras_groups g
+LEFT JOIN extras_group_items i ON i.group_id = g.id
+GROUP BY g.id, g.group_name
+ORDER BY g.id ASC
+
     `);
     res.json(result.rows);
   } catch (err) {
