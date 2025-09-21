@@ -863,49 +863,55 @@ async function updateStockForOrder(orderItems) {
       }
     }
 
-    // 🔻 Deduct Extras
-    for (const ex of extras) {
-      const usedQty = parseFloat(ex.quantity || 1) * quantityMultiplier;
-      console.log(`🔻 Deducting Extra: ${ex.name} -${usedQty} ${ex.unit}`);
 
-      const res = await pool.query(
-        `UPDATE stock
-         SET quantity = quantity - $1
-         WHERE LOWER(name) = LOWER($2) AND unit = $3
-         RETURNING *`,
-        [usedQty, ex.name, ex.unit]
+   // 🔻 Deduct Extras
+for (const ex of extras) {
+  // Use amount (from recipe) × quantity (from cart)
+  const baseAmount = parseFloat(ex.amount || 1);
+  const usedQty = baseAmount * (parseInt(ex.quantity) || 1) * quantityMultiplier;
+
+  console.log(`🔻 Deducting Extra: ${ex.name} -${usedQty} ${ex.unit}`);
+
+  const res = await pool.query(
+    `UPDATE stock
+     SET quantity = GREATEST(quantity - $1, 0)
+     WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+     RETURNING *`,
+    [usedQty, ex.name, (ex.unit || "").toLowerCase()]
+  );
+
+  const updatedStock = res.rows[0];
+  if (res.rowCount > 0 && updatedStock) {
+    emitStockUpdate(io, updatedStock.id);
+
+    if (
+      updatedStock.quantity > updatedStock.critical_quantity &&
+      updatedStock.auto_added_to_cart
+    ) {
+      await pool.query(
+        "UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1",
+        [updatedStock.id]
       );
-
-      const updatedStock = res.rows[0];
-      if (res.rowCount > 0 && updatedStock) {
-        emitStockUpdate(io, updatedStock.id);
-
-        if (
-          updatedStock.quantity > updatedStock.critical_quantity &&
-          updatedStock.auto_added_to_cart
-        ) {
-          await pool.query(
-            "UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1",
-            [updatedStock.id]
-          );
-        }
-
-        if (
-          updatedStock.critical_quantity &&
-          updatedStock.quantity <= updatedStock.critical_quantity
-        ) {
-          emitAlert(
-            io,
-            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-            updatedStock.id,
-            "stock",
-            { stockId: updatedStock.id }
-          );
-        }
-      } else {
-        console.warn(`⚠️ No matching stock found for extra: ${ex.name}`);
-      }
     }
+
+    if (
+      updatedStock.critical_quantity &&
+      updatedStock.quantity <= updatedStock.critical_quantity
+    ) {
+      emitAlert(
+        io,
+        `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
+        updatedStock.id,
+        "stock",
+        { stockId: updatedStock.id }
+      );
+    }
+  } else {
+    console.warn(`⚠️ No matching stock found for extra: ${ex.name}`);
+  }
+
+
+
   }
 }
 
