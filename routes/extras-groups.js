@@ -66,7 +66,15 @@ router.post("/", async (req, res) => {
       await client.query(
         `INSERT INTO extras_group_items (group_id, ingredient_name, price, amount, unit)
          VALUES ($1, $2, $3, $4, $5)`,
-        [groupId, item.name, item.price || 0, item.amount || 1, item.unit || ""]
+        [
+          groupId,
+          item.name,
+          item.price ?? 0,
+          item.amount !== undefined && item.amount !== null && item.amount !== ""
+            ? parseFloat(item.amount)
+            : 1,
+          item.unit || ""
+        ]
       );
     }
 
@@ -104,7 +112,15 @@ router.put("/:id", async (req, res) => {
       await client.query(
         `INSERT INTO extras_group_items (group_id, ingredient_name, price, amount, unit)
          VALUES ($1, $2, $3, $4, $5)`,
-        [id, item.name, item.price || 0, item.amount || 1, item.unit || ""]
+        [
+          id,
+          item.name,
+          item.price ?? 0,
+          item.amount !== undefined && item.amount !== null && item.amount !== ""
+            ? parseFloat(item.amount)
+            : 1,
+          item.unit || ""
+        ]
       );
     }
 
