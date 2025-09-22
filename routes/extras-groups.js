@@ -14,9 +14,9 @@ router.get("/", async (req, res) => {
             json_build_object(
               'id', i.id,
               'name', i.ingredient_name,
-              'price', i.price,
-              'amount', i.amount,
-              'unit', i.unit
+              'extraPrice', i.price,
+              'unit', i.unit,
+              'amount', i.amount
             )
           ) FILTER (WHERE i.id IS NOT NULL),
           '[]'
@@ -33,7 +33,7 @@ router.get("/", async (req, res) => {
   }
 });
 
-// GET /api/extras-groups/:id - fetch single group
+// (Optional) GET /api/extras-groups/:id - fetch single group
 router.get("/:id", async (req, res) => {
   const { id } = req.params;
   try {
@@ -119,7 +119,7 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-// DELETE /api/extras-groups/:id - Delete a group and its items
+// DELETE /api/extras-groups/:id - Delete an extras group and its items
 router.delete("/:id", async (req, res) => {
   const { id } = req.params;
   try {
