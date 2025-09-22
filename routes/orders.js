@@ -873,7 +873,18 @@ for (const ex of extras) {
 
   // Normalize name (fallback to ingredient_name if name missing)
   const extraName = ex.name || ex.ingredient_name;
-  const extraUnit = (ex.unit || "").toLowerCase();
+  // Try to use unit, but if missing, fallback by looking up stock
+let extraUnit = (ex.unit || "").toLowerCase();
+if (!extraUnit) {
+  const lookup = await pool.query(
+    "SELECT unit FROM stock WHERE LOWER(name) = LOWER($1) LIMIT 1",
+    [extraName]
+  );
+  if (lookup.rows.length) {
+    extraUnit = lookup.rows[0].unit.toLowerCase();
+  }
+}
+
 
   if (!extraName) {
     console.warn("⚠️ Extra missing name/ingredient_name:", ex);
