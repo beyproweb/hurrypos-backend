@@ -867,14 +867,14 @@ async function updateStockForOrder(orderItems) {
     // ✅ Deduct Extras as stock
 // --- Deduct extras from stock ---
 for (const ex of extras) {
-  const usedQty = parseFloat(ex.amount || 1) * parseInt(ex.quantity || 1) * quantityMultiplier;
+  const usedQty = (parseFloat(ex.amount) || 1) * (parseInt(ex.quantity) || 1) * quantityMultiplier;
 
   console.log(`🔻 Deducting Extra: ${ex.name} -${usedQty} ${ex.unit}`, { rawExtra: ex });
 
   const res = await pool.query(
     `UPDATE stock
      SET quantity = quantity - $1
-     WHERE LOWER(name) = LOWER($2) AND unit = $3
+     WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
      RETURNING *`,
     [usedQty, ex.name, ex.unit]
   );
@@ -883,12 +883,10 @@ for (const ex of extras) {
     const updatedStock = res.rows[0];
     emitStockUpdate(io, updatedStock.id);
 
-    // Reset auto_added_to_cart if now above critical
     if (updatedStock.quantity > updatedStock.critical_quantity && updatedStock.auto_added_to_cart) {
       await pool.query(`UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1`, [updatedStock.id]);
     }
 
-    // Alert if stock is now low
     if (updatedStock.critical_quantity && updatedStock.quantity <= updatedStock.critical_quantity) {
       emitAlert(
         io,
@@ -903,10 +901,6 @@ for (const ex of extras) {
   }
 }
 
-  } else {
-    console.warn(`⚠️ No matching stock found for extra: ${ex.name} (${unit})`, { rawExtra: ex });
-  }
-}
 
   }
 }
