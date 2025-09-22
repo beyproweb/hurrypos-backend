@@ -866,38 +866,113 @@ async function updateStockForOrder(orderItems) {
     // 🔻 Deduct Extras
     // ✅ Deduct Extras as stock
 // --- Deduct extras from stock ---
-for (const ex of extras) {
-  const usedQty = (parseFloat(ex.amount) || 1) * (parseInt(ex.quantity) || 1) * quantityMultiplier;
+// ✅ Update stock based on ingredients and extras
+async function updateStockForOrder(orderItems) {
+  console.log("🧾 Received order items:", orderItems);
 
-  console.log(`🔻 Deducting Extra: ${ex.name} -${usedQty} ${ex.unit}`, { rawExtra: ex });
+  for (const item of orderItems) {
+    const quantityMultiplier = parseInt(item.quantity);
 
-  const res = await pool.query(
-    `UPDATE stock
-     SET quantity = quantity - $1
-     WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
-     RETURNING *`,
-    [usedQty, ex.name, ex.unit]
-  );
+    const ingredients = Array.isArray(item.ingredients)
+      ? item.ingredients
+      : JSON.parse(item.ingredients || "[]");
 
-  if (res.rowCount > 0) {
-    const updatedStock = res.rows[0];
-    emitStockUpdate(io, updatedStock.id);
+    const extras = Array.isArray(item.extras)
+      ? item.extras
+      : JSON.parse(item.extras || "[]");
 
-    if (updatedStock.quantity > updatedStock.critical_quantity && updatedStock.auto_added_to_cart) {
-      await pool.query(`UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1`, [updatedStock.id]);
-    }
+    // 🔻 Deduct Ingredients
+    for (const ing of ingredients) {
+      const usedQty = parseFloat(ing.quantity) * quantityMultiplier;
+      console.log(`🔻 Deducting Ingredient: ${ing.ingredient} -${usedQty} ${ing.unit}`);
 
-    if (updatedStock.critical_quantity && updatedStock.quantity <= updatedStock.critical_quantity) {
-      emitAlert(
-        io,
-        `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-        updatedStock.id,
-        "stock",
-        { stockId: updatedStock.id }
+      const res = await pool.query(
+        `UPDATE stock
+         SET quantity = quantity - $1
+         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+         RETURNING *`,
+        [usedQty, ing.ingredient, (ing.unit || "").toLowerCase()]
       );
+
+      const updatedStock = res.rows[0];
+      if (res.rowCount > 0 && updatedStock) {
+        emitStockUpdate(io, updatedStock.id);
+
+        if (
+          updatedStock.quantity > updatedStock.critical_quantity &&
+          updatedStock.auto_added_to_cart
+        ) {
+          await pool.query(
+            "UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1",
+            [updatedStock.id]
+          );
+        }
+
+        if (
+          updatedStock.critical_quantity &&
+          updatedStock.quantity <= updatedStock.critical_quantity
+        ) {
+          emitAlert(
+            io,
+            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
+            updatedStock.id,
+            "stock",
+            { stockId: updatedStock.id }
+          );
+        }
+      } else {
+        console.warn(`⚠️ No matching stock found for ingredient: ${ing.ingredient} (${ing.unit})`);
+      }
     }
-  } else {
-    console.warn(`⚠️ No matching stock found for extra: ${ex.name} (${ex.unit})`, { rawExtra: ex });
+
+    // 🔻 Deduct Extras
+    for (const ex of extras) {
+      const usedQty =
+        (parseFloat(ex.amount) || 1) *
+        (parseInt(ex.quantity) || 1) *
+        quantityMultiplier;
+
+      console.log(`🔻 Deducting Extra: ${ex.name} -${usedQty} ${ex.unit}`, { rawExtra: ex });
+
+      const res = await pool.query(
+        `UPDATE stock
+         SET quantity = quantity - $1
+         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+         RETURNING *`,
+        [usedQty, ex.name, (ex.unit || "").toLowerCase()]
+      );
+
+      if (res.rowCount > 0) {
+        const updatedStock = res.rows[0];
+        emitStockUpdate(io, updatedStock.id);
+
+        if (
+          updatedStock.quantity > updatedStock.critical_quantity &&
+          updatedStock.auto_added_to_cart
+        ) {
+          await pool.query(`UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1`, [
+            updatedStock.id,
+          ]);
+        }
+
+        if (
+          updatedStock.critical_quantity &&
+          updatedStock.quantity <= updatedStock.critical_quantity
+        ) {
+          emitAlert(
+            io,
+            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
+            updatedStock.id,
+            "stock",
+            { stockId: updatedStock.id }
+          );
+        }
+      } else {
+        console.warn(`⚠️ No matching stock found for extra: ${ex.name} (${ex.unit})`, {
+          rawExtra: ex,
+        });
+      }
+    }
   }
 }
 
