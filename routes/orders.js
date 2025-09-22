@@ -864,53 +864,64 @@ async function updateStockForOrder(orderItems) {
     }
 
     // 🔻 Deduct Extras
-    for (const ex of extras) {
-      const usedQty =
-        (parseFloat(ex.amount) || 1) *
-        (parseInt(ex.quantity) || 1) *
-        quantityMultiplier;
+    // 🔻 Deduct Extras
+for (const ex of extras) {
+  const usedQty =
+    (parseFloat(ex.amount) || 1) *
+    (parseInt(ex.quantity) || 1) *
+    quantityMultiplier;
 
-      console.log(`🔻 Deducting Extra: ${ex.name} -${usedQty} ${ex.unit}`, { rawExtra: ex });
+  // Normalize name (fallback to ingredient_name if name missing)
+  const extraName = ex.name || ex.ingredient_name;
+  const extraUnit = (ex.unit || "").toLowerCase();
 
-      const res = await pool.query(
-        `UPDATE stock
-         SET quantity = quantity - $1
-         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
-         RETURNING *`,
-        [usedQty, ex.name, (ex.unit || "").toLowerCase()]
-      );
+  if (!extraName) {
+    console.warn("⚠️ Extra missing name/ingredient_name:", ex);
+    continue;
+  }
 
-      if (res.rowCount > 0) {
-        const updatedStock = res.rows[0];
-        emitStockUpdate(io, updatedStock.id);
+  console.log(`🔻 Deducting Extra: ${extraName} -${usedQty} ${extraUnit}`, { rawExtra: ex });
 
-        if (
-          updatedStock.quantity > updatedStock.critical_quantity &&
-          updatedStock.auto_added_to_cart
-        ) {
-          await pool.query(`UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1`, [
-            updatedStock.id,
-          ]);
-        }
+  const res = await pool.query(
+    `UPDATE stock
+     SET quantity = quantity - $1
+     WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+     RETURNING *`,
+    [usedQty, extraName, extraUnit]
+  );
 
-        if (
-          updatedStock.critical_quantity &&
-          updatedStock.quantity <= updatedStock.critical_quantity
-        ) {
-          emitAlert(
-            io,
-            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-            updatedStock.id,
-            "stock",
-            { stockId: updatedStock.id }
-          );
-        }
-      } else {
-        console.warn(`⚠️ No matching stock found for extra: ${ex.name} (${ex.unit})`, {
-          rawExtra: ex,
-        });
-      }
+  if (res.rowCount > 0) {
+    const updatedStock = res.rows[0];
+    emitStockUpdate(io, updatedStock.id);
+
+    if (
+      updatedStock.quantity > updatedStock.critical_quantity &&
+      updatedStock.auto_added_to_cart
+    ) {
+      await pool.query(`UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1`, [
+        updatedStock.id,
+      ]);
     }
+
+    if (
+      updatedStock.critical_quantity &&
+      updatedStock.quantity <= updatedStock.critical_quantity
+    ) {
+      emitAlert(
+        io,
+        `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
+        updatedStock.id,
+        "stock",
+        { stockId: updatedStock.id }
+      );
+    }
+  } else {
+    console.warn(`⚠️ No matching stock found for extra: ${extraName} (${extraUnit})`, {
+      rawExtra: ex,
+    });
+  }
+}
+
   }
 }
 
