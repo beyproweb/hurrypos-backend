@@ -826,68 +826,6 @@ async function updateStockForOrder(orderItems) {
 
       const res = await pool.query(
         `UPDATE stock
-  SET quantity = quantity - $1
-  WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
-  RETURNING *`,
- [usedQty, ex.name, (ex.unit || "").toLowerCase()]
-);
-
-      const updatedStock = res.rows[0];
-      if (res.rowCount > 0 && updatedStock) {
-        emitStockUpdate(io, updatedStock.id);
-
-        if (
-          updatedStock.quantity > updatedStock.critical_quantity &&
-          updatedStock.auto_added_to_cart
-        ) {
-          await pool.query(
-            "UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1",
-            [updatedStock.id]
-          );
-        }
-
-        if (
-          updatedStock.critical_quantity &&
-          updatedStock.quantity <= updatedStock.critical_quantity
-        ) {
-          emitAlert(
-            io,
-            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-            updatedStock.id,
-            "stock",
-            { stockId: updatedStock.id }
-          );
-        }
-      } else {
-        console.warn(`⚠️ No matching stock found for ingredient: ${ing.ingredient}`);
-      }
-    }
-
-    // 🔻 Deduct Extras
-    // ✅ Deduct Extras as stock
-// --- Deduct extras from stock ---
-// ✅ Update stock based on ingredients and extras
-async function updateStockForOrder(orderItems) {
-  console.log("🧾 Received order items:", orderItems);
-
-  for (const item of orderItems) {
-    const quantityMultiplier = parseInt(item.quantity);
-
-    const ingredients = Array.isArray(item.ingredients)
-      ? item.ingredients
-      : JSON.parse(item.ingredients || "[]");
-
-    const extras = Array.isArray(item.extras)
-      ? item.extras
-      : JSON.parse(item.extras || "[]");
-
-    // 🔻 Deduct Ingredients
-    for (const ing of ingredients) {
-      const usedQty = parseFloat(ing.quantity) * quantityMultiplier;
-      console.log(`🔻 Deducting Ingredient: ${ing.ingredient} -${usedQty} ${ing.unit}`);
-
-      const res = await pool.query(
-        `UPDATE stock
          SET quantity = quantity - $1
          WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
          RETURNING *`,
@@ -975,11 +913,6 @@ async function updateStockForOrder(orderItems) {
     }
   }
 }
-
-
-  }
-}
-
 
 // GET order items by order ID
 router.get("/:id/items", async (req, res) => {
