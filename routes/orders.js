@@ -826,11 +826,11 @@ async function updateStockForOrder(orderItems) {
 
       const res = await pool.query(
         `UPDATE stock
-         SET quantity = GREATEST(quantity - $1, 0)
-         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
-         RETURNING *`,
-        [usedQty, ing.ingredient, (ing.unit || "").toLowerCase()]
-      );
+  SET quantity = quantity - $1
+  WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+  RETURNING *`,
+ [usedQty, ex.name, (ex.unit || "").toLowerCase()]
+);
 
       const updatedStock = res.rows[0];
       if (res.rowCount > 0 && updatedStock) {
