@@ -867,9 +867,10 @@ async function updateStockForOrder(orderItems) {
     // 🔻 Deduct Extras
 for (const ex of extras) {
   const usedQty =
-    (parseFloat(ex.amount) || 1) *
-    (parseInt(ex.quantity) || 1) *
-    quantityMultiplier;
+  (parseFloat(ex.amount) || 1) *
+  (parseFloat(ex.quantity) || 1) *
+  quantityMultiplier;
+
 
   // Normalize name (fallback to ingredient_name if name missing)
   const extraName = ex.name || ex.ingredient_name;
