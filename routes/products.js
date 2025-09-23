@@ -2,6 +2,30 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 
+function normalizeUnit(u) {
+  if (!u) return "";
+  u = u.toLowerCase();
+  if (u === "pieces") return "piece";
+  if (u === "portion" || u === "portions") return "portion";
+  return u;
+}
+
+function convertPrice(basePrice, supplierUnit, targetUnit) {
+  if (!basePrice || !supplierUnit || !targetUnit) return null;
+  supplierUnit = normalizeUnit(supplierUnit);
+  targetUnit = normalizeUnit(targetUnit);
+
+  if (supplierUnit === targetUnit) return basePrice;
+
+  if (supplierUnit === "kg" && targetUnit === "g") return basePrice / 1000;
+  if (supplierUnit === "g" && targetUnit === "kg") return basePrice * 1000;
+
+  if (supplierUnit === "l" && targetUnit === "ml") return basePrice / 1000;
+  if (supplierUnit === "ml" && targetUnit === "l") return basePrice * 1000;
+
+  return null;
+}
+
 // GET /api/products - fetch all products
 router.get("/", async (req, res) => {
   try {
