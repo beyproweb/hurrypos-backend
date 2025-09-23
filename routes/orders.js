@@ -910,18 +910,22 @@ async function updateStockForOrder(orderItems) {
       const portionsPicked = parseInt(ex.quantity) || 1;
 
       // 2) If amount or unit is missing/blank, pull from Manage Extras Group
-      if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0 || !extraUnit) {
-        const grp = await resolveExtraFromGroups(extraName);
-        if (grp) {
-          if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0) {
-            amountPerPortion = grp.amount;
-          }
-          if (!extraUnit) {
-            extraUnit = grp.unit || "";
-          }
-          console.log("🧩 Extras fallback from groups:", { extraName, amountPerPortion, extraUnit });
-        }
-      }
+     // 2) If amount is invalid OR unit is blank OR (amount === 1 AND unit empty),
+//    then pull real values from Manage Extras Group
+if (
+  !Number.isFinite(amountPerPortion) ||
+  amountPerPortion <= 0 ||
+  !extraUnit ||
+  (amountPerPortion === 1 && !ex.unit)  // 🚑 fix: override dummy 1
+) {
+  const grp = await resolveExtraFromGroups(extraName);
+  if (grp) {
+    amountPerPortion = grp.amount;
+    extraUnit = grp.unit;
+    console.log("🧩 Extras override from groups:", { extraName, amountPerPortion, extraUnit });
+  }
+}
+
 
       // 3) If unit still empty, fall back to stock unit
       if (!extraUnit) {
