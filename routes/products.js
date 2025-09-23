@@ -90,6 +90,8 @@ router.get("/costs", async (req, res) => {
           }
         }
       });
+      costs[prod.id] = totalCost;
+    });
 
     res.json(costs);
   } catch (err) {
