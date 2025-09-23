@@ -864,71 +864,81 @@ async function updateStockForOrder(orderItems) {
     }
 
     // 🔻 Deduct Extras
-    for (const ex of extras) {
-      // ✅ Use only the saved "amount" from Manage Extras Group × product qty
-      const usedQty = (parseFloat(ex.amount) || 1) * quantityMultiplier;
+   // 🔻 Deduct Extras
+for (const ex of extras) {
+  // amount = weight per portion from Manage Extras Group
+  // quantity = how many portions customer picked
+  // quantityMultiplier = how many main products in the order
+  const usedQty =
+    (parseFloat(ex.amount) || 1) *
+    (parseInt(ex.quantity) || 1) *
+    quantityMultiplier;
 
-      // Normalize name (fallback to ingredient_name if name missing)
-      const extraName = ex.name || ex.ingredient_name;
-      let extraUnit = (ex.unit || "").toLowerCase();
+  const extraName = ex.name || ex.ingredient_name;
+  let extraUnit = (ex.unit || "").toLowerCase();
 
-      if (!extraUnit) {
-        const lookup = await pool.query(
-          "SELECT unit FROM stock WHERE LOWER(name) = LOWER($1) LIMIT 1",
-          [extraName]
-        );
-        if (lookup.rows.length) {
-          extraUnit = lookup.rows[0].unit.toLowerCase();
-        }
-      }
-
-      if (!extraName) {
-        console.warn("⚠️ Extra missing name/ingredient_name:", ex);
-        continue;
-      }
-
-      console.log(`🔻 Deducting Extra: ${extraName} -${usedQty} ${extraUnit}`, { rawExtra: ex });
-
-      const res = await pool.query(
-        `UPDATE stock
-         SET quantity = quantity - $1
-         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
-         RETURNING *`,
-        [usedQty, extraName, extraUnit]
-      );
-
-      if (res.rowCount > 0) {
-        const updatedStock = res.rows[0];
-        emitStockUpdate(io, updatedStock.id);
-
-        if (
-          updatedStock.quantity > updatedStock.critical_quantity &&
-          updatedStock.auto_added_to_cart
-        ) {
-          await pool.query(
-            `UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1`,
-            [updatedStock.id]
-          );
-        }
-
-        if (
-          updatedStock.critical_quantity &&
-          updatedStock.quantity <= updatedStock.critical_quantity
-        ) {
-          emitAlert(
-            io,
-            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-            updatedStock.id,
-            "stock",
-            { stockId: updatedStock.id }
-          );
-        }
-      } else {
-        console.warn(`⚠️ No matching stock found for extra: ${extraName} (${extraUnit})`, {
-          rawExtra: ex,
-        });
-      }
+  if (!extraUnit) {
+    const lookup = await pool.query(
+      "SELECT unit FROM stock WHERE LOWER(name) = LOWER($1) LIMIT 1",
+      [extraName]
+    );
+    if (lookup.rows.length) {
+      extraUnit = lookup.rows[0].unit.toLowerCase();
     }
+  }
+
+  if (!extraName) {
+    console.warn("⚠️ Extra missing name/ingredient_name:", ex);
+    continue;
+  }
+
+  console.log(
+    `🔻 Deducting Extra: ${extraName} -${usedQty} ${extraUnit}`,
+    { rawExtra: ex }
+  );
+
+  const res = await pool.query(
+    `UPDATE stock
+     SET quantity = quantity - $1
+     WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+     RETURNING *`,
+    [usedQty, extraName, extraUnit]
+  );
+
+  if (res.rowCount > 0) {
+    const updatedStock = res.rows[0];
+    emitStockUpdate(io, updatedStock.id);
+
+    if (
+      updatedStock.quantity > updatedStock.critical_quantity &&
+      updatedStock.auto_added_to_cart
+    ) {
+      await pool.query(
+        `UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1`,
+        [updatedStock.id]
+      );
+    }
+
+    if (
+      updatedStock.critical_quantity &&
+      updatedStock.quantity <= updatedStock.critical_quantity
+    ) {
+      emitAlert(
+        io,
+        `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
+        updatedStock.id,
+        "stock",
+        { stockId: updatedStock.id }
+      );
+    }
+  } else {
+    console.warn(
+      `⚠️ No matching stock found for extra: ${extraName} (${extraUnit})`,
+      { rawExtra: ex }
+    );
+  }
+}
+
   }
 }
 
