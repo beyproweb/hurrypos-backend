@@ -805,6 +805,7 @@ router.get('/debug/order-item-discounts', async (req, res) => {
 
 
 
+
 // ✅ Update stock based on ingredients and extras (fixed to respect Manage Extras Group amount+unit)
 async function updateStockForOrder(orderItems) {
   console.log("🧾 Received order items:", orderItems);
@@ -896,7 +897,7 @@ async function updateStockForOrder(orderItems) {
       }
     }
 
-    // 🔻 Deduct Extras (fixed)
+    // 🔻 Deduct Extras (fixed + normalized)
     for (const ex of extras) {
       const extraName = ex.name || ex.ingredient_name;
       if (!extraName) {
@@ -910,24 +911,51 @@ async function updateStockForOrder(orderItems) {
       const portionsPicked = parseInt(ex.quantity) || 1;
 
       // 2) If amount or unit is missing/blank, pull from Manage Extras Group
-     // 2) If amount is invalid OR unit is blank OR (amount === 1 AND unit empty),
-//    then pull real values from Manage Extras Group
-if (
-  !Number.isFinite(amountPerPortion) ||
-  amountPerPortion <= 0 ||
-  !extraUnit ||
-  (amountPerPortion === 1 && !ex.unit)  // 🚑 fix: override dummy 1
-) {
-  const grp = await resolveExtraFromGroups(extraName);
-  if (grp) {
-    amountPerPortion = grp.amount;
-    extraUnit = grp.unit;
-    console.log("🧩 Extras override from groups:", { extraName, amountPerPortion, extraUnit });
-  }
-}
+      if (
+        !Number.isFinite(amountPerPortion) ||
+        amountPerPortion <= 0 ||
+        !extraUnit ||
+        (amountPerPortion === 1 && !ex.unit) // 🚑 fix: override dummy 1
+      ) {
+        const grp = await resolveExtraFromGroups(extraName);
+        if (grp) {
+          amountPerPortion = grp.amount;
+          extraUnit = grp.unit;
+          console.log("🧩 Extras override from groups:", { extraName, amountPerPortion, extraUnit });
+        }
+      }
 
+      // 3) Normalize unit if mismatch with stock
+      const stockRes = await pool.query(
+        `SELECT id, unit FROM stock WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+        [extraName]
+      );
+      if (stockRes.rows.length) {
+        const stockUnit = (stockRes.rows[0].unit || "").toLowerCase();
+        if (extraUnit && extraUnit !== stockUnit) {
+          // Convert simple cases
+          if (extraUnit === "g" && stockUnit === "kg") {
+            amountPerPortion = amountPerPortion / 1000;
+            extraUnit = stockUnit;
+          } else if (extraUnit === "kg" && stockUnit === "g") {
+            amountPerPortion = amountPerPortion * 1000;
+            extraUnit = stockUnit;
+          } else if (extraUnit === "ml" && stockUnit === "l") {
+            amountPerPortion = amountPerPortion / 1000;
+            extraUnit = stockUnit;
+          } else if (extraUnit === "l" && stockUnit === "ml") {
+            amountPerPortion = amountPerPortion * 1000;
+            extraUnit = stockUnit;
+          } else if (
+            (extraUnit === "piece" && stockUnit === "portion") ||
+            (extraUnit === "portion" && stockUnit === "piece")
+          ) {
+            extraUnit = stockUnit; // treat same
+          }
+        }
+      }
 
-      // 3) If unit still empty, fall back to stock unit
+      // 4) If unit still empty, fall back to stock unit
       if (!extraUnit) {
         extraUnit = await resolveUnitFromStock(extraName);
         if (extraUnit) {
@@ -935,7 +963,7 @@ if (
         }
       }
 
-      // 4) Final safety: if amount is still invalid, assume 1 (log loudly)
+      // 5) Final safety: if amount is still invalid, assume 1 (log loudly)
       if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0) {
         console.warn("❗ Extra amount invalid; defaulting to 1", { extraName, raw: ex.amount });
         amountPerPortion = 1;
@@ -997,6 +1025,7 @@ if (
     }
   }
 }
+
 
 
 
