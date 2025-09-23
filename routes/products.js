@@ -77,13 +77,19 @@ router.get("/costs", async (req, res) => {
         }
       }
       ingredientsArr.forEach((ing) => {
-        if (!ing.ingredient || !ing.quantity || !ing.unit) return;
-        const key = `${ing.ingredient}__${ing.unit}`;
-        const price = prices[key] || 0;
-        totalCost += parseFloat(ing.quantity) * price;
+       if (!ing.ingredient || !ing.quantity || !ing.unit) return;
+        const candidates = Object.entries(prices).filter(([key]) =>
+          key.startsWith(`${ing.ingredient}__`)
+        );
+        for (const [key, basePrice] of candidates) {
+          const supplierUnit = key.split("__")[1];
+          const converted = convertPrice(basePrice, supplierUnit, ing.unit);
+          if (converted !== null) {
+            totalCost += parseFloat(ing.quantity) * converted;
+            break; // stop once we found a valid conversion
+          }
+        }
       });
-      costs[prod.id] = totalCost;
-    });
 
     res.json(costs);
   } catch (err) {
