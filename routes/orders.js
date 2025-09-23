@@ -928,7 +928,6 @@ for (const ing of ingredients) {
   }
 }
 
-
     // 🔻 Deduct Extras (fixed + normalized)
     for (const ex of extras) {
       const extraName = ex.name || ex.ingredient_name;
