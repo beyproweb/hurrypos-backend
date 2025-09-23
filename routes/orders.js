@@ -854,48 +854,80 @@ async function updateStockForOrder(orderItems) {
       : JSON.parse(item.extras || "[]");
 
     // 🔻 Deduct Ingredients (unchanged)
-    for (const ing of ingredients) {
-      const usedQty = parseFloat(ing.quantity) * quantityMultiplier;
-      console.log(`🔻 Deducting Ingredient: ${ing.ingredient} -${usedQty} ${ing.unit}`);
+    // 🔻 Deduct Ingredients (with normalization)
+for (const ing of ingredients) {
+  let ingUnit = (ing.unit || "").toLowerCase();
+  let amountPerUnit = parseFloat(ing.quantity) * quantityMultiplier;
 
-      const res = await pool.query(
-        `UPDATE stock
-         SET quantity = quantity - $1
-         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
-         RETURNING *`,
-        [usedQty, ing.ingredient, (ing.unit || "").toLowerCase()]
-      );
-
-      const updatedStock = res.rows[0];
-      if (res.rowCount > 0 && updatedStock) {
-        emitStockUpdate(io, updatedStock.id);
-
-        if (
-          updatedStock.quantity > updatedStock.critical_quantity &&
-          updatedStock.auto_added_to_cart
-        ) {
-          await pool.query(
-            "UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1",
-            [updatedStock.id]
-          );
-        }
-
-        if (
-          updatedStock.critical_quantity &&
-          updatedStock.quantity <= updatedStock.critical_quantity
-        ) {
-          emitAlert(
-            io,
-            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-            updatedStock.id,
-            "stock",
-            { stockId: updatedStock.id }
-          );
-        }
-      } else {
-        console.warn(`⚠️ No matching stock found for ingredient: ${ing.ingredient} (${ing.unit})`);
+  // Normalize with stock if mismatch
+  const stockRes = await pool.query(
+    `SELECT id, unit FROM stock WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+    [ing.ingredient]
+  );
+  if (stockRes.rows.length) {
+    const stockUnit = (stockRes.rows[0].unit || "").toLowerCase();
+    if (ingUnit && ingUnit !== stockUnit) {
+      if (ingUnit === "g" && stockUnit === "kg") {
+        amountPerUnit = amountPerUnit / 1000;
+        ingUnit = stockUnit;
+      } else if (ingUnit === "kg" && stockUnit === "g") {
+        amountPerUnit = amountPerUnit * 1000;
+        ingUnit = stockUnit;
+      } else if (ingUnit === "ml" && stockUnit === "l") {
+        amountPerUnit = amountPerUnit / 1000;
+        ingUnit = stockUnit;
+      } else if (ingUnit === "l" && stockUnit === "ml") {
+        amountPerUnit = amountPerUnit * 1000;
+        ingUnit = stockUnit;
+      } else if (
+        (ingUnit === "piece" && stockUnit === "portion") ||
+        (ingUnit === "portion" && stockUnit === "piece")
+      ) {
+        ingUnit = stockUnit;
       }
     }
+  }
+
+  console.log(`🔻 Deducting Ingredient: ${ing.ingredient} -${amountPerUnit} ${ingUnit}`);
+
+  const res = await pool.query(
+    `UPDATE stock
+     SET quantity = quantity - $1
+     WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+     RETURNING *`,
+    [amountPerUnit, ing.ingredient, ingUnit]
+  );
+
+  if (res.rowCount > 0) {
+    const updatedStock = res.rows[0];
+    emitStockUpdate(io, updatedStock.id);
+
+    if (
+      updatedStock.quantity > updatedStock.critical_quantity &&
+      updatedStock.auto_added_to_cart
+    ) {
+      await pool.query("UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1", [
+        updatedStock.id,
+      ]);
+    }
+
+    if (
+      updatedStock.critical_quantity &&
+      updatedStock.quantity <= updatedStock.critical_quantity
+    ) {
+      emitAlert(
+        io,
+        `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
+        updatedStock.id,
+        "stock",
+        { stockId: updatedStock.id }
+      );
+    }
+  } else {
+    console.warn(`⚠️ No matching stock found for ingredient: ${ing.ingredient} (${ingUnit})`);
+  }
+}
+
 
     // 🔻 Deduct Extras (fixed + normalized)
     for (const ex of extras) {
