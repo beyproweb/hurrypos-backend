@@ -804,12 +804,45 @@ router.get('/debug/order-item-discounts', async (req, res) => {
 
 
 
-// ✅ Update stock based on ingredients and extras
+
+// ✅ Update stock based on ingredients and extras (fixed to respect Manage Extras Group amount+unit)
 async function updateStockForOrder(orderItems) {
   console.log("🧾 Received order items:", orderItems);
 
+  // Small helper to fetch fallback amount/unit from Manage Extras Group
+  async function resolveExtraFromGroups(name) {
+    const q = await pool.query(
+      `SELECT amount, unit
+       FROM extras_group_items
+       WHERE LOWER(ingredient_name) = LOWER($1)
+       ORDER BY id DESC
+       LIMIT 1`,
+      [name]
+    );
+    if (!q.rows.length) return null;
+    const r = q.rows[0] || {};
+    return {
+      amount: Number(r.amount),
+      unit: (r.unit || "").toLowerCase()
+    };
+  }
+
+  // Helper to fetch unit from stock if still missing
+  async function resolveUnitFromStock(name) {
+    const q = await pool.query(
+      `SELECT unit
+       FROM stock
+       WHERE LOWER(name) = LOWER($1)
+       ORDER BY id DESC
+       LIMIT 1`,
+      [name]
+    );
+    if (!q.rows.length) return "";
+    return (q.rows[0].unit || "").toLowerCase();
+  }
+
   for (const item of orderItems) {
-    const quantityMultiplier = parseInt(item.quantity);
+    const quantityMultiplier = parseInt(item.quantity); // how many main products
 
     const ingredients = Array.isArray(item.ingredients)
       ? item.ingredients
@@ -819,7 +852,7 @@ async function updateStockForOrder(orderItems) {
       ? item.extras
       : JSON.parse(item.extras || "[]");
 
-    // 🔻 Deduct Ingredients
+    // 🔻 Deduct Ingredients (unchanged)
     for (const ing of ingredients) {
       const usedQty = parseFloat(ing.quantity) * quantityMultiplier;
       console.log(`🔻 Deducting Ingredient: ${ing.ingredient} -${usedQty} ${ing.unit}`);
@@ -863,84 +896,104 @@ async function updateStockForOrder(orderItems) {
       }
     }
 
-    // 🔻 Deduct Extras
-   // 🔻 Deduct Extras
-for (const ex of extras) {
-  // amount = weight per portion from Manage Extras Group
-  // quantity = how many portions customer picked
-  // quantityMultiplier = how many main products in the order
-  const usedQty =
-    (parseFloat(ex.amount) || 1) *
-    (parseInt(ex.quantity) || 1) *
-    quantityMultiplier;
+    // 🔻 Deduct Extras (fixed)
+    for (const ex of extras) {
+      const extraName = ex.name || ex.ingredient_name;
+      if (!extraName) {
+        console.warn("⚠️ Extra missing name/ingredient_name:", ex);
+        continue;
+      }
 
-  const extraName = ex.name || ex.ingredient_name;
-  let extraUnit = (ex.unit || "").toLowerCase();
+      // 1) Start with values sent from cart
+      let amountPerPortion = Number(ex.amount);
+      let extraUnit = (ex.unit || "").toLowerCase();
+      const portionsPicked = parseInt(ex.quantity) || 1;
 
-  if (!extraUnit) {
-    const lookup = await pool.query(
-      "SELECT unit FROM stock WHERE LOWER(name) = LOWER($1) LIMIT 1",
-      [extraName]
-    );
-    if (lookup.rows.length) {
-      extraUnit = lookup.rows[0].unit.toLowerCase();
-    }
-  }
+      // 2) If amount or unit is missing/blank, pull from Manage Extras Group
+      if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0 || !extraUnit) {
+        const grp = await resolveExtraFromGroups(extraName);
+        if (grp) {
+          if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0) {
+            amountPerPortion = grp.amount;
+          }
+          if (!extraUnit) {
+            extraUnit = grp.unit || "";
+          }
+          console.log("🧩 Extras fallback from groups:", { extraName, amountPerPortion, extraUnit });
+        }
+      }
 
-  if (!extraName) {
-    console.warn("⚠️ Extra missing name/ingredient_name:", ex);
-    continue;
-  }
+      // 3) If unit still empty, fall back to stock unit
+      if (!extraUnit) {
+        extraUnit = await resolveUnitFromStock(extraName);
+        if (extraUnit) {
+          console.log("📦 Extras unit fallback from stock:", { extraName, extraUnit });
+        }
+      }
 
-  console.log(
-    `🔻 Deducting Extra: ${extraName} -${usedQty} ${extraUnit}`,
-    { rawExtra: ex }
-  );
+      // 4) Final safety: if amount is still invalid, assume 1 (log loudly)
+      if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0) {
+        console.warn("❗ Extra amount invalid; defaulting to 1", { extraName, raw: ex.amount });
+        amountPerPortion = 1;
+      }
 
-  const res = await pool.query(
-    `UPDATE stock
-     SET quantity = quantity - $1
-     WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
-     RETURNING *`,
-    [usedQty, extraName, extraUnit]
-  );
+      const usedQty = amountPerPortion * portionsPicked * quantityMultiplier;
 
-  if (res.rowCount > 0) {
-    const updatedStock = res.rows[0];
-    emitStockUpdate(io, updatedStock.id);
-
-    if (
-      updatedStock.quantity > updatedStock.critical_quantity &&
-      updatedStock.auto_added_to_cart
-    ) {
-      await pool.query(
-        `UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1`,
-        [updatedStock.id]
+      console.log(
+        `🔻 Deducting Extra: ${extraName} -${usedQty} ${extraUnit}`,
+        {
+          rawExtra: ex,
+          reason: "amountPerPortion × portionsPicked × productQty",
+          amountPerPortion,
+          portionsPicked,
+          productQty: quantityMultiplier
+        }
       );
-    }
 
-    if (
-      updatedStock.critical_quantity &&
-      updatedStock.quantity <= updatedStock.critical_quantity
-    ) {
-      emitAlert(
-        io,
-        `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-        updatedStock.id,
-        "stock",
-        { stockId: updatedStock.id }
+      const res = await pool.query(
+        `UPDATE stock
+         SET quantity = quantity - $1
+         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+         RETURNING *`,
+        [usedQty, extraName, extraUnit]
       );
+
+      if (res.rowCount > 0) {
+        const updatedStock = res.rows[0];
+        emitStockUpdate(io, updatedStock.id);
+
+        if (
+          updatedStock.quantity > updatedStock.critical_quantity &&
+          updatedStock.auto_added_to_cart
+        ) {
+          await pool.query(
+            `UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1`,
+            [updatedStock.id]
+          );
+        }
+
+        if (
+          updatedStock.critical_quantity &&
+          updatedStock.quantity <= updatedStock.critical_quantity
+        ) {
+          emitAlert(
+            io,
+            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
+            updatedStock.id,
+            "stock",
+            { stockId: updatedStock.id }
+          );
+        }
+      } else {
+        console.warn(
+          `⚠️ No matching stock found for extra: ${extraName} (${extraUnit})`,
+          { rawExtra: ex }
+        );
+      }
     }
-  } else {
-    console.warn(
-      `⚠️ No matching stock found for extra: ${extraName} (${extraUnit})`,
-      { rawExtra: ex }
-    );
   }
 }
 
-  }
-}
 
 
 // GET order items by order ID
