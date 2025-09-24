@@ -43,68 +43,77 @@ router.post("/export/csv", async (req, res) => {
 
 
 // GET /reports/summary - Returns gross sales, net sales, expenses today, and profit
-// GET /reports/summary - Returns gross sales, net sales, expenses today, profit, and avg order value
+// reports.js
 router.get("/summary", async (req, res) => {
   try {
     const client = await pool.connect();
 
-    // Daily sales (today only, timezone-aware)
+    const { from, to } = req.query;
+    const today = new Date().toISOString().slice(0, 10);
+
+    // default range = today
+    const startDate = from || today;
+    const endDate   = to   || today;
+
+    // Daily sales (range-aware)
     const dailySalesRes = await client.query(`
       SELECT COALESCE(SUM(amount), 0) AS daily_sales
       FROM receipt_methods
-      WHERE created_at >= CURRENT_DATE AT TIME ZONE 'Europe/Istanbul'
-        AND created_at < (CURRENT_DATE + INTERVAL '1 day') AT TIME ZONE 'Europe/Istanbul'
-    `);
+      WHERE created_at >= $1::date
+        AND created_at < ($2::date + INTERVAL '1 day')
+    `, [startDate, endDate]);
     const dailySales = parseFloat(dailySalesRes.rows[0].daily_sales);
 
-    // Gross sales (all time)
+    // Gross & Net sales within range
     const grossSalesRes = await client.query(`
       SELECT COALESCE(SUM(total), 0) AS gross_sales
       FROM orders
       WHERE is_paid = true
-    `);
+        AND created_at >= $1::date
+        AND created_at < ($2::date + INTERVAL '1 day')
+    `, [startDate, endDate]);
     const grossSales = parseFloat(grossSalesRes.rows[0].gross_sales);
 
-    // Net sales
     const netSalesRes = await client.query(`
       SELECT COALESCE(SUM(total - p.discount_value), 0) AS net_sales
       FROM orders o
       JOIN order_items oi ON o.id = oi.order_id
       JOIN products p ON oi.product_id = p.id
       WHERE o.status IN ('paid', 'closed')
-    `);
+        AND o.created_at >= $1::date
+        AND o.created_at < ($2::date + INTERVAL '1 day')
+    `, [startDate, endDate]);
     const netSales = parseFloat(netSalesRes.rows[0].net_sales);
 
-    // Expenses today (from transactions and staff_payments)
+    // Expenses
     const [supplierRes, staffRes] = await Promise.all([
       client.query(`
         SELECT COALESCE(SUM(amount_paid), 0) AS total
         FROM transactions
         WHERE ingredient = 'Payment'
-          AND delivery_date >= CURRENT_DATE AT TIME ZONE 'Europe/Istanbul'
-          AND delivery_date < (CURRENT_DATE + INTERVAL '1 day') AT TIME ZONE 'Europe/Istanbul'
-      `),
+          AND delivery_date >= $1::date
+          AND delivery_date < ($2::date + INTERVAL '1 day')
+      `, [startDate, endDate]),
       client.query(`
         SELECT COALESCE(SUM(amount), 0) AS total
         FROM staff_payments
-        WHERE created_at >= CURRENT_DATE AT TIME ZONE 'Europe/Istanbul'
-          AND created_at < (CURRENT_DATE + INTERVAL '1 day') AT TIME ZONE 'Europe/Istanbul'
-      `)
+        WHERE created_at >= $1::date
+          AND created_at < ($2::date + INTERVAL '1 day')
+      `, [startDate, endDate])
     ]);
-
     const expensesToday =
       parseFloat(supplierRes.rows[0].total) + parseFloat(staffRes.rows[0].total);
 
     const profit = netSales - expensesToday;
 
-    // ✅ Average order value (only paid+closed orders)
+    // Average Order Value (range-aware)
     const avgRes = await client.query(`
-      SELECT
-        COUNT(*) AS order_count,
-        COALESCE(SUM(total), 0) AS total_sum
+      SELECT COUNT(*) AS order_count, COALESCE(SUM(total), 0) AS total_sum
       FROM orders
       WHERE status IN ('paid', 'closed')
-    `);
+        AND created_at >= $1::date
+        AND created_at < ($2::date + INTERVAL '1 day')
+    `, [startDate, endDate]);
 
     const orderCount = parseInt(avgRes.rows[0].order_count, 10);
     const totalSum = parseFloat(avgRes.rows[0].total_sum);
@@ -116,7 +125,7 @@ router.get("/summary", async (req, res) => {
       net_sales: netSales,
       expenses_today: expensesToday,
       profit,
-      average_order_value: avgOrderValue, // ✅ new field
+      average_order_value: avgOrderValue,
     });
 
     client.release();
@@ -125,6 +134,7 @@ router.get("/summary", async (req, res) => {
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
+
 
 
 
