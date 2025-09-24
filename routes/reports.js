@@ -1078,4 +1078,50 @@ router.patch("/orders/:id/items/payment-method", async (req, res) => {
   }
 });
 
+// GET /api/reports/online-sales?from=YYYY-MM-DD&to=YYYY-MM-DD
+router.get("/online-sales", async (req, res) => {
+  const { from, to } = req.query;
+  if (!from || !to) {
+    return res.status(400).json({ error: "Missing from/to" });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        order_type,
+        payment_method,
+        COALESCE(SUM(total), 0) AS total
+      FROM orders
+      WHERE status IN ('paid','closed')
+        AND order_type IN ('online','packet')  -- extend later with Trendyol, Getir
+        AND created_at >= $1::date
+        AND created_at < ($2::date + INTERVAL '1 day')
+      GROUP BY order_type, payment_method
+      ORDER BY order_type, payment_method
+      `,
+      [from, to]
+    );
+
+    // reshape into { platform: { total, payments: [{method, total}] } }
+    const platforms = {};
+    for (const row of result.rows) {
+      const platform = row.order_type || "unknown";
+      if (!platforms[platform]) {
+        platforms[platform] = { total: 0, payments: [] };
+      }
+      platforms[platform].payments.push({
+        method: row.payment_method || "Unknown",
+        total: parseFloat(row.total),
+      });
+      platforms[platform].total += parseFloat(row.total);
+    }
+
+    res.json(platforms);
+  } catch (err) {
+    console.error("❌ Error fetching online sales:", err);
+    res.status(500).json({ error: "Failed to fetch online sales" });
+  }
+});
+
 module.exports = router;
