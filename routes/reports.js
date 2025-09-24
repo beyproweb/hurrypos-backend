@@ -133,9 +133,9 @@ router.get("/history", async (req, res) => {
           receipt_id,
           customer_name,
           customer_address,
-          payment_method  -- << CRUCIAL FIX: explicitly select this column
+          payment_method
         FROM orders
-        WHERE status = 'closed'
+        WHERE status IN ('paid', 'closed')   -- ✅ include both paid + closed
         AND created_at >= $1::date
         AND created_at < ($2::date + INTERVAL '1 day')
         ORDER BY created_at DESC
@@ -148,7 +148,6 @@ router.get("/history", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch order history" });
   }
 });
-
 
 // GET /reports/sales-by-payment-method
 router.get("/sales-by-payment-method", async (req, res) => {
