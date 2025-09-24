@@ -861,8 +861,8 @@ for (const ing of ingredients) {
 
   // Normalize with stock if mismatch
   const stockRes = await pool.query(
-    `SELECT id, unit FROM stock WHERE LOWER(name) = LOWER($1) LIMIT 1`,
-    [ing.ingredient]
+`SELECT id, unit FROM stock WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+  [ing.ingredient || ing.name]
   );
   if (stockRes.rows.length) {
     const stockUnit = (stockRes.rows[0].unit || "").toLowerCase();
@@ -924,7 +924,7 @@ for (const ing of ingredients) {
       );
     }
   } else {
-    console.warn(`⚠️ No matching stock found for ingredient: ${ing.ingredient} (${ingUnit})`);
+    console.warn(`⚠️ No matching stock found for ingredient: ${ing.ingredient || ing.name} (${ingUnit})`);
   }
 }
 
