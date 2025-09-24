@@ -43,6 +43,7 @@ router.post("/export/csv", async (req, res) => {
 
 
 // GET /reports/summary - Returns gross sales, net sales, expenses today, and profit
+// GET /reports/summary - Returns gross sales, net sales, expenses today, profit, and avg order value
 router.get("/summary", async (req, res) => {
   try {
     const client = await pool.connect();
@@ -96,12 +97,26 @@ router.get("/summary", async (req, res) => {
 
     const profit = netSales - expensesToday;
 
+    // ✅ Average order value (only paid+closed orders)
+    const avgRes = await client.query(`
+      SELECT
+        COUNT(*) AS order_count,
+        COALESCE(SUM(total), 0) AS total_sum
+      FROM orders
+      WHERE status IN ('paid', 'closed')
+    `);
+
+    const orderCount = parseInt(avgRes.rows[0].order_count, 10);
+    const totalSum = parseFloat(avgRes.rows[0].total_sum);
+    const avgOrderValue = orderCount > 0 ? totalSum / orderCount : 0;
+
     res.json({
       daily_sales: dailySales,
       gross_sales: grossSales,
       net_sales: netSales,
       expenses_today: expensesToday,
       profit,
+      average_order_value: avgOrderValue, // ✅ new field
     });
 
     client.release();
@@ -110,6 +125,7 @@ router.get("/summary", async (req, res) => {
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
+
 
 
 // GET /reports/history (INCLUDE payment_method)
