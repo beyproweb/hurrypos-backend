@@ -62,6 +62,7 @@ router.get('/', async (req, res) => {
       `SELECT id, name, role, phone, address, salary, email, created_at,
               payment_type, salary_model, hourly_rate, avatar
        FROM staff
+       WHERE status = 'active'
        ORDER BY id`
     );
     res.json(result.rows);
@@ -70,6 +71,7 @@ router.get('/', async (req, res) => {
     res.status(500).json({ status: 'error', message: 'Server error' });
   }
 });
+
 
 
 // Fetch all unique roles from the staff table
@@ -269,20 +271,21 @@ router.put('/:id', async (req, res) => {
 
 
 
-// Delete Staff
+// Delete (soft delete) Staff
 router.delete('/:id', async (req, res) => {
   const { id } = req.params;
   logRequest(`/api/staff/${id}`, 'DELETE', { id });
 
   try {
-    await pool.query('DELETE FROM staff WHERE id = $1', [id]);
-    console.log(`✅ Deleted staff ID: ${id}`);
-    res.json({ status: 'success', message: 'Staff deleted' });
+    await pool.query('UPDATE staff SET status = $1 WHERE id = $2', ['inactive', id]);
+    console.log(`📂 Archived staff ID: ${id}`);
+    res.json({ status: 'success', message: 'Staff archived (inactive)' });
   } catch (err) {
-    console.error('❌ Error deleting staff:', err);
-    res.status(500).json({ status: 'error', message: 'Error deleting staff' });
+    console.error('❌ Error archiving staff:', err);
+    res.status(500).json({ status: 'error', message: 'Error archiving staff' });
   }
 });
+
 
 const formatHours = (rawHours) => {
   const totalMinutes = Math.round(parseFloat(rawHours) * 60); // Convert hours to minutes
