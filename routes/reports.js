@@ -205,6 +205,47 @@ router.get("/sales-by-payment-method", async (req, res) => {
   }
 });
 
+// GET /reports/sales-by-payment-method-detailed
+router.get("/sales-by-payment-method-detailed", async (req, res) => {
+  const { from, to } = req.query;
+  let dateFilter = "";
+
+  if (from && to) {
+    dateFilter = `AND o.created_at >= '${from}' AND o.created_at < '${to}'::date + INTERVAL '1 day'`;
+  }
+
+  try {
+    const result = await pool.query(`
+      SELECT
+        rm.payment_method,
+        SUM(rm.amount) AS total,
+        SUM(rm.amount) FILTER (WHERE sub.cnt = 1) AS single_total,
+        SUM(rm.amount) FILTER (WHERE sub.cnt > 1) AS split_total
+      FROM receipt_methods rm
+      JOIN orders o ON rm.receipt_id = o.receipt_id
+      JOIN (
+        SELECT receipt_id, COUNT(*) AS cnt
+        FROM receipt_methods
+        GROUP BY receipt_id
+      ) sub ON rm.receipt_id = sub.receipt_id
+      WHERE o.status = 'closed' ${dateFilter}
+      GROUP BY rm.payment_method
+      ORDER BY total DESC
+    `);
+
+    const formatted = result.rows.map(r => ({
+      method: r.payment_method,
+      total: parseFloat(r.total),
+      single: parseFloat(r.single_total) || 0,
+      split: parseFloat(r.split_total) || 0,
+    }));
+
+    res.json(formatted);
+  } catch (err) {
+    console.error("❌ Error fetching detailed payment breakdown:", err);
+    res.status(500).json({ error: "Failed to load detailed payment data" });
+  }
+});
 
 // GET /reports/profit-loss?range=daily|weekly|monthly
 router.get("/profit-loss", async (req, res) => {
