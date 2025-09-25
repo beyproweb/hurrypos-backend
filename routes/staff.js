@@ -580,6 +580,20 @@ router.delete('/schedule/:id', async (req, res) => {
   }
 });
 
+// Delete all schedules for a staff
+router.delete('/:staffId/schedule', async (req, res) => {
+  const { staffId } = req.params;
+  try {
+    await pool.query('DELETE FROM staff_schedule WHERE staff_id = $1', [staffId]);
+    console.log(`🗑️ Deleted all schedules for staff ID: ${staffId}`);
+    res.json({ status: 'success', message: 'All schedules deleted for this staff' });
+  } catch (err) {
+    console.error('❌ Error deleting all schedules:', err);
+    res.status(500).json({ status: 'error', message: 'Failed to delete all schedules' });
+  }
+});
+
+
 /* =====================================================================
    NEW ENDPOINT: Send Shift Details
    This endpoint receives the full shift details sent from the React app
