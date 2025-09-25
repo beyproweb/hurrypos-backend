@@ -295,9 +295,10 @@ const formatHours = (rawHours) => {
 };
 
 // Get staff profile by ID
+// Get staff profile by ID
 router.get('/profile/:staffId', async (req, res) => {
   const { staffId } = req.params;
-  console.log("📩 Incoming staff payment request:", req.body);
+  console.log("📩 Incoming staff profile request:", staffId);
 
   try {
     const result = await pool.query(
@@ -314,9 +315,10 @@ router.get('/profile/:staffId', async (req, res) => {
         salary_model,
         hourly_rate,
         weekly_salary,
-        monthly_salary
+        monthly_salary,
+        status
       FROM staff
-      WHERE id = $1`,
+      WHERE id = $1`,   // ✅ no status filter here
       [staffId]
     );
 
@@ -333,6 +335,7 @@ router.get('/profile/:staffId', async (req, res) => {
     res.status(500).json({ status: 'error', message: 'Error fetching profile' });
   }
 });
+
 
 
 // Update an existing staff schedule
