@@ -137,6 +137,7 @@ router.post("/upload", upload.single('image'), (req, res) => {
   res.json({ url: fileUrl });
 });
 
+// POST /api/login
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
 
@@ -153,30 +154,39 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ success: false, error: "Incorrect password" });
     }
 
-    // Fetch latest subscription info for this user
+    // Fetch latest subscription info
     const subRes = await pool.query(
       `SELECT active_plan FROM subscription_applications WHERE email = $1 ORDER BY subscribed_at DESC LIMIT 1`,
       [email]
     );
     const plan = subRes.rows[0]?.active_plan;
-const activePlan = plan && plan !== 'null' && plan !== '' ? plan : null;
+    const activePlan = plan && plan !== "null" && plan !== "" ? plan : null;
+
+    // 🔑 Resolve permissions for this role
+    const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+    let perms = [];
+    if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
+      perms = settingsRes.rows[0].users.roles?.[user.role] || [];
+    }
 
     res.json({
-  success: true,
-  user: {
-    id: user.id,
-    fullName: user.full_name,
-    email: user.email,
-    businessName: user.business_name,
-    subscriptionPlan: activePlan,
-    role: user.role, // <--- ADD THIS LINE!
-  },
+      success: true,
+      user: {
+        id: user.id,
+        fullName: user.full_name,
+        email: user.email,
+        businessName: user.business_name,
+        subscriptionPlan: activePlan,
+        role: user.role,
+        permissions: perms, // ✅ always attach resolved permissions
+      },
     });
   } catch (err) {
     console.error("❌ Login error:", err);
     res.status(500).json({ success: false, error: "Server error" });
   }
 });
+
 
 
 router.get("/me", async (req, res) => {
