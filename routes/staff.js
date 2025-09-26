@@ -1434,22 +1434,25 @@ router.post("/login", async (req, res) => {
           const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
           if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
             const settings = settingsRes.rows[0].users;
-            rolePerms = settings.roles?.[staff.role] || [];
+            const roleKey = staff.role?.toLowerCase();
+rolePerms = settings.roles?.[roleKey] || [];
+
           }
         } catch (err) {
           console.error('Failed to fetch staff permissions:', err);
         }
         return res.json({
-          success: true,
-          staff: {
-            id: staff.id,
-            name: staff.name,
-            email: staff.email,
-            role: staff.role,
-            type: 'staff',
-            permissions: rolePerms,
-          }
-        });
+  success: true,
+  staff: {
+    id: staff.id,
+    name: staff.name,
+    email: staff.email,
+    role: roleKey,           // ✅ lowercase
+    type: 'staff',
+    permissions: rolePerms.map(p => p.toLowerCase()), // ✅ lowercase perms
+  }
+});
+
       }
     }
 
