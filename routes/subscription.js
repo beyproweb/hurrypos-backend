@@ -189,12 +189,13 @@ router.post("/login", async (req, res) => {
 
 
 // inside subscription.js
+// inside subscription.js
 router.get("/me", async (req, res) => {
   const email = req.query.email;
   if (!email) return res.status(400).json({ error: "Missing email" });
 
   try {
-    // 🔹 First check USERS table
+    // 🔹 USERS table (Owner/Admin)
     const userResult = await pool.query(
       `SELECT id, email, full_name, subscription_plan, role, business_name
        FROM users WHERE email = $1`,
@@ -203,12 +204,13 @@ router.get("/me", async (req, res) => {
 
     if (userResult.rowCount > 0) {
       const user = userResult.rows[0];
+      const role = (user.role || "").toLowerCase(); // normalize role
 
       // Fetch permissions from settings.users JSONB
       const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
       let perms = [];
       if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
-        perms = settingsRes.rows[0].users.roles?.[user.role] || [];
+        perms = settingsRes.rows[0].users.roles?.[role] || [];
       }
 
       return res.json({
@@ -218,14 +220,14 @@ router.get("/me", async (req, res) => {
           email: user.email,
           businessName: user.business_name,
           subscriptionPlan: user.subscription_plan,
-          role: user.role,
+          role, // normalized
           type: "user",
           permissions: perms,
         },
       });
     }
 
-    // 🔹 Then check STAFF table
+    // 🔹 STAFF table
     const staffResult = await pool.query(
       `SELECT id, name, email, role FROM staff WHERE email = $1`,
       [email]
@@ -233,12 +235,13 @@ router.get("/me", async (req, res) => {
 
     if (staffResult.rowCount > 0) {
       const staff = staffResult.rows[0];
+      const role = (staff.role || "").toLowerCase(); // normalize role
 
       // Fetch permissions from settings.users JSONB
       const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
       let perms = [];
       if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
-        perms = settingsRes.rows[0].users.roles?.[staff.role] || [];
+        perms = settingsRes.rows[0].users.roles?.[role] || [];
       }
 
       return res.json({
@@ -246,7 +249,7 @@ router.get("/me", async (req, res) => {
           id: staff.id,
           name: staff.name,
           email: staff.email,
-          role: staff.role,
+          role, // normalized
           type: "staff",
           permissions: perms,
         },
