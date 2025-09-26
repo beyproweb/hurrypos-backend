@@ -246,6 +246,47 @@ router.post("/qr-menu-disabled", async (req, res) => {
   }
 });
 
+// ✅ Update role permissions
+router.post("/roles", async (req, res) => {
+  const { role, permissions } = req.body;
+
+  if (!role || !Array.isArray(permissions)) {
+    return res.status(400).json({ error: "Role and permissions required" });
+  }
+
+  const roleKey = role.toLowerCase();
+
+  try {
+    const result = await pool.query("SELECT users FROM settings LIMIT 1");
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Settings not found" });
+    }
+
+    let users = result.rows[0].users || { roles: {} };
+
+    // Ensure JSON object
+    if (typeof users === "string") {
+      try {
+        users = JSON.parse(users);
+      } catch {
+        users = { roles: {} };
+      }
+    }
+
+    // Normalize role keys & permission strings
+    users.roles = users.roles || {};
+    users.roles[roleKey] = permissions.map((p) => p.toLowerCase());
+
+    await pool.query("UPDATE settings SET users = $1::json WHERE key = 'global'", [
+      JSON.stringify(users),
+    ]);
+
+    res.json({ success: true, roles: users.roles });
+  } catch (err) {
+    console.error("❌ Failed to update role permissions:", err);
+    res.status(500).json({ error: "Failed to update role permissions" });
+  }
+});
 
 
 
