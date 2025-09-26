@@ -296,45 +296,90 @@ const formatHours = (rawHours) => {
 
 // Get staff profile by ID
 // Get staff profile by ID
-router.get('/profile/:staffId', async (req, res) => {
-  const { staffId } = req.params;
-  console.log("📩 Incoming staff profile request:", staffId);
+// Unified login for both owners (users) and staff
+router.post("/login", async (req, res) => {
+  const { email, password } = req.body; // frontend still sends "password", but for staff we treat it as PIN
 
   try {
-    const result = await pool.query(
-      `SELECT
-        id,
-        name,
-        role,
-        phone,
-        address,
-        salary,
-        email,
-        created_at,
-        payment_type,
-        salary_model,
-        hourly_rate,
-        weekly_salary,
-        monthly_salary,
-        status
-      FROM staff
-      WHERE id = $1`,   // ✅ no status filter here
-      [staffId]
-    );
+    // 1. Try USERS table (admins/owners)
+    const userResult = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    const user = userResult.rows[0];
+    if (user) {
+      const isMatch = await bcrypt.compare(password, user.password_hash);
+      if (!isMatch) {
+        return res.status(401).json({ success: false, error: "Invalid credentials" });
+      }
 
-    if (result.rowCount === 0) {
-      console.log(`❌ Staff ID ${staffId} not found`);
-      return res.status(404).json({ status: 'error', message: 'Staff not found' });
+      // fetch role permissions
+      let userPerms = [];
+      try {
+        const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+        if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
+          const settings = settingsRes.rows[0].users;
+          userPerms = settings.roles?.[user.role] || [];
+        }
+      } catch (err) {
+        console.error("Failed to fetch user permissions:", err);
+      }
+
+      return res.json({
+        success: true,
+        user: {
+          id: user.id,
+          fullName: user.full_name,
+          email: user.email,
+          businessName: user.business_name,
+          subscriptionPlan: user.subscription_plan || null,
+          role: user.role,
+          type: "user",
+          permissions: userPerms,
+        },
+      });
     }
 
-    const profile = result.rows[0];
-    console.log('✅ Fetched staff profile:', profile);
-    res.json(profile);
+    // 2. Try STAFF table (cashiers, drivers, etc.)
+    const staffResult = await pool.query("SELECT * FROM staff WHERE email = $1", [email]);
+    const staff = staffResult.rows[0];
+    if (staff) {
+      // ✅ IMPORTANT: check PIN instead of password
+      if (staff.pin !== password) {
+        return res.status(401).json({ success: false, error: "Invalid PIN" });
+      }
+
+      // fetch role permissions
+      let rolePerms = [];
+      try {
+        const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+        if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
+          const settings = settingsRes.rows[0].users;
+          rolePerms = settings.roles?.[staff.role] || [];
+        }
+      } catch (err) {
+        console.error("Failed to fetch staff permissions:", err);
+      }
+
+      return res.json({
+        success: true,
+        staff: {
+          id: staff.id,
+          name: staff.name,
+          email: staff.email,
+          role: staff.role,
+          type: "staff",
+          permissions: rolePerms,
+        },
+      });
+    }
+
+    // ❌ No match in users or staff
+    return res.status(401).json({ success: false, error: "User or staff not found" });
+
   } catch (err) {
-    console.error('❌ Error fetching staff profile:', err);
-    res.status(500).json({ status: 'error', message: 'Error fetching profile' });
+    console.error("❌ Login error:", err);
+    return res.status(500).json({ success: false, error: "Server error: " + err.message });
   }
 });
+
 
 
 
