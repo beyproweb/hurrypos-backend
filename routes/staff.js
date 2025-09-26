@@ -433,6 +433,7 @@ router.put('/attendance/archive/:id', async (req, res) => {
 });
 
 // Add a new staff member
+// Add a new staff member
 router.post('/', async (req, res) => {
   const {
     id,
@@ -446,14 +447,15 @@ router.post('/', async (req, res) => {
     hourly_rate,
     weekly_salary,
     monthly_salary,
-    payment_type
+    payment_type,
+    pin // 👈 added
   } = req.body;
 
   logRequest('/api/staff', 'POST', req.body);
 
-  if (!id || !name || !role || !phone || !address || !salary || !email || !payment_type || !salary_model) {
+  if (!id || !name || !role || !phone || !address || !salary || !email || !payment_type || !salary_model || !pin) {
     console.error('❌ Missing fields');
-    return res.status(400).json({ status: 'error', message: 'All fields are required' });
+    return res.status(400).json({ status: 'error', message: 'All fields (including PIN) are required' });
   }
 
   try {
@@ -467,8 +469,8 @@ router.post('/', async (req, res) => {
       `INSERT INTO staff (
         id, name, role, phone, address, salary,
         email, payment_type, salary_model,
-        hourly_rate, weekly_salary, monthly_salary
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        hourly_rate, weekly_salary, monthly_salary, pin
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING *`,
       [
         id,
@@ -483,6 +485,7 @@ router.post('/', async (req, res) => {
         salary_model === 'hourly' ? hourly_rate : null,
         salary_model === 'fixed' && payment_type === 'weekly' ? weekly_salary : null,
         salary_model === 'fixed' && payment_type === 'monthly' ? monthly_salary : null,
+        pin // 👈 store PIN
       ]
     );
 
@@ -510,12 +513,12 @@ router.put('/:id', async (req, res) => {
     hourly_rate,
     weekly_salary,
     monthly_salary,
-    avatar // ✅ Include avatar
+    avatar,
+    pin // 👈 added
   } = req.body;
 
   logRequest(`/api/staff/${id}`, 'PUT', req.body);
 
-  // Validation
   if (!name || !role || !phone || !address || !salary || !email || !salary_model) {
     console.error('❌ Missing fields');
     return res.status(400).json({ status: 'error', message: 'All fields are required' });
@@ -542,8 +545,8 @@ router.put('/:id', async (req, res) => {
     pushField("hourly_rate", salary_model === 'hourly' ? hourly_rate : null);
     pushField("weekly_salary", salary_model === 'fixed' && payment_type === 'weekly' ? weekly_salary : null);
     pushField("monthly_salary", salary_model === 'fixed' && payment_type === 'monthly' ? monthly_salary : null);
-
-    if (avatar !== undefined) pushField("avatar", avatar); // ✅ optional field
+    if (avatar !== undefined) pushField("avatar", avatar);
+    if (pin !== undefined) pushField("pin", pin); // 👈 allow updating PIN
 
     const query = `UPDATE staff SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`;
     values.push(id);
@@ -561,6 +564,7 @@ router.put('/:id', async (req, res) => {
     res.status(500).json({ status: 'error', message: 'Error updating staff' });
   }
 });
+
 
 
 // Fetch all staff schedules
