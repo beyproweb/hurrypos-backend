@@ -1384,6 +1384,7 @@ router.get('/drivers', async (req, res) => {
 
 
 
+// ----------------- LOGIN (Users + Staff) -----------------
 router.post("/login", async (req, res) => {
   const { email, password, pin } = req.body; // support both
 
@@ -1402,10 +1403,11 @@ router.post("/login", async (req, res) => {
           const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
           if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
             const settings = settingsRes.rows[0].users;
-            userPerms = settings.roles?.[user.role] || [];
+            const roleKey = user.role?.toLowerCase();
+            userPerms = settings.roles?.[roleKey] || [];
           }
         } catch (err) {
-          console.error('Failed to fetch user permissions:', err);
+          console.error("Failed to fetch user permissions:", err);
         }
         return res.json({
           success: true,
@@ -1415,10 +1417,10 @@ router.post("/login", async (req, res) => {
             email: user.email,
             businessName: user.business_name,
             subscriptionPlan: user.subscription_plan || null,
-            role: user.role,
-            type: 'user',
-            permissions: userPerms,
-          }
+            role: user.role?.toLowerCase(),
+            type: "user",
+            permissions: userPerms.map((p) => p.toLowerCase()),
+          },
         });
       }
     }
@@ -1430,37 +1432,40 @@ router.post("/login", async (req, res) => {
       const providedPin = pin || password; // support both, prefer pin
       if (staff.pin === providedPin) {
         let rolePerms = [];
+        let roleKey = staff.role?.toLowerCase(); // ✅ define in this scope
+
         try {
           const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
           if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
             const settings = settingsRes.rows[0].users;
-            const roleKey = staff.role?.toLowerCase();
-rolePerms = settings.roles?.[roleKey] || [];
-
+            rolePerms = settings.roles?.[roleKey] || [];
           }
         } catch (err) {
-          console.error('Failed to fetch staff permissions:', err);
+          console.error("Failed to fetch staff permissions:", err);
         }
-        return res.json({
-  success: true,
-  staff: {
-    id: staff.id,
-    name: staff.name,
-    email: staff.email,
-    role: roleKey,           // ✅ lowercase
-    type: 'staff',
-    permissions: rolePerms.map(p => p.toLowerCase()), // ✅ lowercase perms
-  }
-});
 
+        return res.json({
+          success: true,
+          staff: {
+            id: staff.id,
+            name: staff.name,
+            email: staff.email,
+            role: roleKey, // ✅ lowercase
+            type: "staff",
+            permissions: rolePerms.map((p) => p.toLowerCase()), // ✅ lowercase perms
+          },
+        });
       }
     }
 
-    return res.status(401).json({ success: false, error: "User or staff not found or incorrect credentials" });
-
+    return res
+      .status(401)
+      .json({ success: false, error: "User or staff not found or incorrect credentials" });
   } catch (err) {
     console.error("❌ Login error:", err);
-    return res.status(500).json({ success: false, error: "Server error: " + err.message });
+    return res
+      .status(500)
+      .json({ success: false, error: "Server error: " + err.message });
   }
 });
 
