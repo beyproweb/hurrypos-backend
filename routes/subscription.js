@@ -188,49 +188,78 @@ router.post("/login", async (req, res) => {
 });
 
 
-
+// inside subscription.js
 router.get("/me", async (req, res) => {
   const email = req.query.email;
   if (!email) return res.status(400).json({ error: "Missing email" });
 
-  // Try USERS table first
-  const userResult = await pool.query(
-    `SELECT id, email, full_name, subscription_plan, role FROM users WHERE email = $1`,
-    [email]
-  );
-  if (userResult.rowCount > 0) {
-    // ...existing user logic...
-    const user = userResult.rows[0];
-    // Fetch permissions from settings.users JSONB
-    const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
-    let perms = [];
-    if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
-      perms = settingsRes.rows[0].users.roles?.[user.role] || [];
-    }
-    user.permissions = perms;
-    return res.json({ user });
-  }
+  try {
+    // 🔹 First check USERS table
+    const userResult = await pool.query(
+      `SELECT id, email, full_name, subscription_plan, role, business_name
+       FROM users WHERE email = $1`,
+      [email]
+    );
 
-  // Try STAFF table!
-  const staffResult = await pool.query(
-    `SELECT id, name, email, role FROM staff WHERE email = $1`,
-    [email]
-  );
-  if (staffResult.rowCount > 0) {
-    const staff = staffResult.rows[0];
-    // Fetch permissions from settings.users JSONB
-    const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
-    let perms = [];
-    if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
-      perms = settingsRes.rows[0].users.roles?.[staff.role] || [];
-    }
-    staff.permissions = perms;
-    return res.json({ staff });
-  }
+    if (userResult.rowCount > 0) {
+      const user = userResult.rows[0];
 
-  // Not found
-  return res.status(404).json({ error: "User or staff not found" });
+      // Fetch permissions from settings.users JSONB
+      const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+      let perms = [];
+      if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
+        perms = settingsRes.rows[0].users.roles?.[user.role] || [];
+      }
+
+      return res.json({
+        user: {
+          id: user.id,
+          fullName: user.full_name,
+          email: user.email,
+          businessName: user.business_name,
+          subscriptionPlan: user.subscription_plan,
+          role: user.role,
+          type: "user",
+          permissions: perms,
+        },
+      });
+    }
+
+    // 🔹 Then check STAFF table
+    const staffResult = await pool.query(
+      `SELECT id, name, email, role FROM staff WHERE email = $1`,
+      [email]
+    );
+
+    if (staffResult.rowCount > 0) {
+      const staff = staffResult.rows[0];
+
+      // Fetch permissions from settings.users JSONB
+      const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+      let perms = [];
+      if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
+        perms = settingsRes.rows[0].users.roles?.[staff.role] || [];
+      }
+
+      return res.json({
+        staff: {
+          id: staff.id,
+          name: staff.name,
+          email: staff.email,
+          role: staff.role,
+          type: "staff",
+          permissions: perms,
+        },
+      });
+    }
+
+    return res.status(404).json({ error: "User or staff not found" });
+  } catch (err) {
+    console.error("❌ /me error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
 });
+
 
 
 
