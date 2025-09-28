@@ -1381,6 +1381,32 @@ router.get('/drivers', async (req, res) => {
 });
 
 
+// ✅ Update staff role
+router.put('/:id/role', async (req, res) => {
+  const { id } = req.params;
+  const { role } = req.body;
+
+  if (!role) {
+    return res.status(400).json({ status: 'error', message: 'Role is required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE staff SET role = $1 WHERE id = $2 RETURNING id, name, email, role`,
+      [role.toLowerCase(), id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ status: 'error', message: 'Staff not found' });
+    }
+
+    console.log(`✅ Updated role for staff ID ${id} → ${role.toLowerCase()}`);
+    res.json({ status: 'success', staff: result.rows[0] });
+  } catch (err) {
+    console.error('❌ Error updating staff role:', err);
+    res.status(500).json({ status: 'error', message: 'Failed to update staff role' });
+  }
+});
 
 
 
