@@ -4,7 +4,16 @@ const pool = require("../db");
 
 // optional: uncomment if you have a global logger
 // const { logRequest } = require("../utils/logger");
-
+// Tenant guard middleware
+router.use((req, res, next) => {
+  if (!req.user || !req.user.restaurant_id) {
+    return res.status(401).json({
+      status: "error",
+      message: "Unauthorized: tenant not identified",
+    });
+  }
+  next();
+});
 // simple safe logger fallback
 const log = (path, method, data) =>
   console.log(`🧾 ${method} ${path}`, data ? JSON.stringify(data) : "");
