@@ -1425,16 +1425,21 @@ router.post("/login", async (req, res) => {
       const isMatch = await bcrypt.compare(password, user.password_hash);
       if (isMatch) {
         let userPerms = [];
+        let roleKey = user.role?.toLowerCase() || "admin"; // ✅ fallback to admin
+
         try {
-          const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+          const settingsRes = await pool.query(
+            `SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1`,
+            [user.restaurant_id]
+          );
           if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
             const settings = settingsRes.rows[0].users;
-            const roleKey = user.role?.toLowerCase();
             userPerms = settings.roles?.[roleKey] || [];
           }
         } catch (err) {
           console.error("Failed to fetch user permissions:", err);
         }
+
         return res.json({
           success: true,
           user: {
@@ -1443,7 +1448,7 @@ router.post("/login", async (req, res) => {
             email: user.email,
             businessName: user.business_name,
             subscriptionPlan: user.subscription_plan || null,
-            role: user.role?.toLowerCase(),
+            role: roleKey, // ✅ always lowercase, fallback admin
             type: "user",
             permissions: userPerms.map((p) => p.toLowerCase()),
           },
@@ -1457,11 +1462,14 @@ router.post("/login", async (req, res) => {
     if (staff) {
       const providedPin = pin || password; // support both, prefer pin
       if (staff.pin === providedPin) {
+        let roleKey = staff.role?.toLowerCase() || "staff"; // ✅ fallback staff role
         let rolePerms = [];
-        let roleKey = staff.role?.toLowerCase(); // ✅ define in this scope
 
         try {
-          const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+          const settingsRes = await pool.query(
+            `SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1`,
+            [staff.restaurant_id]
+          );
           if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
             const settings = settingsRes.rows[0].users;
             rolePerms = settings.roles?.[roleKey] || [];
@@ -1476,9 +1484,9 @@ router.post("/login", async (req, res) => {
             id: staff.id,
             name: staff.name,
             email: staff.email,
-            role: roleKey, // ✅ lowercase
+            role: roleKey,
             type: "staff",
-            permissions: rolePerms.map((p) => p.toLowerCase()), // ✅ lowercase perms
+            permissions: rolePerms.map((p) => p.toLowerCase()),
           },
         });
       }
@@ -1494,6 +1502,7 @@ router.post("/login", async (req, res) => {
       .json({ success: false, error: "Server error: " + err.message });
   }
 });
+
 
 
 
