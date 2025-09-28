@@ -98,6 +98,8 @@ router.post("/subscribe", async (req, res) => {
 
 
 // POST /api/register
+// routes/subscription.js (excerpt)
+
 router.post("/register", async (req, res) => {
   const { email, password, fullName, businessName, plan } = req.body;
 
@@ -133,7 +135,7 @@ router.post("/register", async (req, res) => {
       `INSERT INTO restaurants (name, plan, billing_cycle, owner_id)
        VALUES ($1, $2, $3, $4)
        RETURNING id`,
-      [businessName || fullName + "'s Restaurant", plan, "monthly", userId]
+      [businessName || `${fullName}'s Restaurant`, plan, "monthly", userId]
     );
     const restaurantId = restRes.rows[0].id;
 
@@ -143,16 +145,39 @@ router.post("/register", async (req, res) => {
       [restaurantId, userId]
     );
 
-    // Insert default settings for this restaurant
+    // ✅ Insert default settings with admin role + all permissions
+    const defaultRoles = {
+      roles: {
+        admin: [
+          "dashboard",
+          "products",
+          "kitchen",
+          "suppliers",
+          "stock",
+          "production",
+          "tables",
+          "reports",
+          "staff",
+          "task",
+          "delivery",
+          "settings",
+          "settings-notifications",
+          "expenses",
+          "ingredient-prices",
+          "cash-register-history",
+          "integrations",
+        ],
+      },
+    };
+
     await client.query(
       `INSERT INTO settings (restaurant_id, users, notifications, appearance)
-       VALUES ($1, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)`,
-      [restaurantId]
+       VALUES ($1, $2::jsonb, '{}'::jsonb, '{}'::jsonb)`,
+      [restaurantId, JSON.stringify(defaultRoles)]
     );
 
     await client.query("COMMIT");
     res.json({ success: true, message: "Restaurant registered", restaurantId });
-
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Registration error:", err);
