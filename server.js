@@ -37,10 +37,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 // Serve downloadable Beypro Bridge binaries
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
-const auth = require("./middleware/auth");
 
-app.use(auth); // applies to all protected routes
-// 1) Always serve the latest bridge files (no cache)
 app.use(
   "/bridge",
   express.static(path.join(__dirname, "public/bridge"), {
@@ -147,6 +144,8 @@ app.use('/api/integrations/yemeksepeti', yemeksepetiRoutes);
 const categoryImagesRoutes = require("./routes/categoryImages");
 app.use("/api/category-images", categoryImagesRoutes);
 
+const auth = require("./middleware/auth");
+app.use(auth); // now protects everything below
 // ✅ Log requests
 app.use((req, res, next) => {
   console.log(`➡️ ${req.method} request to ${req.url}`);
