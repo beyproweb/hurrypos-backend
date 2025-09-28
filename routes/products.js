@@ -1,454 +1,405 @@
 const express = require("express");
 const router = express.Router();
-const { pool } = require("../db");
+const pool = require("../db");
 
-function normalizeUnit(u) {
-  if (!u) return "";
-  u = u.toLowerCase();
-  if (u === "pieces") return "piece";
-  if (u === "portion" || u === "portions") return "portion";
-  return u;
-}
+// optional: uncomment if you have a global logger
+// const { logRequest } = require("../utils/logger");
 
-function convertPrice(basePrice, supplierUnit, targetUnit) {
-  if (!basePrice || !supplierUnit || !targetUnit) return null;
-  supplierUnit = normalizeUnit(supplierUnit);
-  targetUnit = normalizeUnit(targetUnit);
+// simple safe logger fallback
+const log = (path, method, data) =>
+  console.log(`🧾 ${method} ${path}`, data ? JSON.stringify(data) : "");
 
-  if (supplierUnit === targetUnit) return basePrice;
+// ----------------- PRODUCTS -----------------
 
-  if (supplierUnit === "kg" && targetUnit === "g") return basePrice / 1000;
-  if (supplierUnit === "g" && targetUnit === "kg") return basePrice * 1000;
-
-  if (supplierUnit === "l" && targetUnit === "ml") return basePrice / 1000;
-  if (supplierUnit === "ml" && targetUnit === "l") return basePrice * 1000;
-
-  return null;
-}
-
-// GET /api/products - fetch all products
+// ✅ Fetch all products (tenant-safe)
 router.get("/", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  log("/api/products", "GET", { restaurantId });
+
   try {
-    const result = await pool.query("SELECT * FROM products ORDER BY name ASC");
-    const products = result.rows.map((product) => ({
-      ...product,
-      ingredients:
-        typeof product.ingredients === "string"
-          ? JSON.parse(product.ingredients)
-          : product.ingredients || [],
-      extras:
-        typeof product.extras === "string"
-          ? JSON.parse(product.extras)
-          : product.extras || [],
-      selectedExtrasGroup: (() => {
-        if (Array.isArray(product.selected_extras_group))
-          return product.selected_extras_group;
-        if (
-          typeof product.selected_extras_group === "string" &&
-          product.selected_extras_group.trim()
-        ) {
-          try {
-            return JSON.parse(product.selected_extras_group);
-          } catch {
-            return [];
-          }
-        }
-        return [];
-      })(),
-    }));
-    res.json(products);
-  } catch (err) {
-    console.error("❌ Error fetching products:", err);
-    res.status(500).json({ error: "Failed to fetch products" });
-  }
-});
-
-// GET /api/products/costs
-router.get("/costs", async (req, res) => {
-  try {
-    const productsRes = await pool.query("SELECT id, ingredients FROM products");
-    const pricesRes = await pool.query(`
-      SELECT x.name, x.unit, x.price_per_unit
-      FROM (
-        SELECT
-          h.ingredient_name AS name,
-          h.unit,
-          h.price AS price_per_unit,
-          ROW_NUMBER() OVER (
-            PARTITION BY h.ingredient_name, h.unit
-            ORDER BY h.changed_at DESC
-          ) AS rn
-        FROM ingredient_price_history h
-      ) x
-      WHERE x.rn = 1
-    `);
-    const prices = {};
-    pricesRes.rows.forEach((p) => {
-      prices[`${p.name}__${p.unit}`] = parseFloat(p.price_per_unit);
-    });
-
-    const costs = {};
-    productsRes.rows.forEach((prod) => {
-      let totalCost = 0;
-      let ingredientsArr = [];
-      if (Array.isArray(prod.ingredients)) {
-        ingredientsArr = prod.ingredients;
-      } else if (typeof prod.ingredients === "string") {
-        try {
-          ingredientsArr = JSON.parse(prod.ingredients);
-        } catch {
-          ingredientsArr = [];
-        }
-      }
-      ingredientsArr.forEach((ing) => {
-       if (!ing.ingredient || !ing.quantity || !ing.unit) return;
-        const candidates = Object.entries(prices).filter(([key]) =>
-          key.startsWith(`${ing.ingredient}__`)
-        );
-        for (const [key, basePrice] of candidates) {
-          const supplierUnit = key.split("__")[1];
-          const converted = convertPrice(basePrice, supplierUnit, ing.unit);
-          if (converted !== null) {
-            totalCost += parseFloat(ing.quantity) * converted;
-            break; // stop once we found a valid conversion
-          }
-        }
-      });
-      costs[prod.id] = totalCost;
-    });
-
-    res.json(costs);
-  } catch (err) {
-    console.error("❌ Failed to calculate product costs:", err);
-    res.status(500).json({ error: "Failed to calculate product costs" });
-  }
-});
-
-// GET /api/products/:id
-router.get("/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const result = await pool.query("SELECT * FROM products WHERE restaurant_id = $1 AND id = $1", [
-      id,
-    ]);
-    if (result.rows.length === 0)
-      return res.status(404).json({ error: "Product not found" });
-
-    const product = result.rows[0];
-    const mappedProduct = {
-      ...product,
-      ingredients:
-        typeof product.ingredients === "string"
-          ? JSON.parse(product.ingredients)
-          : product.ingredients || [],
-      extras:
-        typeof product.extras === "string"
-          ? JSON.parse(product.extras)
-          : product.extras || [],
-      selectedExtrasGroup: (() => {
-        if (Array.isArray(product.selected_extras_group))
-          return product.selected_extras_group;
-        if (
-          typeof product.selected_extras_group === "string" &&
-          product.selected_extras_group.trim()
-        ) {
-          try {
-            return JSON.parse(product.selected_extras_group);
-          } catch {
-            return [];
-          }
-        }
-        return [];
-      })(),
-    };
-
-    res.json(mappedProduct);
-  } catch (err) {
-    console.error("❌ Error fetching product:", err);
-    res.status(500).json({ error: "Failed to fetch product" });
-  }
-});
-
-// POST /api/products
-router.post("/", async (req, res) => {
-  try {
-    const {
-      name,
-      price,
-      category,
-      preparation_time,
-      description,
-      discount_type,
-      discount_value,
-      visible,
-      tags,
-      allergens,
-      promo_start,
-      promo_end,
-      image: image_url,
-      ingredients,
-      extras,
-      selectedExtrasGroup,
-    } = req.body;
-
-    let parsedIngredients = "[]";
-    let parsedExtras = "[]";
-    let parsedGroup = "[]";
-
-    try {
-      parsedIngredients = JSON.stringify(
-        Array.isArray(ingredients) ? ingredients : []
-      );
-    } catch {
-      return res.status(400).json({ error: "Invalid ingredients format" });
-    }
-
-    try {
-      parsedExtras = JSON.stringify(Array.isArray(extras) ? extras : []);
-    } catch {
-      return res.status(400).json({ error: "Invalid extras format" });
-    }
-
-    try {
-      parsedGroup = JSON.stringify(
-        Array.isArray(selectedExtrasGroup) ? selectedExtrasGroup : []
-      );
-    } catch {
-      return res
-        .status(400)
-        .json({ error: "Invalid selectedExtrasGroup format" });
-    }
-
     const result = await pool.query(
-      `INSERT INTO products (
-        name, price, category, preparation_time, description,
-        discount_type, discount_value, visible, tags, allergens,
-        promo_start, promo_end, image, ingredients, extras, selected_extras_group
-      ) VALUES (
-        $1, $2, $3, $4, $5,
-        $6, $7, $8, $9, $10,
-        $11, $12, $13, $14, $15, $16
-      ) RETURNING *`,
+      `
+      SELECT id, name, category, price, cost, image, stock, unit, description, status, created_at
+      FROM products
+      WHERE restaurant_id = $1
+      ORDER BY id DESC
+      `,
+      [restaurantId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Fetch products error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch products" });
+  }
+});
+
+// ✅ Fetch single product
+router.get("/:id", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, name, category, price, cost, image, stock, unit, description, status, created_at
+      FROM products
+      WHERE restaurant_id = $1 AND id = $2
+      `,
+      [restaurantId, id]
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ status: "error", message: "Product not found" });
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("❌ Fetch product error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch product" });
+  }
+});
+
+// ✅ Add new product
+router.post("/", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { name, category, price, cost, image, stock, unit, description, status = "active" } =
+    req.body;
+
+  if (!name || !price || !category)
+    return res
+      .status(400)
+      .json({ status: "error", message: "Name, price, and category are required" });
+
+  try {
+    const result = await pool.query(
+      `
+      INSERT INTO products (
+        restaurant_id, name, category, price, cost, image, stock, unit, description, status
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      RETURNING *
+      `,
       [
+        restaurantId,
         name,
-        parseFloat(price) || 0,
         category,
-        preparation_time ? parseInt(preparation_time) : null,
-        description,
-        discount_type || "none",
-        parseFloat(discount_value) || 0,
-        typeof visible === "boolean" ? visible : visible === "true",
-        tags,
-        allergens,
-        promo_start || null,
-        promo_end || null,
-        image_url,
-        parsedIngredients,
-        parsedExtras,
-        parsedGroup,
+        price,
+        cost || 0,
+        image || null,
+        stock || 0,
+        unit || "pcs",
+        description || "",
+        status,
       ]
     );
-
-    res.json(result.rows[0]);
+    res.json({ status: "success", message: "Product added", product: result.rows[0] });
   } catch (err) {
-    console.error("❌ Error creating product:", err);
-    res.status(500).json({ error: "Failed to create product" });
+    console.error("❌ Add product error:", err);
+    res.status(500).json({ status: "error", message: "Failed to add product" });
   }
 });
 
-// PUT /api/products/:id
-// PUT /api/products/:id
-// PUT /api/products/:id  — robust to TEXT vs JSON(B) vs INT[] schemas
+// ✅ Update product
 router.put("/:id", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
   const { id } = req.params;
-  const {
-    name,
-    price,
-    category,
-    preparation_time,
-    description,
-    discount_type,
-    discount_value,
-    visible,
-    tags,
-    allergens,
-    promo_start,
-    promo_end,
-    image,
-    ingredients,
-    extras,
-    selectedExtrasGroup,
-  } = req.body;
+  const updates = req.body;
 
-  // Normalize inputs
-  const safeNumber = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
-  const prepTime = preparation_time !== null && preparation_time !== undefined
-    ? (Number.isFinite(Number(preparation_time)) ? Number(preparation_time) : null)
-    : null;
+  const allowed = [
+    "name",
+    "category",
+    "price",
+    "cost",
+    "image",
+    "stock",
+    "unit",
+    "description",
+    "status",
+  ];
+  const fields = Object.keys(updates).filter((k) => allowed.includes(k));
+  if (fields.length === 0)
+    return res
+      .status(400)
+      .json({ status: "error", message: "No valid fields provided for update" });
 
-  const ingArr   = Array.isArray(ingredients) ? ingredients : [];
-  const extraArr = Array.isArray(extras) ? extras : [];
-  const groupArr = Array.isArray(selectedExtrasGroup)
-    ? selectedExtrasGroup.map(n => Number(n)).filter(n => Number.isFinite(n))
-    : [];
+  const setClause = fields.map((f, i) => `${f} = $${i + 3}`).join(", ");
+  const values = [restaurantId, id, ...fields.map((f) => updates[f])];
 
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
+    const result = await pool.query(
+      `UPDATE products SET ${setClause} WHERE restaurant_id=$1 AND id=$2 RETURNING *`,
+      values
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ status: "error", message: "Product not found" });
 
-    // Look up actual column types so we cast correctly
-    const typeRes = await client.query(
+    res.json({ status: "success", message: "Product updated", product: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Update product error:", err);
+    res.status(500).json({ status: "error", message: "Failed to update product" });
+  }
+});
+
+// ✅ Delete product
+router.delete("/:id", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      `DELETE FROM products WHERE restaurant_id=$1 AND id=$2 RETURNING id,name`,
+      [restaurantId, id]
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ status: "error", message: "Product not found" });
+
+    res.json({ status: "success", message: "Product deleted", product: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Delete product error:", err);
+    res.status(500).json({ status: "error", message: "Failed to delete product" });
+  }
+});
+
+// ✅ Bulk delete
+router.delete("/", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0)
+    return res
+      .status(400)
+      .json({ status: "error", message: "No product IDs provided for deletion" });
+
+  try {
+    const result = await pool.query(
+      `DELETE FROM products WHERE restaurant_id=$1 AND id=ANY($2::int[]) RETURNING id,name`,
+      [restaurantId, ids]
+    );
+    res.json({
+      status: "success",
+      message: `${result.rowCount} product(s) deleted`,
+      deleted: result.rows,
+    });
+  } catch (err) {
+    console.error("❌ Bulk delete error:", err);
+    res.status(500).json({ status: "error", message: "Failed to delete products" });
+  }
+});
+
+// ✅ Costs overview
+router.get("/costs", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  try {
+    const result = await pool.query(
       `
-      SELECT column_name, data_type, udt_name
-      FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = 'products'
-        AND column_name IN ('ingredients','extras','selected_extras_group')
+      SELECT
+        p.id, p.name, p.category, p.cost, p.price, p.stock, p.unit,
+        COALESCE(SUM(i.price * pi.quantity),0) AS ingredient_cost
+      FROM products p
+      LEFT JOIN product_ingredients pi
+        ON pi.product_id=p.id AND pi.restaurant_id=p.restaurant_id
+      LEFT JOIN ingredients i
+        ON i.id=pi.ingredient_id AND i.restaurant_id=p.restaurant_id
+      WHERE p.restaurant_id=$1
+      GROUP BY p.id,p.name,p.category,p.cost,p.price,p.stock,p.unit
+      ORDER BY p.category,p.name
+      `,
+      [restaurantId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Fetch cost error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch cost data" });
+  }
+});
+
+// ----------------- EXTRAS GROUPS -----------------
+
+// ✅ Get extras groups
+router.get("/extras-group", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  try {
+    const groups = await pool.query(
       `
+      SELECT id,name,required,max_selection,created_at
+      FROM extras_groups WHERE restaurant_id=$1 ORDER BY name
+      `,
+      [restaurantId]
+    );
+    if (groups.rowCount === 0) return res.json([]);
+
+    const ids = groups.rows.map((g) => g.id);
+    const items = await pool.query(
+      `
+      SELECT id,group_id,name,price
+      FROM extras_group_items
+      WHERE restaurant_id=$1 AND group_id=ANY($2::int[])
+      ORDER BY group_id,name
+      `,
+      [restaurantId, ids]
     );
 
-    const col = {};
-    for (const r of typeRes.rows) {
-      col[r.column_name] = { data_type: r.data_type, udt_name: r.udt_name };
-    }
-    const isJsonLike  = (c) => c && (c.data_type === "json" || c.data_type === "jsonb");
-    const isIntArray  = (c) => c && c.data_type === "ARRAY" && c.udt_name === "_int4"; // integer[]
-    const isTextLike  = (c) => c && (c.data_type === "text" || c.data_type.startsWith("character"));
-
-    // Build dynamic SET parts & values for the 3 tricky columns
-    const setParts = [
-      "name = $1",
-      "price = $2",
-      "category = $3",
-      "preparation_time = $4",
-      "description = $5",
-      "discount_type = $6",
-      "discount_value = $7",
-      "visible = $8",
-      "tags = $9",
-      "allergens = $10",
-      "promo_start = $11",
-      "promo_end = $12",
-      "image = $13",
-    ];
-    const vals = [
-      name,
-      safeNumber(price, 0),
-      category,
-      prepTime,
-      description,
-      discount_type || "none",
-      safeNumber(discount_value, 0),
-      typeof visible === "boolean" ? visible : visible === "true",
-      tags,
-      allergens,
-      promo_start || null,
-      promo_end || null,
-      image || null,
-    ];
-
-    // ingredients
-    if (isJsonLike(col.ingredients)) {
-      setParts.push(`ingredients = $${vals.length + 1}::jsonb`);
-      vals.push(JSON.stringify(ingArr));
-    } else {
-      // TEXT / VARCHAR fallback
-      setParts.push(`ingredients = $${vals.length + 1}`);
-      vals.push(JSON.stringify(ingArr));
+    const map = {};
+    for (const item of items.rows) {
+      if (!map[item.group_id]) map[item.group_id] = [];
+      map[item.group_id].push(item);
     }
 
-    // extras
-    if (isJsonLike(col.extras)) {
-      setParts.push(`extras = $${vals.length + 1}::jsonb`);
-      vals.push(JSON.stringify(extraArr));
-    } else {
-      // TEXT / VARCHAR fallback
-      setParts.push(`extras = $${vals.length + 1}`);
-      vals.push(JSON.stringify(extraArr));
-    }
-
-    // selected_extras_group
-    if (isIntArray(col.selected_extras_group)) {
-      setParts.push(`selected_extras_group = $${vals.length + 1}::int[]`);
-      vals.push(groupArr);
-    } else if (isJsonLike(col.selected_extras_group)) {
-      setParts.push(`selected_extras_group = $${vals.length + 1}::jsonb`);
-      vals.push(JSON.stringify(groupArr));
-    } else if (isTextLike(col.selected_extras_group)) {
-      setParts.push(`selected_extras_group = $${vals.length + 1}`);
-      vals.push(JSON.stringify(groupArr)); // store as JSON string in TEXT
-    } else {
-      // Safe default: store JSON string
-      setParts.push(`selected_extras_group = $${vals.length + 1}`);
-      vals.push(JSON.stringify(groupArr));
-    }
-
-    // WHERE id
-    const sql = `
-      UPDATE products
-      SET ${setParts.join(", ")}
-      WHERE restaurant_id = $1 AND id = $${vals.length + 1}
-      RETURNING *
-    `;
-    vals.push(id);
-
-    const result = await client.query(sql, vals);
-    await client.query("COMMIT");
-    res.json(result.rows[0]);
+    const data = groups.rows.map((g) => ({ ...g, items: map[g.id] || [] }));
+    res.json(data);
   } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("❌ Error updating product:", err);
-    res.status(500).json({ error: "Failed to update product" });
-  } finally {
-    client.release();
+    console.error("❌ Fetch extras groups error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch extras groups" });
   }
 });
 
+// ✅ Create extras group
+router.post("/extras-group", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { name, required = false, max_selection = 1, items = [] } = req.body;
+  if (!name)
+    return res.status(400).json({ status: "error", message: "Group name required" });
 
+  try {
+    const group = await pool.query(
+      `
+      INSERT INTO extras_groups (restaurant_id,name,required,max_selection)
+      VALUES ($1,$2,$3,$4)
+      RETURNING id,name,required,max_selection,created_at
+      `,
+      [restaurantId, name, required, max_selection]
+    );
 
-// DELETE /api/extras-groups/:groupId/items/:itemId
-router.delete("/:groupId/items/:itemId", async (req, res) => {
-  const { groupId, itemId } = req.params;
+    if (items.length > 0) {
+      await pool.query(
+        `
+        INSERT INTO extras_group_items (restaurant_id,group_id,name,price)
+        VALUES ${items
+          .map((_, i) => `($1,$2,$${i * 2 + 3},$${i * 2 + 4})`)
+          .join(", ")}
+        `,
+        [restaurantId, group.rows[0].id, ...items.flatMap((x) => [x.name, x.price || 0])]
+      );
+    }
+
+    res.json({ status: "success", message: "Extras group created", group: group.rows[0] });
+  } catch (err) {
+    console.error("❌ Create extras group error:", err);
+    res.status(500).json({ status: "error", message: "Failed to create extras group" });
+  }
+});
+
+// ✅ Update extras group
+router.put("/extras-group/:id", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { id } = req.params;
+  const { name, required, max_selection, items = [] } = req.body;
+
+  try {
+    const check = await pool.query(
+      `SELECT id FROM extras_groups WHERE restaurant_id=$1 AND id=$2`,
+      [restaurantId, id]
+    );
+    if (check.rowCount === 0)
+      return res
+        .status(404)
+        .json({ status: "error", message: "Extras group not found" });
+
+    await pool.query(
+      `
+      UPDATE extras_groups
+      SET name=$3, required=$4, max_selection=$5
+      WHERE restaurant_id=$1 AND id=$2
+      `,
+      [restaurantId, id, name, required, max_selection]
+    );
+
+    await pool.query(
+      `DELETE FROM extras_group_items WHERE restaurant_id=$1 AND group_id=$2`,
+      [restaurantId, id]
+    );
+
+    if (items.length > 0) {
+      await pool.query(
+        `
+        INSERT INTO extras_group_items (restaurant_id,group_id,name,price)
+        VALUES ${items
+          .map((_, i) => `($1,$2,$${i * 2 + 3},$${i * 2 + 4})`)
+          .join(", ")}
+        `,
+        [restaurantId, id, ...items.flatMap((x) => [x.name, x.price || 0])]
+      );
+    }
+
+    res.json({ status: "success", message: "Extras group updated" });
+  } catch (err) {
+    console.error("❌ Update extras group error:", err);
+    res.status(500).json({ status: "error", message: "Failed to update extras group" });
+  }
+});
+
+// ✅ Delete extras group
+router.delete("/extras-group/:id", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { id } = req.params;
   try {
     await pool.query(
-      "DELETE FROM extras_group_items WHERE group_id = $1 AND id = $2",
-      [groupId, itemId]
+      `DELETE FROM extras_group_items WHERE restaurant_id=$1 AND group_id=$2`,
+      [restaurantId, id]
     );
-    res.json({ success: true });
+    const del = await pool.query(
+      `DELETE FROM extras_groups WHERE restaurant_id=$1 AND id=$2 RETURNING id,name`,
+      [restaurantId, id]
+    );
+    if (del.rowCount === 0)
+      return res.status(404).json({ status: "error", message: "Group not found" });
+
+    res.json({ status: "success", message: "Extras group deleted", group: del.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: "Failed to delete extra item" });
+    console.error("❌ Delete extras group error:", err);
+    res.status(500).json({ status: "error", message: "Failed to delete extras group" });
   }
 });
 
-// DELETE /api/products/:id
-router.delete("/:id", async (req, res) => {
-  const { id } = req.params;
+// ----------------- CATEGORIES -----------------
+
+// ✅ Get categories
+router.get("/categories", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
   try {
-    await pool.query("DELETE FROM products WHERE restaurant_id = $1 AND id = $1", [id]);
-    res.json({ success: true });
+    const result = await pool.query(
+      `
+      SELECT DISTINCT category
+      FROM products
+      WHERE restaurant_id=$1 AND category IS NOT NULL AND TRIM(category)<>''
+      ORDER BY category
+      `,
+      [restaurantId]
+    );
+    res.json(result.rows.map((r) => r.category));
   } catch (err) {
-    console.error("❌ Error deleting product:", err);
-    res.status(500).json({ error: "Failed to delete product" });
+    console.error("❌ Fetch categories error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch categories" });
   }
 });
 
-// DELETE /api/products (all or by category)
-router.delete("/", async (req, res) => {
-  const { category } = req.query;
+// ✅ Add category
+router.post("/categories", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { category } = req.body;
+  if (!category || !category.trim())
+    return res.status(400).json({ status: "error", message: "Category required" });
+
   try {
-    if (category) {
-      await pool.query("DELETE FROM products WHERE category = $1", [category]);
-      return res.json({
-        success: true,
-        message: `Deleted products in category: ${category}`,
-      });
-    } else {
-      await pool.query("DELETE FROM products");
-      return res.json({ success: true, message: "Deleted all products" });
-    }
+    await pool.query(
+      `
+      INSERT INTO categories (restaurant_id,name)
+      VALUES ($1,$2)
+      ON CONFLICT (restaurant_id,name) DO NOTHING
+      `,
+      [restaurantId, category.trim()]
+    );
+    res.json({ status: "success", message: `Category "${category}" added` });
   } catch (err) {
-    console.error("❌ Error deleting products:", err);
-    res.status(500).json({ error: "Failed to delete products" });
+    console.error("❌ Add category error:", err);
+    res.status(500).json({ status: "error", message: "Failed to add category" });
   }
 });
 
