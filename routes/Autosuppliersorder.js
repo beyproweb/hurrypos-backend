@@ -69,7 +69,7 @@ router.post("/supplier-cart-items", async (req, res) => {
 
     // ✅ LIVE check critical status from DB
     const stockRes = await pool.query(
-      `SELECT quantity, critical_quantity FROM stock WHERE id = $1`,
+      `SELECT quantity, critical_quantity FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
       [stock_id]
     );
 
@@ -87,7 +87,7 @@ router.post("/supplier-cart-items", async (req, res) => {
     // ✅ Ensure cart exists and preserve existing scheduling info (DO NOT reset it!)
     // ✅ Ensure cart exists and preserve existing scheduling info
 const cartCheck = await pool.query(
-  `SELECT id FROM supplier_carts WHERE id = $1`,
+  `SELECT id FROM supplier_carts WHERE restaurant_id = $1 AND id = $1`,
   [cart_id]
 );
 if (cartCheck.rows.length === 0) {
@@ -96,7 +96,7 @@ if (cartCheck.rows.length === 0) {
 
 // ✅ Confirm cart without resetting existing scheduled fields
 await pool.query(
-  `UPDATE supplier_carts SET confirmed = true WHERE id = $1`,
+  `UPDATE supplier_carts SET confirmed = true WHERE restaurant_id = $1 AND id = $1`,
   [cart_id]
 );
 
@@ -132,7 +132,7 @@ router.put("/supplier-carts/:id/confirm", async (req, res) => {
       return res.status(400).json({ error: "Scheduled date/time is required." });
     }
 
-    const currentRes = await pool.query(`SELECT * FROM supplier_carts WHERE id = $1`, [id]);
+    const currentRes = await pool.query(`SELECT * FROM supplier_carts WHERE restaurant_id = $1 AND id = $1`, [id]);
     const current = currentRes.rows[0];
     if (!current) return res.status(404).json({ error: "Cart not found." });
 
@@ -160,7 +160,7 @@ router.put("/supplier-carts/:id/confirm", async (req, res) => {
            repeat_type = $2,
            repeat_days = $3,
            auto_confirm = $4
-       WHERE id = $5
+       WHERE restaurant_id = $1 AND id = $5
        RETURNING *`,
       [scheduled_at, updatedRepeatType, updatedRepeatDays, updatedAutoConfirm, id]
     );
@@ -216,7 +216,7 @@ router.post("/supplier-carts/:id/send", async (req, res) => {
       if (!item.stock_id || item.quantity <= 0) continue;
 
       const stockRes = await pool.query(
-        `SELECT quantity, name FROM stock WHERE id = $1`,
+        `SELECT quantity, name FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
         [item.stock_id]
       );
       const currentStock = stockRes.rows[0];
@@ -224,7 +224,7 @@ router.post("/supplier-carts/:id/send", async (req, res) => {
 
       // ✅ Reset flags
       await pool.query(
-        `UPDATE stock SET auto_added_to_cart = FALSE, last_auto_add_at = NULL WHERE id = $1`,
+        `UPDATE stock SET auto_added_to_cart = FALSE, last_auto_add_at = NULL WHERE restaurant_id = $1 AND id = $1`,
         [item.stock_id]
       );
 
@@ -232,7 +232,7 @@ router.post("/supplier-carts/:id/send", async (req, res) => {
     }
 
     // ✅ Archive cart
-    await pool.query(`UPDATE supplier_carts SET archived = true WHERE id = $1`, [id]);
+    await pool.query(`UPDATE supplier_carts SET archived = true WHERE restaurant_id = $1 AND id = $1`, [id]);
     console.log(`📦 Archived cart ${id} after send`);
 
     const orderMessage = `
@@ -279,7 +279,7 @@ router.get("/supplier-carts/items", async (req, res) => {
 
     if (cart_id && !isNaN(Number(cart_id))) {
       // Fetch by cart ID
-      const cartCheck = await pool.query(`SELECT * FROM supplier_carts WHERE id = $1`, [Number(cart_id)]);
+      const cartCheck = await pool.query(`SELECT * FROM supplier_carts WHERE restaurant_id = $1 AND id = $1`, [Number(cart_id)]);
       if (cartCheck.rows.length === 0) {
         return res.status(404).json({ error: "Cart not found." });
       }
@@ -330,7 +330,7 @@ router.patch("/stock/:id", async (req, res) => {
     const { id } = req.params;
     const { quantity, critical_quantity, reorder_quantity } = req.body;
 
-    const currentRes = await pool.query(`SELECT * FROM stock WHERE id = $1`, [id]);
+    const currentRes = await pool.query(`SELECT * FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`, [id]);
     const current = currentRes.rows[0];
 
     if (!current) return res.status(404).json({ error: "Stock not found." });
@@ -340,7 +340,7 @@ router.patch("/stock/:id", async (req, res) => {
        SET quantity = COALESCE($1, quantity),
            critical_quantity = COALESCE($2, critical_quantity),
            reorder_quantity = COALESCE($3, reorder_quantity)
-       WHERE id = $4
+       WHERE restaurant_id = $1 AND id = $4
        RETURNING *`,
       [quantity, critical_quantity, reorder_quantity, id]
     );
@@ -356,7 +356,7 @@ router.patch("/stock/:id", async (req, res) => {
         `UPDATE stock
          SET auto_added_to_cart = FALSE,
              last_auto_add_at = NULL
-         WHERE id = $1`,
+         WHERE restaurant_id = $1 AND id = $1`,
         [id]
       );
       updated.auto_added_to_cart = false;
@@ -373,7 +373,7 @@ router.patch("/stock/:id", async (req, res) => {
       await pool.query(
         `UPDATE stock
          SET last_auto_add_at = NULL
-         WHERE id = $1`,
+         WHERE restaurant_id = $1 AND id = $1`,
         [id]
       );
       updated.last_auto_add_at = null;
@@ -398,7 +398,7 @@ router.patch("/stock/:id/flag-auto-added", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `UPDATE stock SET last_auto_add_at = $1 WHERE id = $2 RETURNING *`,
+      `UPDATE stock SET last_auto_add_at = $1 WHERE restaurant_id = $1 AND id = $2 RETURNING *`,
       [last_auto_add_at, id]
     );
     res.json({ updated: result.rows[0] });
@@ -413,7 +413,7 @@ router.patch("/stock/:id/flag-auto-added", async (req, res) => {
 router.get("/stock/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query("SELECT * FROM stock WHERE id = $1", [id]);
+    const result = await pool.query("SELECT * FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1", [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Stock item not found." });
@@ -440,7 +440,7 @@ router.patch("/supplier-cart-items/:id", async (req, res) => {
     const updateRes = await pool.query(
       `UPDATE supplier_cart_items
        SET quantity = $1
-       WHERE id = $2
+       WHERE restaurant_id = $1 AND id = $2
        RETURNING *`,
       [quantity, id]
     );

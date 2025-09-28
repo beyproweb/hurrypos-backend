@@ -29,7 +29,7 @@ router.post("/payments/iyzico/checkout", async (req, res) => {
   if (!order_id) return res.status(400).json({ error: "order_id required" });
 
   try {
-    const { rows: orderRows } = await pool.query("SELECT * FROM orders WHERE id = $1", [order_id]);
+    const { rows: orderRows } = await pool.query("SELECT * FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1", [order_id]);
     if (!orderRows.length) return res.status(404).json({ error: "Order not found" });
     const order = orderRows[0];
 
@@ -148,7 +148,7 @@ router.post("/payments/iyzico/callback", async (req, res) => {
              SET payment_method = 'card',
                  is_paid = TRUE,
                  receipt_id = COALESCE(receipt_id, gen_random_uuid())
-           WHERE id = $1`,
+           WHERE restaurant_id = $1 AND id = $1`,
           [orderId]
         );
 
@@ -158,7 +158,7 @@ router.post("/payments/iyzico/callback", async (req, res) => {
             `INSERT INTO customer_cards
                (customer_phone, card_user_key, card_token, brand, last4, exp_month, exp_year)
              SELECT o.customer_phone, $2, $3, $4, $5, $6, $7
-             FROM orders o
+             FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 o
              WHERE o.id = $1
              ON CONFLICT DO NOTHING`,
             [orderId, cardUserKey, cardToken, cardBrand, last4, expMonth, expYear]

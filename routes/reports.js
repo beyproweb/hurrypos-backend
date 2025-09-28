@@ -76,7 +76,7 @@ router.get("/summary", async (req, res) => {
 
     const netSalesRes = await client.query(`
       SELECT COALESCE(SUM(total - p.discount_value), 0) AS net_sales
-      FROM orders o
+      FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 o
       JOIN order_items oi ON o.id = oi.order_id
       JOIN products p ON oi.product_id = p.id
       WHERE o.status IN ('paid', 'closed')
@@ -274,7 +274,7 @@ router.get("/profit-loss", async (req, res) => {
         SELECT
           ${groupByClause} AS group_date,
           COALESCE(SUM(o.total - p.discount_value), 0) AS profit
-        FROM orders o
+        FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 o
         LEFT JOIN order_items oi ON o.id = oi.order_id
         LEFT JOIN products p ON oi.product_id = p.id
         WHERE o.status IN ('paid', 'closed')
@@ -286,7 +286,7 @@ router.get("/profit-loss", async (req, res) => {
         SELECT
           TO_CHAR(t.delivery_date, ${dateFormat}) AS group_date,
           COALESCE(SUM(t.amount_paid), 0) AS loss
-        FROM transactions t
+        FROM transactions WHERE restaurant_id = $1 WHERE restaurant_id = $1 t
         WHERE t.ingredient = 'Payment'
           AND t.delivery_date >= $1::date
           AND t.delivery_date < ($2::date + INTERVAL '1 day')
@@ -791,7 +791,7 @@ const todayStr = istNow.toISOString().slice(0, 10);
     // Keep close logic unchanged (block if orders open or before shop close time)
     if (type === "close") {
       const openOrdersRes = await pool.query(`
-        SELECT COUNT(*) FROM orders WHERE status != 'closed'
+        SELECT COUNT(*) FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE status != 'closed'
       `);
       const openCount = parseInt(openOrdersRes.rows[0].count, 10);
       if (openCount > 0) {
@@ -924,7 +924,7 @@ router.get("/last-register-closes", async (req, res) => {
 router.delete("/expenses/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    await pool.query(`DELETE FROM expenses WHERE id = $1`, [id]);
+    await pool.query(`DELETE FROM expenses WHERE restaurant_id = $1 AND id = $1`, [id]);
     res.json({ success: true, message: "Expense deleted" });
   } catch (err) {
     console.error("❌ Failed to delete expense:", err);
@@ -942,7 +942,7 @@ router.post("/receipt-methods", async (req, res) => {
     if ((!receipt_id || receipt_id === 'null') && order_id) {
       // Generate a new UUID and update the order
       const { rows } = await pool.query(
-        "UPDATE orders SET receipt_id = gen_random_uuid() WHERE id = $1 RETURNING receipt_id",
+        "UPDATE orders SET receipt_id = gen_random_uuid() WHERE restaurant_id = $1 AND id = $1 RETURNING receipt_id",
         [order_id]
       );
       receipt_id = rows[0].receipt_id;
@@ -968,7 +968,7 @@ router.post("/receipt-methods", async (req, res) => {
       .filter(k => parseFloat(methods[k]) > 0)
       .join("+");
     const { rows: orderRows } = await pool.query(
-      `SELECT id, payment_method FROM orders WHERE receipt_id = $1`,
+      `SELECT id, payment_method FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE receipt_id = $1`,
       [receipt_id]
     );
     if (orderRows.length > 0) {
@@ -976,7 +976,7 @@ router.post("/receipt-methods", async (req, res) => {
       const oldMethod = orderRows[0].payment_method;
       if (oldMethod !== paymentMethodStr) {
         await pool.query(
-          `UPDATE orders SET payment_method = $1 WHERE id = $2`,
+          `UPDATE orders SET payment_method = $1 WHERE restaurant_id = $1 AND id = $2`,
           [paymentMethodStr, orderId]
         );
         await pool.query(
@@ -1004,7 +1004,7 @@ router.get("/supplier-cash-payments", async (req, res) => {
         t.created_at,
         s.name AS note,
         'supplier' AS type
-      FROM transactions t
+      FROM transactions WHERE restaurant_id = $1 WHERE restaurant_id = $1 t
       JOIN suppliers s ON t.supplier_id = s.id
       WHERE t.ingredient = 'Payment'
         AND LOWER(t.payment_method) = 'cash'

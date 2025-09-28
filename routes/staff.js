@@ -78,7 +78,7 @@ router.get('/', async (req, res) => {
 router.get('/roles', async (req, res) => {
   logRequest('/api/staff/roles', 'GET', {});
   try {
-    const result = await pool.query('SELECT DISTINCT role FROM staff ORDER BY role');
+    const result = await pool.query('SELECT DISTINCT role FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 ORDER BY role');
     const roles = result.rows.map((row) => row.role);
     console.log('✅ Fetched roles:', roles);
     res.json({ roles });
@@ -96,7 +96,7 @@ router.post('/checkin', async (req, res) => {
 
   try {
     // Validate if staff exists
-    const staffCheck = await pool.query('SELECT id FROM staff WHERE id = $1', [staffId]);
+    const staffCheck = await pool.query('SELECT id FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1', [staffId]);
     if (staffCheck.rowCount === 0) {
       console.error(`❌ Staff ID ${staffId} not found`);
       return res.status(404).json({ status: 'error', message: 'Staff ID not found' });
@@ -155,7 +155,7 @@ router.post('/checkin', async (req, res) => {
       await pool.query(
         `UPDATE attendance
          SET check_out_time = $1, duration_minutes = $2
-         WHERE id = $3`,
+         WHERE restaurant_id = $1 AND id = $3`,
         [checkOut, durationMinutes, session.id]
       );
 
@@ -252,7 +252,7 @@ router.put('/:id', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `UPDATE staff SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+      `UPDATE staff SET ${fields.join(', ')} WHERE restaurant_id = $1 AND id = $${idx} RETURNING *`,
       [...values, id]
     );
 
@@ -277,7 +277,7 @@ router.delete('/:id', async (req, res) => {
   logRequest(`/api/staff/${id}`, 'DELETE', { id });
 
   try {
-    await pool.query('UPDATE staff SET status = $1 WHERE id = $2', ['inactive', id]);
+    await pool.query('UPDATE staff SET status = $1 WHERE restaurant_id = $1 AND id = $2', ['inactive', id]);
     console.log(`📂 Archived staff ID: ${id}`);
     res.json({ status: 'success', message: 'Staff archived (inactive)' });
   } catch (err) {
@@ -311,7 +311,7 @@ router.put('/schedule/:id', async (req, res) => {
            salary = $5,
            salary_model = $6,
            hourly_rate = $7
-       WHERE id = $8
+       WHERE restaurant_id = $1 AND id = $8
        RETURNING *`,
       [shift_start, shift_end, status, days, salary, salary_model, hourly_rate, id]
     );
@@ -335,7 +335,7 @@ router.put('/attendance/archive/:id', async (req, res) => {
   const { id } = req.params;
 
   try {
-    await pool.query('UPDATE attendance SET status = $1 WHERE id = $2', ['archived', id]);
+    await pool.query('UPDATE attendance SET status = $1 WHERE restaurant_id = $1 AND id = $2', ['archived', id]);
     console.log(`📂 Successfully archived attendance record with ID: ${id}`);
     return res.json({ status: 'success', message: 'Staff archived from the list' });
   } catch (err) {
@@ -371,7 +371,7 @@ router.post('/', async (req, res) => {
   }
 
   try {
-    const existingStaff = await pool.query('SELECT * FROM staff WHERE id = $1', [id]);
+    const existingStaff = await pool.query('SELECT * FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1', [id]);
     if (existingStaff.rowCount > 0) {
       console.error(`❌ Staff ID ${id} already exists`);
       return res.status(409).json({ status: 'error', message: 'Staff ID already exists' });
@@ -460,7 +460,7 @@ router.put('/:id', async (req, res) => {
     if (avatar !== undefined) pushField("avatar", avatar);
     if (pin !== undefined) pushField("pin", pin); // 👈 allow updating PIN
 
-    const query = `UPDATE staff SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`;
+    const query = `UPDATE staff SET ${fields.join(', ')} WHERE restaurant_id = $1 AND id = $${idx} RETURNING *`;
     values.push(id);
 
     const result = await pool.query(query, values);
@@ -533,7 +533,7 @@ router.delete('/schedule/:id', async (req, res) => {
   logRequest(`/api/staff/schedule/${id}`, 'DELETE', { id });
 
   try {
-    const result = await pool.query('DELETE FROM staff_schedule WHERE id = $1 RETURNING *;', [id]);
+    const result = await pool.query('DELETE FROM staff_schedule WHERE restaurant_id = $1 AND id = $1 RETURNING *;', [id]);
     res.json({ status: 'success', message: 'Schedule deleted', schedule: result.rows[0] });
   } catch (err) {
     console.error('❌ Error deleting schedule:', err);
@@ -879,7 +879,7 @@ router.get('/:staffId/payroll', async (req, res) => {
     }
 
     const staffRes = await pool.query(
-      `SELECT salary, hourly_rate, salary_model, payment_type, weekly_salary, monthly_salary FROM staff WHERE id = $1`,
+      `SELECT salary, hourly_rate, salary_model, payment_type, weekly_salary, monthly_salary FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
       [staffId]
     );
     const staff = staffRes.rows[0];
@@ -1328,7 +1328,7 @@ router.post('/:staffId/payments', async (req, res) => {
 
     // 📧 Fetch staff details for receipt
     const staffRes = await pool.query(
-      `SELECT name, email, role FROM staff WHERE id = $1`,
+      `SELECT name, email, role FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
       [staffId]
     );
 
@@ -1371,7 +1371,7 @@ router.post('/:staffId/payments', async (req, res) => {
 router.get('/drivers', async (req, res) => {
   try {
     const result = await pool.query(
-  `SELECT id, name, phone FROM staff WHERE LOWER(role) = 'kurye' OR LOWER(role) = 'driver'`
+  `SELECT id, name, phone FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE LOWER(role) = 'kurye' OR LOWER(role) = 'driver'`
 );
     res.json(result.rows);
   } catch (err) {
@@ -1392,7 +1392,7 @@ router.put('/:id/role', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `UPDATE staff SET role = $1 WHERE id = $2 RETURNING id, name, email, role`,
+      `UPDATE staff SET role = $1 WHERE restaurant_id = $1 AND id = $2 RETURNING id, name, email, role`,
       [role.toLowerCase(), id]
     );
 
@@ -1457,7 +1457,7 @@ router.post("/login", async (req, res) => {
     }
 
     // 2. Try STAFF
-    const staffResult = await pool.query("SELECT * FROM staff WHERE email = $1", [email]);
+    const staffResult = await pool.query("SELECT * FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE email = $1", [email]);
     const staff = staffResult.rows[0];
     if (staff) {
       const providedPin = pin || password; // support both, prefer pin

@@ -66,7 +66,7 @@ router.patch('/customer-addresses/:addressId', async (req, res) => {
     await client.query("BEGIN");
     // Fetch address to get customer_id
     const { rows } = await client.query(
-      `SELECT customer_id FROM customer_addresses WHERE id = $1`, [addressId]
+      `SELECT customer_id FROM customer_addresses WHERE restaurant_id = $1 AND id = $1`, [addressId]
     );
     if (rows.length === 0) return res.status(404).json({ error: "Address not found" });
     const customerId = rows[0].customer_id;
@@ -84,7 +84,7 @@ router.patch('/customer-addresses/:addressId', async (req, res) => {
          SET label = COALESCE($1, label),
              address = COALESCE($2, address),
              is_default = COALESCE($3, is_default)
-         WHERE id = $4
+         WHERE restaurant_id = $1 AND id = $4
          RETURNING *`,
       [label, address, is_default, addressId]
     );
@@ -103,7 +103,7 @@ router.delete('/customer-addresses/:addressId', async (req, res) => {
   const { addressId } = req.params;
   try {
     await pool.query(
-      `DELETE FROM customer_addresses WHERE id = $1`, [addressId]
+      `DELETE FROM customer_addresses WHERE restaurant_id = $1 AND id = $1`, [addressId]
     );
     res.json({ success: true });
   } catch (err) {

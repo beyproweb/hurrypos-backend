@@ -30,7 +30,7 @@ router.post('/', async (req, res) => {
 // Remove a drink
 router.delete('/:id', async (req, res) => {
   try {
-    await pool.query('DELETE FROM drinks WHERE id = $1', [req.params.id]);
+    await pool.query('DELETE FROM drinks WHERE restaurant_id = $1 AND id = $1', [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete drink' });

@@ -8,7 +8,7 @@ module.exports = (io) => {
 // GET /stock - Returns all stock items + latest price per unit
 router.get("/", async (req, res) => {
   try {
-    const notifRes = await pool.query(`SELECT value FROM settings WHERE key = 'notifications'`);
+    const notifRes = await pool.query(`SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'notifications'`);
     let cooldownMinutes = 30;
     let stockAlertEnabled = true;
 
@@ -31,7 +31,7 @@ const result = await pool.query(`
    ORDER BY delivery_date DESC LIMIT 1),
   0
 ) AS price_per_unit
-  FROM stock s
+  FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 s
   LEFT JOIN suppliers sp ON s.supplier_id = sp.id
 LEFT JOIN LATERAL (
   SELECT price AS price_per_unit
@@ -67,7 +67,7 @@ LEFT JOIN LATERAL (
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query("SELECT * FROM stock WHERE id = $1", [id]);
+    const result = await pool.query("SELECT * FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1", [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Stock item not found." });
@@ -203,7 +203,7 @@ router.patch("/:id", async (req, res) => {
        SET quantity = COALESCE($1, quantity),
            critical_quantity = COALESCE($2, critical_quantity),
            reorder_quantity = COALESCE($3, reorder_quantity)
-       WHERE id = $4
+       WHERE restaurant_id = $1 AND id = $4
        RETURNING *`,
       [quantity, critical_quantity, reorder_quantity, id]
     );
@@ -250,7 +250,7 @@ router.patch("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const delRes = await pool.query("DELETE FROM stock WHERE id = $1 RETURNING *", [id]);
+    const delRes = await pool.query("DELETE FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1 RETURNING *", [id]);
     if (delRes.rows.length === 0) {
       return res.status(404).json({ error: "Stock item not found." });
     }
@@ -272,7 +272,7 @@ router.patch("/:id/flag-auto-added", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `UPDATE stock SET last_auto_add_at = $1 WHERE id = $2 RETURNING *`,
+      `UPDATE stock SET last_auto_add_at = $1 WHERE restaurant_id = $1 AND id = $2 RETURNING *`,
       [last_auto_add_at, id]
     );
     res.json({ updated: result.rows[0] });

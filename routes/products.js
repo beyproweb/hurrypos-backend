@@ -128,7 +128,7 @@ router.get("/costs", async (req, res) => {
 router.get("/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await pool.query("SELECT * FROM products WHERE id = $1", [
+    const result = await pool.query("SELECT * FROM products WHERE restaurant_id = $1 AND id = $1", [
       id,
     ]);
     if (result.rows.length === 0)
@@ -387,7 +387,7 @@ router.put("/:id", async (req, res) => {
     const sql = `
       UPDATE products
       SET ${setParts.join(", ")}
-      WHERE id = $${vals.length + 1}
+      WHERE restaurant_id = $1 AND id = $${vals.length + 1}
       RETURNING *
     `;
     vals.push(id);
@@ -424,7 +424,7 @@ router.delete("/:groupId/items/:itemId", async (req, res) => {
 router.delete("/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    await pool.query("DELETE FROM products WHERE id = $1", [id]);
+    await pool.query("DELETE FROM products WHERE restaurant_id = $1 AND id = $1", [id]);
     res.json({ success: true });
   } catch (err) {
     console.error("❌ Error deleting product:", err);

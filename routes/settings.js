@@ -182,14 +182,14 @@ router.post("/localization", async (req, res) => {
     await client.query("BEGIN");
 
     await client.query(
-      `INSERT INTO settings (key, value)
+      `INSERT INTO settings (restaurant_id, key, value)
        VALUES ('language', $1)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [language]
     );
 
     await client.query(
-      `INSERT INTO settings (key, value)
+      `INSERT INTO settings (restaurant_id, key, value)
        VALUES ('currency', $1)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [currency]
@@ -210,7 +210,7 @@ router.post("/localization", async (req, res) => {
 router.get("/qr-menu-disabled", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT value FROM settings WHERE key = 'qr-menu-disabled' LIMIT 1"
+      "SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'qr-menu-disabled' LIMIT 1"
     );
     // Try to parse value as JSON array, fallback to empty
     let disabled = [];
@@ -234,7 +234,7 @@ router.post("/qr-menu-disabled", async (req, res) => {
   const { disabled } = req.body; // expects an array of IDs
   try {
     await pool.query(
-      `INSERT INTO settings (key, value)
+      `INSERT INTO settings (restaurant_id, key, value)
        VALUES ('qr-menu-disabled', $1)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [JSON.stringify(Array.isArray(disabled) ? disabled : [])]
@@ -257,7 +257,7 @@ router.post("/roles", async (req, res) => {
   const roleKey = role.toLowerCase();
 
   try {
-    const result = await pool.query("SELECT users FROM settings LIMIT 1");
+    const result = await pool.query("SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1");
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "Settings not found" });
     }
@@ -277,7 +277,7 @@ router.post("/roles", async (req, res) => {
     users.roles = users.roles || {};
     users.roles[roleKey] = permissions.map((p) => p.toLowerCase());
 
-    await pool.query("UPDATE settings SET users = $1::json WHERE key = 'global'", [
+    await pool.query("UPDATE settings SET users = $1::json WHERE restaurant_id = $1 AND key = 'global'", [
       JSON.stringify(users),
     ]);
 
@@ -296,7 +296,7 @@ router.delete("/roles/:role", async (req, res) => {
   }
 
   try {
-    const result = await pool.query("SELECT users FROM settings WHERE key = 'global' LIMIT 1");
+    const result = await pool.query("SELECT users FROM settings WHERE restaurant_id = $1 AND key = 'global' LIMIT 1");
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "Settings not found" });
     }
@@ -313,7 +313,7 @@ if (!users.roles || !users.roles[role]) {
 
     delete users.roles[role]; // ❌ remove the role
 
-    await pool.query("UPDATE settings SET users = $1::json WHERE key = 'global'", [
+    await pool.query("UPDATE settings SET users = $1::json WHERE restaurant_id = $1 AND key = 'global'", [
       JSON.stringify(users),
     ]);
 
@@ -337,7 +337,7 @@ router.get("/:section", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT ${section} FROM settings WHERE key = 'global' LIMIT 1`
+      `SELECT ${section} FROM settings WHERE restaurant_id = $1 AND key = 'global' LIMIT 1`
     );
     const raw = result.rows?.[0]?.[section] || {};
 
@@ -420,7 +420,7 @@ router.post("/:section", async (req, res) => {
 
   try {
     await pool.query(
-      `UPDATE settings SET ${section} = $1::jsonb WHERE key = 'global'`,
+      `UPDATE settings SET ${section} = $1::jsonb WHERE restaurant_id = $1 AND key = 'global'`,
       [JSON.stringify(newData)]
     );
     res.json({ success: true });
