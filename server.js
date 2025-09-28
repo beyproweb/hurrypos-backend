@@ -3,13 +3,22 @@ const express = require('express');
 require('dotenv').config();
 const app = express();
 const pool = require('./db');
-const cors = require('cors');
+const cors = require("cors");
+
 app.use(cors({
-  origin: [process.env.FRONTEND_BASE, "https://pos.beypro.com", "http://localhost:5173"].filter(Boolean),
-  methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
+  origin: [
+    "https://www.beypro.com",
+    "https://pos.beypro.com",
+    "http://localhost:5173",
+    process.env.FRONTEND_BASE
+  ].filter(Boolean),
+  methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
   credentials: true,
-  allowedHeaders: "Origin,X-Requested-With,Content-Type,Accept,Authorization",
+  allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization"],
 }));
+
+// Important: handle preflight explicitly
+app.options("*", cors());
 
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
