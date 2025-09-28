@@ -176,6 +176,14 @@ router.post("/register", async (req, res) => {
       [restaurantId, JSON.stringify(defaultRoles)]
     );
 
+    // ✅ Insert a legacy global row for compatibility (key/value)
+    await client.query(
+      `INSERT INTO settings (restaurant_id, key, value)
+       VALUES ($1, 'global', '{}'::jsonb)
+       ON CONFLICT (restaurant_id, key) DO NOTHING`,
+      [restaurantId]
+    );
+
     await client.query("COMMIT");
     res.json({ success: true, message: "Restaurant registered", restaurantId });
   } catch (err) {
