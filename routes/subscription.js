@@ -99,35 +99,69 @@ router.post("/subscribe", async (req, res) => {
 
 // POST /api/register
 router.post("/register", async (req, res) => {
-  const { email, password, fullName, businessName, subscriptionPlan } = req.body;
+  const { email, password, fullName, businessName, plan } = req.body;
 
-  if (!email || !password || !fullName) {
+  if (!email || !password || !fullName || !plan) {
     return res.status(400).json({ success: false, error: "Missing required fields" });
   }
 
+  const client = await pool.connect();
   try {
+    await client.query("BEGIN");
+
     // Check if user already exists
-    const userCheck = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    const userCheck = await client.query("SELECT id FROM users WHERE email = $1", [email]);
     if (userCheck.rows.length > 0) {
+      await client.query("ROLLBACK");
       return res.status(409).json({ success: false, error: "User already exists" });
     }
 
-    // Hash the password
+    // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Insert new user
-    await pool.query(
+    // Insert user
+    const userRes = await client.query(
       `INSERT INTO users (email, full_name, password_hash, business_name, subscription_plan)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [email, fullName, passwordHash, businessName, subscriptionPlan]
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [email, fullName, passwordHash, businessName, plan]
+    );
+    const userId = userRes.rows[0].id;
+
+    // Insert restaurant
+    const restRes = await client.query(
+      `INSERT INTO restaurants (name, plan, billing_cycle, owner_id)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [businessName || fullName + "'s Restaurant", plan, "monthly", userId]
+    );
+    const restaurantId = restRes.rows[0].id;
+
+    // Update user with restaurant_id
+    await client.query(
+      `UPDATE users SET restaurant_id = $1 WHERE id = $2`,
+      [restaurantId, userId]
     );
 
-    return res.json({ success: true, message: "User registered" });
+    // Insert default settings for this restaurant
+    await client.query(
+      `INSERT INTO settings (restaurant_id, users, notifications, appearance)
+       VALUES ($1, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)`,
+      [restaurantId]
+    );
+
+    await client.query("COMMIT");
+    res.json({ success: true, message: "Restaurant registered", restaurantId });
+
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("❌ Registration error:", err);
-    return res.status(500).json({ success: false, error: "Registration failed" });
+    res.status(500).json({ success: false, error: "Registration failed" });
+  } finally {
+    client.release();
   }
 });
+
 
 router.use("/uploads", express.static(path.join(__dirname, 'uploads'))); // ✅ serve files
 
