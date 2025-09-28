@@ -288,6 +288,41 @@ router.post("/roles", async (req, res) => {
   }
 });
 
+// ✅ Delete role
+router.delete("/roles/:role", async (req, res) => {
+  const role = req.params.role?.toLowerCase();
+  if (!role) {
+    return res.status(400).json({ error: "Role is required" });
+  }
+
+  try {
+    const result = await pool.query("SELECT users FROM settings WHERE key = 'global' LIMIT 1");
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Settings not found" });
+    }
+
+    let users = result.rows[0].users;
+    if (typeof users === "string") {
+      users = JSON.parse(users);
+    }
+
+    if (!users.roles || !users.roles[role]) {
+      return res.status(404).json({ error: `Role '${role}' not found` });
+    }
+
+    delete users.roles[role]; // ❌ remove the role
+
+    await pool.query("UPDATE settings SET users = $1::json WHERE key = 'global'", [
+      JSON.stringify(users),
+    ]);
+
+    console.log(`🗑️ Deleted role '${role}'`);
+    res.json({ success: true, roles: users.roles });
+  } catch (err) {
+    console.error("❌ Failed to delete role:", err);
+    res.status(500).json({ error: "Failed to delete role" });
+  }
+});
 
 
 // ✅ GET /api/settings/:section
