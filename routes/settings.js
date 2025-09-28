@@ -306,9 +306,10 @@ router.delete("/roles/:role", async (req, res) => {
       users = JSON.parse(users);
     }
 
-    if (!users.roles || !users.roles[role]) {
-      return res.status(404).json({ error: `Role '${role}' not found` });
-    }
+if (!users.roles || !users.roles[role]) {
+   console.warn(`⚠️ Role '${role}' not found in DB. Available: ${Object.keys(users.roles)}`);
+   return res.status(404).json({ error: `Role '${role}' not found` });
+ }
 
     delete users.roles[role]; // ❌ remove the role
 
