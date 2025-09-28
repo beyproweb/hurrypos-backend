@@ -81,7 +81,7 @@ router.get("/expenses/types", async (req, res) => {
 router.delete("/expenses/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    await pool.query(`DELETE FROM expenses WHERE id = $1`, [id]);
+    await pool.query(`DELETE FROM expenses WHERE restaurant_id = $1 AND id = $1`, [id]);
     res.json({ success: true, message: "Expense deleted" });
   } catch (err) {
     console.error("❌ Failed to delete expense:", err);

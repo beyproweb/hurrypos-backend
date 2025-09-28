@@ -25,7 +25,7 @@ function startKitchenTimersJob() {
         await pool.query(
           `UPDATE kitchen_timers
            SET seconds_left = total_seconds, running = false, updated_at = NOW()
-           WHERE id = ANY($1::int[])`,
+           WHERE restaurant_id = $1 AND id = ANY($1::int[])`,
           [timerIds]
         );
       }

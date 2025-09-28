@@ -121,10 +121,10 @@ router.post("/register", async (req, res) => {
     // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Insert user
+    // ✅ Insert user with role = 'admin'
     const userRes = await client.query(
-      `INSERT INTO users (email, full_name, password_hash, business_name, subscription_plan)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO users (email, full_name, password_hash, business_name, subscription_plan, role)
+       VALUES ($1, $2, $3, $4, $5, 'admin')
        RETURNING id`,
       [email, fullName, passwordHash, businessName, plan]
     );
@@ -141,7 +141,7 @@ router.post("/register", async (req, res) => {
 
     // Update user with restaurant_id
     await client.query(
-      `UPDATE users SET restaurant_id = $1 WHERE id = $2`,
+      `UPDATE users SET restaurant_id = $1 WHERE restaurant_id = $1 AND id = $2`,
       [restaurantId, userId]
     );
 
@@ -171,14 +171,14 @@ router.post("/register", async (req, res) => {
     };
 
     await client.query(
-      `INSERT INTO settings (restaurant_id, users, notifications, appearance)
+      `INSERT INTO settings (restaurant_id, restaurant_id, users, notifications, appearance)
        VALUES ($1, $2::jsonb, '{}'::jsonb, '{}'::jsonb)`,
       [restaurantId, JSON.stringify(defaultRoles)]
     );
 
-    // ✅ Insert a legacy global row for compatibility (key/value)
+    // ✅ Insert a legacy global row for compatibility
     await client.query(
-      `INSERT INTO settings (restaurant_id, key, value)
+      `INSERT INTO settings (restaurant_id, restaurant_id, key, value)
        VALUES ($1, 'global', '{}'::jsonb)
        ON CONFLICT (restaurant_id, key) DO NOTHING`,
       [restaurantId]
@@ -194,6 +194,7 @@ router.post("/register", async (req, res) => {
     client.release();
   }
 });
+
 
 
 router.use("/uploads", express.static(path.join(__dirname, 'uploads'))); // ✅ serve files
@@ -230,7 +231,7 @@ router.post("/login", async (req, res) => {
     const activePlan = plan && plan !== "null" && plan !== "" ? plan : null;
 
     // 🔑 Resolve permissions for this role
-    const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+    const settingsRes = await pool.query(`SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1`);
     let perms = [];
     if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
       perms = settingsRes.rows[0].users.roles?.[user.role] || [];
@@ -274,7 +275,7 @@ router.get("/me", async (req, res) => {
       const role = (user.role || "").toLowerCase(); // normalize role
 
       // Fetch permissions from settings.users JSONB
-      const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+      const settingsRes = await pool.query(`SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1`);
       let perms = [];
       if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
         perms = settingsRes.rows[0].users.roles?.[role] || [];
@@ -296,7 +297,7 @@ router.get("/me", async (req, res) => {
 
     // 🔹 STAFF table
     const staffResult = await pool.query(
-      `SELECT id, name, email, role FROM staff WHERE email = $1`,
+      `SELECT id, name, email, role FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE email = $1`,
       [email]
     );
 
@@ -305,7 +306,7 @@ router.get("/me", async (req, res) => {
       const role = (staff.role || "").toLowerCase(); // normalize role
 
       // Fetch permissions from settings.users JSONB
-      const settingsRes = await pool.query(`SELECT users FROM settings LIMIT 1`);
+      const settingsRes = await pool.query(`SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1`);
       let perms = [];
       if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
         perms = settingsRes.rows[0].users.roles?.[role] || [];

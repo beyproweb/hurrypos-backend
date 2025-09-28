@@ -82,7 +82,7 @@ User said (in ${languageLabel}): "${message}"
     let assigned_to = null;
     if (assignedName) {
       const match = await pool.query(
-        `SELECT id FROM staff WHERE LOWER(unaccent(name)) = LOWER(unaccent($1)) LIMIT 1`,
+        `SELECT id FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE LOWER(unaccent(name)) = LOWER(unaccent($1)) LIMIT 1`,
         [assignedName]
       );
       assigned_to = match.rows[0]?.id || null;
@@ -157,7 +157,7 @@ router.post("/tasks", async (req, res) => {
   let assigned_to = null;
   if (assigned_to_name?.trim()) {
     const result = await pool.query(
-      `SELECT id FROM staff WHERE LOWER(unaccent(name)) = LOWER(unaccent($1)) LIMIT 1`,
+      `SELECT id FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE LOWER(unaccent(name)) = LOWER(unaccent($1)) LIMIT 1`,
       [assigned_to_name.trim()]
     );
     assigned_to = result.rows[0]?.id || null;
@@ -198,7 +198,7 @@ router.patch("/tasks/:id/start", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
-      `UPDATE tasks SET started_at = NOW(), status = 'in_progress' WHERE id = $1 RETURNING *`,
+      `UPDATE tasks SET started_at = NOW(), status = 'in_progress' WHERE restaurant_id = $1 AND id = $1 RETURNING *`,
       [id]
     );
     getIO(req)?.emit("task_updated", result.rows[0]);
@@ -214,7 +214,7 @@ router.patch("/tasks/:id/complete", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
-      `UPDATE tasks SET completed_at = NOW(), status = 'completed' WHERE id = $1 RETURNING *`,
+      `UPDATE tasks SET completed_at = NOW(), status = 'completed' WHERE restaurant_id = $1 AND id = $1 RETURNING *`,
       [id]
     );
     getIO(req)?.emit("task_updated", result.rows[0]);
@@ -277,7 +277,7 @@ router.put("/tasks/:id", async (req, res) => {
            due_at = $4,
            priority = $5,
            station = $6
-       WHERE id = $7
+       WHERE restaurant_id = $1 AND id = $7
        RETURNING *`,
       [title, description || "", assigned_to || null, due_at || null, priority || "medium", station || null, id]
     );

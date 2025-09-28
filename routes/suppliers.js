@@ -62,7 +62,7 @@ router.post("/transactions", upload.single("receipt"), async (req, res) => {
 
     // Find supplier
     const supplierRes = await pool.query(
-      "SELECT total_due, name FROM suppliers WHERE id = $1", [supplier_id]
+      "SELECT total_due, name FROM suppliers WHERE restaurant_id = $1 AND id = $1", [supplier_id]
     );
     let currentDue = supplierRes.rows.length > 0 ? parseFloat(supplierRes.rows[0].total_due) : 0;
     let supplierName = supplierRes.rows.length > 0 ? supplierRes.rows[0].name : "";
@@ -80,7 +80,7 @@ router.post("/transactions", upload.single("receipt"), async (req, res) => {
       [supplier_id, ingredient, quantity, unit, total_cost, amount_paid, newDue, payment_method, price_per_unit, receiptUrl]
     );
 
-    await pool.query(`UPDATE suppliers SET total_due = $1 WHERE id = $2`, [newDue, supplier_id]);
+    await pool.query(`UPDATE suppliers SET total_due = $1 WHERE restaurant_id = $1 AND id = $2`, [newDue, supplier_id]);
 
     // Stock update (if not Payment)
     if (ingredient !== "Payment") {
@@ -99,7 +99,7 @@ router.post("/transactions", upload.single("receipt"), async (req, res) => {
       const stockItem = stockUpsert.rows[0];
 
       if (stockItem.quantity > stockItem.critical_quantity && stockItem.auto_added_to_cart) {
-        await pool.query("UPDATE stock SET auto_added_to_cart = FALSE WHERE id = $1", [stockItem.id]);
+        await pool.query("UPDATE stock SET auto_added_to_cart = FALSE WHERE restaurant_id = $1 AND id = $1", [stockItem.id]);
       }
 
       const ppu = parseFloat(total_cost) / parseFloat(quantity);
@@ -211,7 +211,7 @@ router.get("/ingredients", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query("SELECT * FROM suppliers WHERE id = $1", [id]);
+    const result = await pool.query("SELECT * FROM suppliers WHERE restaurant_id = $1 AND id = $1", [id]);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Supplier not found." });
     }
@@ -230,7 +230,7 @@ router.put("/:id", async (req, res) => {
     const updateResult = await pool.query(
       `UPDATE suppliers
        SET name = $1, phone = $2, email = $3, address = $4, tax_number = $5, id_number = $6, notes = $7
-       WHERE id = $8 RETURNING *`,
+       WHERE restaurant_id = $1 AND id = $8 RETURNING *`,
       [name, phone, email, address, tax_number, id_number, notes, id]
     );
     if (updateResult.rows.length === 0) {
@@ -247,7 +247,7 @@ router.put("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    await pool.query("DELETE FROM suppliers WHERE id = $1", [id]);
+    await pool.query("DELETE FROM suppliers WHERE restaurant_id = $1 AND id = $1", [id]);
     res.status(200).json({ message: "Supplier deleted" });
   } catch (err) {
     console.error("❌ Error deleting supplier:", err);
@@ -280,8 +280,8 @@ router.get("/:id/transactions", async (req, res) => {
 router.delete("/:id/transactions", async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query("DELETE FROM transactions WHERE supplier_id = $1", [id]);
-    await pool.query("UPDATE suppliers SET total_due = 0 WHERE id = $1", [id]);
+    await pool.query("DELETE FROM transactions WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE supplier_id = $1", [id]);
+    await pool.query("UPDATE suppliers SET total_due = 0 WHERE restaurant_id = $1 AND id = $1", [id]);
     res.json({ message: "All transactions cleared." });
   } catch (error) {
     console.error("❌ Error clearing transactions:", error);
@@ -295,7 +295,7 @@ router.put("/:id/pay", async (req, res) => {
     const { id } = req.params;
     const { payment, payment_method } = req.body;
 
-    const supplierQuery = await pool.query("SELECT total_due FROM suppliers WHERE id = $1", [id]);
+    const supplierQuery = await pool.query("SELECT total_due FROM suppliers WHERE restaurant_id = $1 AND id = $1", [id]);
     if (supplierQuery.rows.length === 0) {
       return res.status(404).json({ error: "Supplier not found" });
     }
@@ -317,7 +317,7 @@ router.put("/:id/pay", async (req, res) => {
     await pool.query(
       `UPDATE suppliers
        SET total_due = $1
-       WHERE id = $2`,
+       WHERE restaurant_id = $1 AND id = $2`,
       [newDue, id]
     );
 

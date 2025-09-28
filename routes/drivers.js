@@ -17,17 +17,17 @@ router.patch("/orders/:id/driver-status", async (req, res) => {
   try {
     if (driver_status === "picked_up") {
       await pool.query(
-        `UPDATE orders SET driver_status = $1, picked_up_at = NOW() WHERE id = $2`,
+        `UPDATE orders SET driver_status = $1, picked_up_at = NOW() WHERE restaurant_id = $1 AND id = $2`,
         [driver_status, id]
       );
     } else if (driver_status === "delivered") {
       await pool.query(
-        `UPDATE orders SET driver_status = $1, delivered_at = NOW() WHERE id = $2`,
+        `UPDATE orders SET driver_status = $1, delivered_at = NOW() WHERE restaurant_id = $1 AND id = $2`,
         [driver_status, id]
       );
     } else {
       await pool.query(
-        `UPDATE orders SET driver_status = $1 WHERE id = $2`,
+        `UPDATE orders SET driver_status = $1 WHERE restaurant_id = $1 AND id = $2`,
         [driver_status, id]
       );
     }
@@ -45,7 +45,7 @@ router.post("/orders/:id/close", async (req, res) => {
   const { id } = req.params;
   try {
     await pool.query(
-      `UPDATE orders SET status = 'closed' WHERE id = $1`,
+      `UPDATE orders SET status = 'closed' WHERE restaurant_id = $1 AND id = $1`,
       [id]
     );
     res.json({ success: true });
@@ -89,7 +89,7 @@ router.post("/orders/:id/claim-driver", async (req, res) => {
     const result = await pool.query(
       `UPDATE orders
        SET driver_id = $1
-       WHERE id = $2 AND driver_id IS NULL
+       WHERE restaurant_id = $1 AND id = $2 AND driver_id IS NULL
        RETURNING *`,
       [driver_id, id]
     );

@@ -37,7 +37,7 @@ router.get("/", async (req, res) => {
 router.get("/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await pool.query("SELECT * FROM extras_groups WHERE id = $1", [id]);
+    const result = await pool.query("SELECT * FROM extras_groups WHERE restaurant_id = $1 AND id = $1", [id]);
     if (!result.rows.length) return res.status(404).json({ error: "Not found" });
     res.json(result.rows[0]);
   } catch (err) {
@@ -101,7 +101,7 @@ router.put("/:id", async (req, res) => {
     await client.query("BEGIN");
 
     await client.query(
-      "UPDATE extras_groups SET group_name = $1 WHERE id = $2",
+      "UPDATE extras_groups SET group_name = $1 WHERE restaurant_id = $1 AND id = $2",
       [group_name, id]
     );
 
@@ -140,7 +140,7 @@ router.delete("/:id", async (req, res) => {
   const { id } = req.params;
   try {
     await pool.query("DELETE FROM extras_group_items WHERE group_id = $1", [id]);
-    await pool.query("DELETE FROM extras_groups WHERE id = $1", [id]);
+    await pool.query("DELETE FROM extras_groups WHERE restaurant_id = $1 AND id = $1", [id]);
     res.json({ success: true });
   } catch (err) {
     console.error("❌ Error deleting group:", err.stack || err);

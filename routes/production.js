@@ -182,7 +182,7 @@ router.put('/recipes/:id', async (req, res) => {
     await client.query(
       `UPDATE recipes
        SET name = $1, emoji = $2, base_quantity = $3, output_unit = $4
-       WHERE id = $5`,
+       WHERE restaurant_id = $1 AND id = $5`,
       [name, emoji, base_quantity, output_unit, recipeId]
     );
 
@@ -261,7 +261,7 @@ router.get('/production-log/unstocked', async (req, res) => {
 router.delete('/recipes/:id', async (req, res) => {
   const recipeId = parseInt(req.params.id);
   try {
-    await pool.query(`DELETE FROM recipes WHERE id = $1`, [recipeId]);
+    await pool.query(`DELETE FROM recipes WHERE restaurant_id = $1 AND id = $1`, [recipeId]);
     res.status(200).json({ message: 'Recipe deleted.' });
   } catch (err) {
     console.error('❌ Failed to delete recipe:', err);

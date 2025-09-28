@@ -39,7 +39,7 @@ router.patch("/:id", async (req, res) => {
   if (!fields.length) return res.status(400).json({ error: "No valid fields to update." });
 
   values.push(id);
-  const sql = `UPDATE customers SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`;
+  const sql = `UPDATE customers SET ${fields.join(", ")} WHERE restaurant_id = $1 AND id = $${idx} RETURNING *`;
 
   try {
     const result = await pool.query(sql, values);

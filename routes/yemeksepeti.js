@@ -12,7 +12,7 @@ router.post('/orders', async (req, res) => {
 
     // Insert order into Beypro as 'packet' type
     // Fetch auto_confirm_orders from settings
-const settingsRes = await pool.query("SELECT integrations FROM settings WHERE key = 'global'");
+const settingsRes = await pool.query("SELECT integrations FROM settings WHERE restaurant_id = $1 AND key = 'global'");
 const integrations = settingsRes.rows?.[0]?.integrations || {};
 const autoConfirm = integrations.auto_confirm_orders === true;
 

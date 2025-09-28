@@ -138,13 +138,13 @@ router.put("/order-items/kitchen-status", async (req, res) => {
 
     // 1. Update kitchen_status for all items
     await client.query(
-      `UPDATE order_items SET kitchen_status = $1 WHERE id = ANY($2::int[])`,
+      `UPDATE order_items SET kitchen_status = $1 WHERE restaurant_id = $1 AND id = ANY($2::int[])`,
       [status, ids]
     );
 
     // 2. Find affected order IDs
     const { rows: itemOrders } = await client.query(
-      `SELECT DISTINCT order_id FROM order_items WHERE id = ANY($1::int[])`,
+      `SELECT DISTINCT order_id FROM order_items WHERE restaurant_id = $1 AND id = ANY($1::int[])`,
       [ids]
     );
     const orderIds = itemOrders.map((r) => r.order_id);
@@ -198,12 +198,12 @@ router.put("/order-items/kitchen-status", async (req, res) => {
           `UPDATE orders
            SET prep_started_at = COALESCE(prep_started_at, NOW()),
                estimated_ready_at = $1
-           WHERE id = $2`,
+           WHERE restaurant_id = $1 AND id = $2`,
           [estReadyAt, orderId]
         );
       } else {
         await client.query(
-          `UPDATE orders SET estimated_ready_at = NULL WHERE id = $1`,
+          `UPDATE orders SET estimated_ready_at = NULL WHERE restaurant_id = $1 AND id = $1`,
           [orderId]
         );
       }
@@ -212,7 +212,7 @@ router.put("/order-items/kitchen-status", async (req, res) => {
       // b) ALL DELIVERED
       if (statuses.length && statuses.every((s) => s === "delivered")) {
         await client.query(
-          `UPDATE orders SET kitchen_delivered_at = NOW() WHERE id = $1`,
+          `UPDATE orders SET kitchen_delivered_at = NOW() WHERE restaurant_id = $1 AND id = $1`,
           [orderId]
         );
         deliveredOrderIds.push(orderId);
@@ -259,7 +259,7 @@ router.patch("/orders/:id/status", async (req, res) => {
            total = COALESCE($2, total),
            payment_method = CASE WHEN $3 IS NOT NULL THEN $3 ELSE payment_method END,
            is_paid = CASE WHEN $1 = 'paid' THEN true ELSE is_paid END
-       WHERE id = $4
+       WHERE restaurant_id = $1 AND id = $4
        RETURNING *`,
       [status, total, payment_method, id]
     );
@@ -297,11 +297,11 @@ router.delete("/orders/dev-reset", async (req, res) => {
   try {
     await pool.query(`
       DELETE FROM order_items WHERE order_id IN (
-        SELECT id FROM orders WHERE status = 'paid' OR status = 'closed'
+        SELECT id FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE status = 'paid' OR status = 'closed'
       );
     `);
     await pool.query(`DELETE FROM sub_orders;`);
-    await pool.query(`DELETE FROM orders WHERE status = 'paid' OR status = 'closed';`);
+    await pool.query(`DELETE FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE status = 'paid' OR status = 'closed';`);
     res.json({ message: "🧹 Old orders deleted (paid/closed)" });
   } catch (err) {
     console.error("❌ Cleanup failed:", err);
@@ -337,7 +337,7 @@ router.post("/kitchen-timers", async (req, res) => {
           total_seconds = $3,
           running = $4,
           updated_at = NOW()
-         WHERE id = $5
+         WHERE restaurant_id = $1 AND id = $5
          RETURNING *`,
         [name, secondsLeft, total, running, id]
       );
@@ -374,7 +374,7 @@ router.get("/kitchen-timers", async (req, res) => {
 // --- DELETE a timer ---
 router.delete("/kitchen-timers/:id", async (req, res) => {
   try {
-    await pool.query(`DELETE FROM kitchen_timers WHERE id = $1`, [req.params.id]);
+    await pool.query(`DELETE FROM kitchen_timers WHERE restaurant_id = $1 AND id = $1`, [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     console.error("❌ Failed to delete kitchen timer:", err);
@@ -410,7 +410,7 @@ router.post("/kitchen/compile-settings", async (req, res) => {
            excluded_categories = $2,
            excluded_items = $3,
            updated_at = NOW()
-       WHERE id = 1`,
+       WHERE restaurant_id = $1 AND id = 1`,
       [
         JSON.stringify(excludedIngredients),
         JSON.stringify(excludedCategories),
