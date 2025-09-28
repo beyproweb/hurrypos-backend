@@ -36,8 +36,10 @@ const { sendEmail } = require("./utils/notifications"); // make sure this import
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 // Serve downloadable Beypro Bridge binaries
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
-const authMiddleware = require('./middleware/auth');
-app.use(authMiddleware);
+
+const auth = require("./middleware/auth");
+
+app.use(auth); // applies to all protected routes
 // 1) Always serve the latest bridge files (no cache)
 app.use(
   "/bridge",
