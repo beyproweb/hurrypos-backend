@@ -37,9 +37,9 @@ app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 // Serve downloadable Beypro Bridge binaries
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
-const auth = require("./middleware/auth");
+const auth = require("./auth");
 
-app.use(auth); // applies to all protected routes
+// applies to all protected routes
 // 1) Always serve the latest bridge files (no cache)
 app.use(
   "/bridge",
@@ -70,7 +70,7 @@ app.get("/installers/linux/*", (req, res) => {
 const taskRoutes = require("./routes/tasks");
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-
+app.use(auth);
 app.use("/api", taskRoutes);
 
 

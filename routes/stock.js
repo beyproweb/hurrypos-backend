@@ -2,8 +2,9 @@ module.exports = (io) => {
   const express = require('express');
   const router = express.Router();
   const { pool } = require("../db");
-  const { authenticateToken } = require("../middleware/auth");
-router.use(authenticateToken);
+const auth = require("../auth");
+router.use(auth);
+
 
 
   const { emitAlert, emitStockUpdate } = require('../utils/realtime');
