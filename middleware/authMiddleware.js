@@ -8,7 +8,6 @@ module.exports = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
 
-    // No token provided
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).json({
         status: "error",
@@ -19,7 +18,6 @@ module.exports = (req, res, next) => {
     const token = authHeader.split(" ")[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // Token valid but missing tenant info
     if (!decoded || !decoded.restaurant_id) {
       return res.status(401).json({
         status: "error",
@@ -27,7 +25,6 @@ module.exports = (req, res, next) => {
       });
     }
 
-    // Attach tenant user
     req.user = {
       id: decoded.id,
       name: decoded.name,
