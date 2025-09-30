@@ -1,47 +1,58 @@
-
-const express = require('express');
-require('dotenv').config();
+// server.js
+const express = require("express");
+require("dotenv").config();
 const app = express();
-const pool = require('./db');
+const pool = require("./db");
 const cors = require("cors");
 
-app.use(cors({
-  origin: [
-    "https://www.beypro.com",
-    "https://pos.beypro.com",
-    "http://localhost:5173",
-    process.env.FRONTEND_BASE
-  ].filter(Boolean),
-  methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
-  credentials: true,
-  allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization"],
-}));
+// ✅ CORS configuration (supports local + production)
+const allowedOrigins = [
+  "http://localhost:5173",      // local dev
+  "https://pos.beypro.com",     // production POS domain
+];
 
-// Important: handle preflight explicitly
-app.options("*", cors());
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // Allow requests with no origin (like mobile apps or curl)
+      if (!origin) return callback(null, true);
 
-const multer = require('multer');
-const { v4: uuidv4 } = require('uuid');
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      } else {
+        return callback(new Error("CORS not allowed for this origin: " + origin));
+      }
+    },
+    methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS", // ✅ include OPTIONS for preflight
+    credentials: true,
+    allowedHeaders: [
+      "Origin",
+      "X-Requested-With",
+      "Content-Type",
+      "Accept",
+      "Authorization",
+    ],
+  })
+);
 
+
+const multer = require("multer");
+const { v4: uuidv4 } = require("uuid");
 const Tesseract = require("tesseract.js");
 const path = require("path");
 const fs = require("fs");
 
-const http = require('http').createServer(app);
+const http = require("http").createServer(app);
 const { initSocket } = require("./utils/socket");
 const io = initSocket(http);
 app.set("io", io);
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY; // Store your key securely!
-const { sendEmail } = require("./utils/notifications"); // make sure this import exists
-app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
-// Serve downloadable Beypro Bridge binaries
-app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
-const auth = require("./middleware/auth");
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const { sendEmail } = require("./utils/notifications");
 
+app.use("/uploads", express.static(path.join(__dirname, "public", "uploads")));
 
-// applies to all protected routes
-// 1) Always serve the latest bridge files (no cache)
+// Beypro Bridge binaries
 app.use(
   "/bridge",
   express.static(path.join(__dirname, "public/bridge"), {
@@ -56,150 +67,88 @@ app.use(
   })
 );
 
-// 2) Safety net: if any old link hits /installers/*, redirect it to the right file
-app.get("/installers/windows/*", (req, res) => {
-  res.redirect(302, "/bridge/beypro-bridge-win-x64.zip");
-});
-app.get("/installers/macos/*", (req, res) => {
-  // we serve the x64 package; installer uses Rosetta automatically on M-series
-  res.redirect(302, "/bridge/beypro-bridge-mac-x64.tar.gz");
-});
-app.get("/installers/linux/*", (req, res) => {
-  res.redirect(302, "/bridge/beypro-bridge-linux-x64.tar.gz");
-});
+// Legacy installer redirects
+app.get("/installers/windows/*", (req, res) =>
+  res.redirect(302, "/bridge/beypro-bridge-win-x64.zip")
+);
+app.get("/installers/macos/*", (req, res) =>
+  res.redirect(302, "/bridge/beypro-bridge-mac-x64.tar.gz")
+);
+app.get("/installers/linux/*", (req, res) =>
+  res.redirect(302, "/bridge/beypro-bridge-linux-x64.tar.gz")
+);
 
-const taskRoutes = require("./routes/tasks");
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(auth);
-app.use("/api", taskRoutes);
 
+// ========== ROUTES ==========
+app.use("/api", require("./routes/tasks"));
 
-const dayjs = require("dayjs");
+const staffRoutes = require("./routes/staff");
+app.use("/api/staff", staffRoutes);
 
-
-
-const { fetchNewOrders, fetchOrderById } = require('./trendyol');
-const recentAlerts = new Map(); // key: stock.id or item.name, value: timestamp
-
-const {
-  emitOrderUpdate,
-  emitStockUpdate,
-  emitOrderConfirmed,
-  emitOrderDelivered,
-   emitAlert,// ✅ add this
-} = require('./utils/realtime');
-
-const staffRoutes = require('./routes/staff');
-const bcrypt = require("bcrypt");
-
-
-const uploadRouter = require("./routes/upload.js"); // ✅ correct path
+const uploadRouter = require("./routes/upload.js");
 app.use("/api/upload", uploadRouter);
 
 const { startKitchenTimersJob } = require("./routes/timerScheduler");
 startKitchenTimersJob();
 
-app.use('/api/stock', require('./routes/stock')(io));
+// Reports, Production, Notifications, Expenses
+app.use("/api/reports", require("./routes/reports"));
+app.use("/api/production", require("./routes/production"));
+app.use("/api/notifications", require("./routes/notifications"));
+app.use("/api", require("./routes/expenses"));
 
-// Mount the staff route with the correct base path
-app.use('/api/staff', staffRoutes);
-
-const reportsRoutes = require("./routes/reports");
-app.use("/api/reports", reportsRoutes);
-
-const productionRoutes = require('./routes/production');
-app.use('/api/production', productionRoutes);
-
-const notificationsRoutes = require("./routes/notifications");
-app.use("/api/notifications", notificationsRoutes);
-
-const expensesRoutes = require('./routes/expenses');
-app.use('/api', expensesRoutes);
-
-// Disable Iyzico routes if no API key configured
+// Iyzico (conditionally)
 if (process.env.IYZI_API_KEY && process.env.IYZI_SECRET) {
-  const iyzicoRoutes = require("./routes/iyzico");
-  app.use("/api", iyzicoRoutes);
+  app.use("/api", require("./routes/iyzico"));
 } else {
   console.log("⚠️ Iyzico not configured – skipping /api/iyzico routes");
 }
 
+// ========== AUTH ==========
+const authRoutes = require("./routes/auth");
+app.use("/api/auth", authRoutes); // public login/register
 
+const authMiddleware = require("./middleware/authMiddleware");
 
-const userSettingsRoutes = require("./routes/userSettings");
-app.use("/api/user-settings", userSettingsRoutes);
+// Settings, Printers
+app.use("/api/user-settings", require("./routes/userSettings"));
+app.use("/api/printer-settings", require("./routes/printer"));
 
+// Subscription (register/login)
+app.use("/api", require("./routes/subscription"));
 
-const printerRoutes = require('./routes/printer');
-app.use('/api/printer-settings', printerRoutes);
+// Other routes
+app.use("/api/drinks", require("./routes/drinks"));
+app.use("/api/integrations/yemeksepeti", require("./routes/yemeksepeti"));
+app.use("/api/category-images", require("./routes/categoryImages"));
+app.use("/api/settings", require("./routes/settings"));
+app.use("/api/extras-groups", require("./routes/extras-groups"));
+app.use("/api", require("./routes/Autosuppliersorder")(io));
+app.use("/api", require("./routes/kitchen"));
+app.use("/api/phoneorders", require("./routes/phoneorders"));
+app.use("/api/customerAddresses", require("./routes/customerAddresses"));
+app.use("/api/customers", require("./routes/customers"));
+app.use("/api/campaigns", require("./routes/campaigns"));
 
+// ========== PROTECTED ROUTES ==========
+app.use("/api/products", authMiddleware, require("./routes/products"));
+app.use("/api/stock", authMiddleware, require("./routes/stock")(io));
+app.use("/api/orders", authMiddleware, require("./routes/orders")(io));
+app.use("/api/drivers", authMiddleware, require("./routes/drivers")(io));
+app.use("/api/suppliers", authMiddleware, require("./routes/suppliers")(io));
+app.use(
+  "/api/ingredient-prices",
+  authMiddleware,
+  require("./routes/ingredient-prices")(io)
+);
 
-
-
-const subscriptionRoutes = require('./routes/subscription');
-app.use('/api', subscriptionRoutes);
-
-app.use('/api/drinks', require('./routes/drinks'));
-
-const yemeksepetiRoutes = require('./routes/yemeksepeti');
-app.use('/api/integrations/yemeksepeti', yemeksepetiRoutes);
-
-const categoryImagesRoutes = require("./routes/categoryImages");
-app.use("/api/category-images", categoryImagesRoutes);
-
-// ✅ Log requests
+// ========== UTIL ==========
 app.use((req, res, next) => {
   console.log(`➡️ ${req.method} request to ${req.url}`);
   next();
 });
-
-
-const settingsRoutes = require("./routes/settings");
-app.use("/api/settings", settingsRoutes);
-
-
-const productRoutes = require('./routes/products');
-app.use('/api/products', productRoutes);
-
-const extrasGroupRoutes = require("./routes/extras-groups");
-app.use("/api/extras-groups", extrasGroupRoutes);
-
-
-const autoSuppliersRouter = require("./routes/Autosuppliersorder"); // update path if needed
-app.use("/api", autoSuppliersRouter(io));
-
-
-// server.js
-
-
-
-const kitchen = require("./routes/kitchen"); // update path if needed
-app.use("/api", kitchen);
-// Safe parsing function for extras
-
-const phoneordersRoutes = require('./routes/phoneorders');
-app.use('/api', phoneordersRoutes);
-
-const customerAddressesRoutes = require("./routes/customerAddresses");
-app.use("/api", customerAddressesRoutes);
-
-const customerRoutes = require("./routes/customers");
-app.use("/api/customers", customerRoutes);
-
-const campaignsRoutes = require('./routes/campaigns');
-app.use('/api/campaigns', campaignsRoutes);
-
-
-// Routes initialization with `io`
-const ordersRouter = require("./routes/orders")(io); // <-- CRITICAL LINE
-app.use("/api/orders", ordersRouter);
-
-app.use('/api/drivers', require('./routes/drivers')(io));
-app.use('/api/suppliers', require('./routes/suppliers')(io));
-app.use('/api/ingredient-prices', require('./routes/ingredient-prices')(io));
-
-
 
 const safeParseExtras = (extras) => {
   try {
@@ -212,23 +161,16 @@ const safeParseExtras = (extras) => {
   }
 };
 
-
-
-// Error catcher middleware
+// Error catcher
 app.use((err, req, res, next) => {
   console.error("🔥 Express error handler:", err);
   res.status(500).json({ error: "Internal server error" });
 });
 
-
+// Start server
 const PORT = process.env.PORT || 5000;
 http.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend is running on port ${PORT} and accessible from LAN`);
 });
 
-
-
-
 module.exports = { app, pool };
-
-app.use('/bridge', express.static(path.join(__dirname, 'public', 'bridge')));

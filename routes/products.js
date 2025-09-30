@@ -1,9 +1,9 @@
 const express = require("express");
 const router = express.Router();
 const pool = require("../db");
-const { authenticateToken } = require("../middleware/auth");
-router.use(authenticateToken);
+const authMiddleware = require("../middleware/authMiddleware");
 
+router.use(authMiddleware);
 // optional: uncomment if you have a global logger
 // const { logRequest } = require("../utils/logger");
 // Tenant guard middleware
