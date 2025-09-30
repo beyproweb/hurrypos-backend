@@ -1,21 +1,22 @@
+// server.js
 const express = require("express");
 require("dotenv").config();
 const app = express();
 const pool = require("./db");
 const cors = require("cors");
 const path = require("path");
+const fs = require("fs");
 const http = require("http").createServer(app);
 const { initSocket } = require("./utils/socket");
 const io = initSocket(http);
 const { sendEmail } = require("./utils/notifications");
-const fs = require("fs");
 const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
 const Tesseract = require("tesseract.js");
 const dayjs = require("dayjs");
 const bcrypt = require("bcrypt");
 
-// ✅ CORS Configuration
+// ------------------  CORS CONFIG  ------------------
 app.use(
   cors({
     origin: [
@@ -35,11 +36,9 @@ app.use(
     ],
   })
 );
-
-// Handle CORS preflight
 app.options("*", cors());
 
-// ✅ Static file serving
+// ------------------  STATIC FILES  ------------------
 app.use("/uploads", express.static(path.join(__dirname, "public", "uploads")));
 app.use(
   "/bridge",
@@ -55,32 +54,32 @@ app.use(
   })
 );
 
-// ✅ Redirect old installer URLs
-app.get("/installers/windows/*", (req, res) => {
-  res.redirect(302, "/bridge/beypro-bridge-win-x64.zip");
-});
-app.get("/installers/macos/*", (req, res) => {
-  res.redirect(302, "/bridge/beypro-bridge-mac-x64.tar.gz");
-});
-app.get("/installers/linux/*", (req, res) => {
-  res.redirect(302, "/bridge/beypro-bridge-linux-x64.tar.gz");
-});
+// Redirect old installer paths
+app.get("/installers/windows/*", (req, res) =>
+  res.redirect(302, "/bridge/beypro-bridge-win-x64.zip")
+);
+app.get("/installers/macos/*", (req, res) =>
+  res.redirect(302, "/bridge/beypro-bridge-mac-x64.tar.gz")
+);
+app.get("/installers/linux/*", (req, res) =>
+  res.redirect(302, "/bridge/beypro-bridge-linux-x64.tar.gz")
+);
 
-// ✅ JSON body parsing
+// ------------------  CORE MIDDLEWARE  ------------------
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ✅ Log requests
+// Log requests
 app.use((req, res, next) => {
   console.log(`➡️ ${req.method} ${req.url}`);
   next();
 });
 
-// ✅ Initialize socket jobs
+// ------------------  CRON & JOBS  ------------------
 const { startKitchenTimersJob } = require("./routes/timerScheduler");
 startKitchenTimersJob();
 
-// ✅ Routes
+// ------------------  NORMAL ROUTES  ------------------
 app.use("/api/upload", require("./routes/upload"));
 app.use("/api/tasks", require("./routes/tasks"));
 app.use("/api/reports", require("./routes/reports"));
@@ -99,7 +98,7 @@ app.use("/api/staff", require("./routes/staff"));
 app.use("/api/settings", require("./routes/settings"));
 app.use("/api/subscription", require("./routes/subscription"));
 
-// ✅ Conditional integrations
+// Optional Iyzico Integration
 if (process.env.IYZI_API_KEY && process.env.IYZI_SECRET) {
   app.use("/api", require("./routes/iyzico"));
 } else {
@@ -107,11 +106,11 @@ if (process.env.IYZI_API_KEY && process.env.IYZI_SECRET) {
 }
 app.use("/api/integrations/yemeksepeti", require("./routes/yemeksepeti"));
 
-// ✅ Auth middleware (protects below routes)
+// ------------------  AUTH MIDDLEWARE  ------------------
 const auth = require("./middleware/auth");
-app.use(auth);
+app.use(auth); // Protect routes below this line
 
-// ✅ SOCKET-AWARE ROUTES (functions that receive io)
+// ------------------  SOCKET-AWARE ROUTES  ------------------
 app.use("/api/orders", require("./routes/orders")(io));
 app.use("/api/kitchen", require("./routes/kitchen")(io));
 app.use("/api/suppliers", require("./routes/suppliers")(io));
@@ -120,20 +119,11 @@ app.use("/api/stock", require("./routes/stock")(io));
 app.use("/api/drivers", require("./routes/drivers")(io));
 app.use("/api", require("./routes/Autosuppliersorder")(io));
 
-// ✅ Normal routes
+// ------------------  GENERAL ROUTES  ------------------
 app.use("/api/products", require("./routes/products"));
 app.use("/api/extras-groups", require("./routes/extras-groups"));
 
-// ✅ Realtime utilities
-const {
-  emitOrderUpdate,
-  emitStockUpdate,
-  emitOrderConfirmed,
-  emitOrderDelivered,
-  emitAlert,
-} = require("./utils/realtime");
-
-// ✅ Helper: Safe parse extras
+// ------------------  HELPERS  ------------------
 const safeParseExtras = (extras) => {
   try {
     if (Array.isArray(extras)) return extras;
@@ -145,17 +135,16 @@ const safeParseExtras = (extras) => {
   }
 };
 
-// ✅ Global error handler
+// ------------------  GLOBAL ERROR HANDLER  ------------------
 app.use((err, req, res, next) => {
   console.error("🔥 Express error handler:", err);
   res.status(500).json({ error: "Internal server error" });
 });
 
-// ✅ Start server
+// ------------------  SERVER STARTUP  ------------------
 const PORT = process.env.PORT || 5000;
 http.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Backend running on port ${PORT} and accessible via LAN`);
+  console.log(`✅ Beypro backend running on port ${PORT}`);
 });
 
-// ✅ Export for testing
 module.exports = { app, pool };
