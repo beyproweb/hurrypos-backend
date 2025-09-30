@@ -1,43 +1,46 @@
-
-const express = require('express');
-require('dotenv').config();
+const express = require("express");
+require("dotenv").config();
 const app = express();
-const pool = require('./db');
+const pool = require("./db");
 const cors = require("cors");
-
-app.use(cors({
-  origin: [
-    "https://www.beypro.com",
-    "https://pos.beypro.com",
-    "http://localhost:5173",
-    process.env.FRONTEND_BASE
-  ].filter(Boolean),
-  methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
-  credentials: true,
-  allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization"],
-}));
-
-// Important: handle preflight explicitly
-app.options("*", cors());
-
-const multer = require('multer');
-const { v4: uuidv4 } = require('uuid');
-
-const Tesseract = require("tesseract.js");
 const path = require("path");
-const fs = require("fs");
-
-const http = require('http').createServer(app);
+const http = require("http").createServer(app);
 const { initSocket } = require("./utils/socket");
 const io = initSocket(http);
-app.set("io", io);
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY; // Store your key securely!
-const { sendEmail } = require("./utils/notifications"); // make sure this import exists
-app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
-// Serve downloadable Beypro Bridge binaries
-app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
+const { sendEmail } = require("./utils/notifications");
+const fs = require("fs");
+const multer = require("multer");
+const { v4: uuidv4 } = require("uuid");
+const Tesseract = require("tesseract.js");
+const dayjs = require("dayjs");
+const bcrypt = require("bcrypt");
 
-// 1) Always serve the latest bridge files (no cache)
+// ✅ CORS Configuration
+app.use(
+  cors({
+    origin: [
+      "https://www.beypro.com",
+      "https://pos.beypro.com",
+      "http://localhost:5173",
+      process.env.FRONTEND_BASE,
+    ].filter(Boolean),
+    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+    credentials: true,
+    allowedHeaders: [
+      "Origin",
+      "X-Requested-With",
+      "Content-Type",
+      "Accept",
+      "Authorization",
+    ],
+  })
+);
+
+// Handle CORS preflight
+app.options("*", cors());
+
+// ✅ Static file serving
+app.use("/uploads", express.static(path.join(__dirname, "public", "uploads")));
 app.use(
   "/bridge",
   express.static(path.join(__dirname, "public/bridge"), {
@@ -52,153 +55,85 @@ app.use(
   })
 );
 
-// 2) Safety net: if any old link hits /installers/*, redirect it to the right file
+// ✅ Redirect old installer URLs
 app.get("/installers/windows/*", (req, res) => {
   res.redirect(302, "/bridge/beypro-bridge-win-x64.zip");
 });
 app.get("/installers/macos/*", (req, res) => {
-  // we serve the x64 package; installer uses Rosetta automatically on M-series
   res.redirect(302, "/bridge/beypro-bridge-mac-x64.tar.gz");
 });
 app.get("/installers/linux/*", (req, res) => {
   res.redirect(302, "/bridge/beypro-bridge-linux-x64.tar.gz");
 });
 
-const taskRoutes = require("./routes/tasks");
+// ✅ JSON body parsing
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-app.use("/api", taskRoutes);
+// ✅ Log requests
+app.use((req, res, next) => {
+  console.log(`➡️ ${req.method} ${req.url}`);
+  next();
+});
 
+// ✅ Initialize socket jobs
+const { startKitchenTimersJob } = require("./routes/timerScheduler");
+startKitchenTimersJob();
 
-const dayjs = require("dayjs");
+// ✅ Routes
+app.use("/api/upload", require("./routes/upload"));
+app.use("/api/tasks", require("./routes/tasks"));
+app.use("/api/reports", require("./routes/reports"));
+app.use("/api/production", require("./routes/production"));
+app.use("/api/notifications", require("./routes/notifications"));
+app.use("/api/expenses", require("./routes/expenses"));
+app.use("/api/user-settings", require("./routes/userSettings"));
+app.use("/api/printer-settings", require("./routes/printer"));
+app.use("/api/category-images", require("./routes/categoryImages"));
+app.use("/api/campaigns", require("./routes/campaigns"));
+app.use("/api/customers", require("./routes/customers"));
+app.use("/api/customer-addresses", require("./routes/customerAddresses"));
+app.use("/api/phoneorders", require("./routes/phoneorders"));
+app.use("/api/drinks", require("./routes/drinks"));
+app.use("/api/staff", require("./routes/staff"));
+app.use("/api/settings", require("./routes/settings"));
+app.use("/api/subscription", require("./routes/subscription"));
 
+// ✅ Conditional integrations
+if (process.env.IYZI_API_KEY && process.env.IYZI_SECRET) {
+  app.use("/api", require("./routes/iyzico"));
+} else {
+  console.log("⚠️ Iyzico not configured – skipping /api/iyzico routes");
+}
+app.use("/api/integrations/yemeksepeti", require("./routes/yemeksepeti"));
 
+// ✅ Auth middleware (protects below routes)
+const auth = require("./middleware/auth");
+app.use(auth);
 
-const { fetchNewOrders, fetchOrderById } = require('./trendyol');
-const recentAlerts = new Map(); // key: stock.id or item.name, value: timestamp
+// ✅ SOCKET-AWARE ROUTES (functions that receive io)
+app.use("/api/orders", require("./routes/orders")(io));
+app.use("/api/kitchen", require("./routes/kitchen")(io));
+app.use("/api/suppliers", require("./routes/suppliers")(io));
+app.use("/api/ingredient-prices", require("./routes/ingredient-prices")(io));
+app.use("/api/stock", require("./routes/stock")(io));
+app.use("/api/drivers", require("./routes/drivers")(io));
+app.use("/api", require("./routes/Autosuppliersorder")(io));
 
+// ✅ Normal routes
+app.use("/api/products", require("./routes/products"));
+app.use("/api/extras-groups", require("./routes/extras-groups"));
+
+// ✅ Realtime utilities
 const {
   emitOrderUpdate,
   emitStockUpdate,
   emitOrderConfirmed,
   emitOrderDelivered,
-   emitAlert,// ✅ add this
-} = require('./utils/realtime');
+  emitAlert,
+} = require("./utils/realtime");
 
-const staffRoutes = require('./routes/staff');
-const bcrypt = require("bcrypt");
-
-
-const uploadRouter = require("./routes/upload.js"); // ✅ correct path
-app.use("/api/upload", uploadRouter);
-
-const { startKitchenTimersJob } = require("./routes/timerScheduler");
-startKitchenTimersJob();
-
-app.use('/api/stock', require('./routes/stock')(io));
-
-// Mount the staff route with the correct base path
-app.use('/api/staff', staffRoutes);
-
-const reportsRoutes = require("./routes/reports");
-app.use("/api/reports", reportsRoutes);
-
-const productionRoutes = require('./routes/production');
-app.use('/api/production', productionRoutes);
-
-const notificationsRoutes = require("./routes/notifications");
-app.use("/api/notifications", notificationsRoutes);
-
-const expensesRoutes = require('./routes/expenses');
-app.use('/api', expensesRoutes);
-
-// Disable Iyzico routes if no API key configured
-if (process.env.IYZI_API_KEY && process.env.IYZI_SECRET) {
-  const iyzicoRoutes = require("./routes/iyzico");
-  app.use("/api", iyzicoRoutes);
-} else {
-  console.log("⚠️ Iyzico not configured – skipping /api/iyzico routes");
-}
-
-
-
-const userSettingsRoutes = require("./routes/userSettings");
-app.use("/api/user-settings", userSettingsRoutes);
-
-
-const printerRoutes = require('./routes/printer');
-app.use('/api/printer-settings', printerRoutes);
-
-
-
-
-const subscriptionRoutes = require('./routes/subscription');
-app.use('/api', subscriptionRoutes);
-
-app.use('/api/drinks', require('./routes/drinks'));
-
-const yemeksepetiRoutes = require('./routes/yemeksepeti');
-app.use('/api/integrations/yemeksepeti', yemeksepetiRoutes);
-
-const categoryImagesRoutes = require("./routes/categoryImages");
-app.use("/api/category-images", categoryImagesRoutes);
-
-const auth = require("./middleware/auth");
-app.use(auth); // now protects everything below
-// ✅ Log requests
-app.use((req, res, next) => {
-  console.log(`➡️ ${req.method} request to ${req.url}`);
-  next();
-});
-
-
-const settingsRoutes = require("./routes/settings");
-app.use("/api/settings", settingsRoutes);
-
-
-const productRoutes = require('./routes/products');
-app.use('/api/products', productRoutes);
-
-const extrasGroupRoutes = require("./routes/extras-groups");
-app.use("/api/extras-groups", extrasGroupRoutes);
-
-
-const autoSuppliersRouter = require("./routes/Autosuppliersorder"); // update path if needed
-app.use("/api", autoSuppliersRouter(io));
-
-
-// server.js
-
-
-
-const kitchen = require("./routes/kitchen"); // update path if needed
-app.use("/api", kitchen);
-// Safe parsing function for extras
-
-const phoneordersRoutes = require('./routes/phoneorders');
-app.use('/api', phoneordersRoutes);
-
-const customerAddressesRoutes = require("./routes/customerAddresses");
-app.use("/api", customerAddressesRoutes);
-
-const customerRoutes = require("./routes/customers");
-app.use("/api/customers", customerRoutes);
-
-const campaignsRoutes = require('./routes/campaigns');
-app.use('/api/campaigns', campaignsRoutes);
-
-
-// Routes initialization with `io`
-const ordersRouter = require("./routes/orders")(io); // <-- CRITICAL LINE
-app.use("/api/orders", ordersRouter);
-
-app.use('/api/drivers', require('./routes/drivers')(io));
-app.use('/api/suppliers', require('./routes/suppliers')(io));
-app.use('/api/ingredient-prices', require('./routes/ingredient-prices')(io));
-
-
-
+// ✅ Helper: Safe parse extras
 const safeParseExtras = (extras) => {
   try {
     if (Array.isArray(extras)) return extras;
@@ -210,23 +145,17 @@ const safeParseExtras = (extras) => {
   }
 };
 
-
-
-// Error catcher middleware
+// ✅ Global error handler
 app.use((err, req, res, next) => {
   console.error("🔥 Express error handler:", err);
   res.status(500).json({ error: "Internal server error" });
 });
 
-
+// ✅ Start server
 const PORT = process.env.PORT || 5000;
 http.listen(PORT, "0.0.0.0", () => {
-  console.log(`Backend is running on port ${PORT} and accessible from LAN`);
+  console.log(`✅ Backend running on port ${PORT} and accessible via LAN`);
 });
 
-
-
-
+// ✅ Export for testing
 module.exports = { app, pool };
-
-app.use('/bridge', express.static(path.join(__dirname, 'public', 'bridge')));
