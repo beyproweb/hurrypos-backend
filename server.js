@@ -5,25 +5,25 @@ const app = express();
 const pool = require("./db");
 const cors = require("cors");
 
-// ✅ CORS configuration (supports local + production)
+// server.js (top, before routes)
 const allowedOrigins = [
-  "http://localhost:5173",      // local dev
-  "https://pos.beypro.com",     // production POS domain
+  "http://localhost:5173",    // dev
+  "https://pos.beypro.com",
+   "https://hurrypos-frontend.onrender.com"// production
 ];
 
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow requests with no origin (like mobile apps or curl)
-      if (!origin) return callback(null, true);
-
+      if (!origin) return callback(null, true); // allow REST clients/curl
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       } else {
-        return callback(new Error("CORS not allowed for this origin: " + origin));
+        console.warn("❌ Blocked by CORS:", origin);
+        return callback(new Error("Not allowed by CORS"));
       }
     },
-    methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS", // ✅ include OPTIONS for preflight
+    methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS", // ✅ include OPTIONS
     credentials: true,
     allowedHeaders: [
       "Origin",
@@ -34,6 +34,10 @@ app.use(
     ],
   })
 );
+
+// ✅ This line is mandatory to answer preflight requests
+app.options("*", cors());
+
 
 
 const multer = require("multer");

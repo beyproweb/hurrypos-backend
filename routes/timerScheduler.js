@@ -5,43 +5,31 @@ const { getIO } = require("../utils/socket");
 function startKitchenTimersJob() {
   setInterval(async () => {
     try {
-      // 1. Decrement all running timers
-      const res = await pool.query(
-        `UPDATE kitchen_timers
-         SET seconds_left = seconds_left - 1, updated_at = NOW()
-         WHERE running = true AND seconds_left > 0
-         RETURNING *`
+      const { rows: restaurants } = await pool.query(
+        `SELECT DISTINCT restaurant_id FROM kitchen_timers`
       );
 
-      // 2. Find timers that just hit zero
-      const finishedTimersRes = await pool.query(
-        `SELECT * FROM kitchen_timers WHERE seconds_left <= 0 AND running = true`
-      );
-      const finishedTimers = finishedTimersRes.rows;
-
-      // 3. Reset those timers (back to total_seconds and paused)
-      if (finishedTimers.length > 0) {
-        const timerIds = finishedTimers.map(t => t.id);
-        await pool.query(
-          `UPDATE kitchen_timers
-           SET seconds_left = total_seconds, running = false, updated_at = NOW()
-           WHERE restaurant_id = $1 AND id = ANY($1::int[])`,
-          [timerIds]
+      for (const { restaurant_id } of restaurants) {
+        const { rows: timers } = await pool.query(
+          `SELECT id, restaurant_id, total_seconds, running,
+                  CASE
+                    WHEN running = true THEN
+                      GREATEST(total_seconds - EXTRACT(EPOCH FROM (NOW() - started_at))::INT, 0)
+                    ELSE
+                      seconds_left
+                  END AS seconds_left
+           FROM kitchen_timers
+           WHERE restaurant_id = $1
+           ORDER BY created_at ASC`,
+          [restaurant_id]
         );
-      }
 
-      // 4. Emit changes to all clients (optional: only if any timers changed)
-      if (res.rows.length > 0 || finishedTimers.length > 0) {
-        // Get fresh list of all timers
-        const { rows: allTimers } = await pool.query(
-          `SELECT * FROM kitchen_timers ORDER BY created_at ASC`
-        );
-        getIO().emit("kitchen_timers_update", allTimers); // socket event
+        getIO().to(`restaurant_${restaurant_id}`).emit("kitchen_timers_update", timers);
       }
     } catch (err) {
-      console.error("Kitchen timer tick job error:", err);
+      console.error("Kitchen timer tick job error:", err.message);
     }
-  }, 1000); // every second
+  }, 5000); // broadcast every 5s
 }
 
 module.exports = { startKitchenTimersJob };

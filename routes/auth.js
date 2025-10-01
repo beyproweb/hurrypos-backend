@@ -5,13 +5,13 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
 
-/**
- * 🔐 POST /api/auth/login
- * Supports both restaurant owners (users table) and staff accounts (staff table).
- * Returns JWT with tenant info (restaurant_id) for middleware authentication.
- */
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
+
+  console.log("🔑 Login Debug");
+  console.log("➡️ Incoming email:", email);
+  console.log("➡️ DB URL exists?", !!process.env.DATABASE_URL);
+  console.log("➡️ JWT_SECRET exists?", !!process.env.JWT_SECRET);
 
   if (!email || !password) {
     return res.status(400).json({
@@ -24,18 +24,21 @@ router.post("/login", async (req, res) => {
     let user;
     let source = null;
 
-    // 🧩 Try main 'users' table first
+    console.log("🛠️ Querying users table…");
     const userRes = await pool.query(
       "SELECT id, full_name AS name, email, password_hash AS password, restaurant_id, role FROM users WHERE email = $1 LIMIT 1",
       [email]
     );
+
     if (userRes.rows.length > 0) {
       user = userRes.rows[0];
       source = "users";
+      console.log("✅ Found user in users table:", user.email);
     }
 
-    // 🧩 If not found, fallback to 'staff' table
+    // fallback: staff table
     if (!user) {
+      console.log("🛠️ Querying staff table…");
       const staffRes = await pool.query(
         "SELECT id, name, email, password, restaurant_id, role FROM staff WHERE email = $1 LIMIT 1",
         [email]
@@ -43,18 +46,19 @@ router.post("/login", async (req, res) => {
       if (staffRes.rows.length > 0) {
         user = staffRes.rows[0];
         source = "staff";
+        console.log("✅ Found user in staff table:", user.email);
       }
     }
 
-    // 🚫 No user found
     if (!user) {
+      console.warn("❌ No user found for email:", email);
       return res.status(401).json({
         success: false,
         error: "User not found or invalid credentials",
       });
     }
 
-    // ✅ Compare passwords
+    // check password
     let passwordMatch = false;
     try {
       passwordMatch = await bcrypt.compare(password, user.password);
@@ -63,13 +67,14 @@ router.post("/login", async (req, res) => {
     }
 
     if (!passwordMatch) {
+      console.warn("❌ Invalid password for:", email);
       return res.status(401).json({
         success: false,
         error: "Invalid password",
       });
     }
 
-    // ✅ Generate JWT token
+    // create token
     const token = jwt.sign(
       {
         id: user.id,
@@ -97,7 +102,7 @@ router.post("/login", async (req, res) => {
       token,
     });
   } catch (err) {
-    console.error("❌ Login error:", err);
+    console.error("❌ Login error:", err.message, err.stack);
     res.status(500).json({
       success: false,
       error: "Internal server error during login",

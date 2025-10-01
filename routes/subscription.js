@@ -73,8 +73,9 @@ router.post("/register", async (req, res) => {
 });
 
 // ----------------- LOGIN -----------------
+// ----------------- LOGIN -----------------
 router.post("/login", async (req, res) => {
-console.log("🟢 /api/login hit:", req.body);
+  console.log("🟢 /api/login hit:", req.body);
 
   const { email, password } = req.body;
   try {
@@ -97,10 +98,18 @@ console.log("🟢 /api/login hit:", req.body);
       rolesJson = settingsRes.rows[0].users;
     }
 
+    // ✅ Normalize role to lowercase
     const roleKey = (user.role || "admin").toLowerCase();
-    const permissions = rolesJson.roles?.[roleKey] || [];
 
-    // Generate JWT (include tenant)
+    // ✅ Resolve permissions
+    let permissions = rolesJson.roles?.[roleKey] || [];
+
+    // ✅ Ensure admin is always superuser
+    if (roleKey === "admin") {
+      permissions = ["all"];
+    }
+
+    // ✅ Generate JWT (include tenant)
     const token = jwt.sign(
       {
         id: user.id,
@@ -112,6 +121,7 @@ console.log("🟢 /api/login hit:", req.body);
       { expiresIn: "7d" }
     );
 
+    // ✅ Always return normalized role + guaranteed permissions
     res.json({
       success: true,
       token,
@@ -132,12 +142,17 @@ console.log("🟢 /api/login hit:", req.body);
 });
 
 // ----------------- ME (verify token) -----------------
+// ----------------- ME (verify token) -----------------
 router.get("/me", async (req, res) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
-    if (!token) return res.status(401).json({ success: false, error: "Unauthorized" });
+    if (!token) {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    // Fetch user record
     const userRes = await pool.query(
       `SELECT id, full_name, email, role, restaurant_id, business_name
        FROM users
@@ -145,14 +160,44 @@ router.get("/me", async (req, res) => {
       [decoded.id]
     );
 
-    if (userRes.rowCount === 0)
+    if (userRes.rowCount === 0) {
       return res.status(404).json({ success: false, error: "User not found" });
+    }
 
-    res.json({ success: true, user: userRes.rows[0] });
+    const user = userRes.rows[0];
+    const roleKey = (user.role || "admin").toLowerCase();
+
+    // Fetch roles/permissions config from settings
+    let rolesJson = {};
+    const settingsRes = await pool.query(
+      `SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1`,
+      [user.restaurant_id]
+    );
+    if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
+      rolesJson = settingsRes.rows[0].users;
+    }
+
+    // Resolve permissions
+    let permissions = rolesJson.roles?.[roleKey] || [];
+
+    // ✅ Ensure admin is always superuser
+    if (roleKey === "admin") {
+      permissions = ["all"];
+    }
+
+    res.json({
+      success: true,
+      user: {
+        ...user,
+        role: roleKey,
+        permissions,
+      },
+    });
   } catch (err) {
     console.error("❌ /me route error:", err);
     res.status(401).json({ success: false, error: "Invalid token" });
   }
 });
+
 
 module.exports = router;

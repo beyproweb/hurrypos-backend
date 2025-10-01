@@ -23,6 +23,7 @@ const log = (path, method, data) =>
 // ----------------- PRODUCTS -----------------
 
 // ✅ Fetch all products (tenant-safe)
+// ✅ Fetch all products (tenant-safe)
 router.get("/", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   log("/api/products", "GET", { restaurantId });
@@ -30,7 +31,10 @@ router.get("/", async (req, res) => {
   try {
     const result = await pool.query(
       `
-      SELECT id, name, category, price, cost, image, stock, unit, description, status, created_at
+      SELECT id, name, category, price, preparation_time, description,
+             discount_type, discount_value, visible, tags, allergens,
+             promo_start, promo_end, image, image_url, ingredients, extras,
+             selected_extras_group, created_at
       FROM products
       WHERE restaurant_id = $1
       ORDER BY id DESC
@@ -43,6 +47,7 @@ router.get("/", async (req, res) => {
     res.status(500).json({ status: "error", message: "Failed to fetch products" });
   }
 });
+
 
 // ✅ Fetch single product
 router.get("/:id", async (req, res) => {
@@ -69,23 +74,50 @@ router.get("/:id", async (req, res) => {
 });
 
 // ✅ Add new product
+// ✅ Add new product
 router.post("/", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
-  const { name, category, price, cost, image, stock, unit, description, status = "active" } =
-    req.body;
+  const {
+    name,
+    category,
+    price,
+    preparation_time,
+    description,
+    discount_type,
+    discount_value,
+    visible,
+    tags,
+    allergens,
+    promo_start,
+    promo_end,
+    image,
+    image_url,
+    ingredients,
+    extras,
+    selected_extras_group, // frontend field
+  } = req.body;
 
-  if (!name || !price || !category)
-    return res
-      .status(400)
-      .json({ status: "error", message: "Name, price, and category are required" });
+  if (!name || !price || !category) {
+    return res.status(400).json({
+      status: "error",
+      message: "Name, price, and category are required",
+    });
+  }
+
+    // 👇 ADD THIS DEBUG LINE HERE
+  console.log("🛠️ Incoming product payload:", req.body);
 
   try {
     const result = await pool.query(
       `
       INSERT INTO products (
-        restaurant_id, name, category, price, cost, image, stock, unit, description, status
+        restaurant_id, name, category, price, preparation_time,
+        description, discount_type, discount_value, visible, tags, allergens,
+        promo_start, promo_end, image, image_url, ingredients, extras, selected_extras_group
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      VALUES ($1,$2,$3,$4,$5,
+              $6,$7,$8,$9,$10,$11,
+              $12,$13,$14,$15,$16,$17,$18)
       RETURNING *
       `,
       [
@@ -93,20 +125,35 @@ router.post("/", async (req, res) => {
         name,
         category,
         price,
-        cost || 0,
-        image || null,
-        stock || 0,
-        unit || "pcs",
+        preparation_time || null,
         description || "",
-        status,
+        discount_type || "none",
+        discount_value || 0,
+        visible !== false, // default true
+        tags || "",
+        allergens || "",
+        promo_start || null,
+        promo_end || null,
+        image || null,
+        image_url || null,
+        ingredients || [],
+        extras || [],
+        selected_extras_group || [], // ✅ mapped correctly now
       ]
     );
-    res.json({ status: "success", message: "Product added", product: result.rows[0] });
+
+    res.json({
+      status: "success",
+      message: "Product added",
+      product: result.rows[0],
+    });
   } catch (err) {
     console.error("❌ Add product error:", err);
     res.status(500).json({ status: "error", message: "Failed to add product" });
   }
 });
+
+
 
 // ✅ Update product
 router.put("/:id", async (req, res) => {
@@ -118,18 +165,26 @@ router.put("/:id", async (req, res) => {
     "name",
     "category",
     "price",
-    "cost",
-    "image",
-    "stock",
-    "unit",
+    "preparation_time",
     "description",
-    "status",
+    "discount_type",
+    "discount_value",
+    "visible",
+    "tags",
+    "allergens",
+    "promo_start",
+    "promo_end",
+    "image",
+    "image_url",
+    "ingredients",
+    "extras",
+    "selected_extras_group",
   ];
+
   const fields = Object.keys(updates).filter((k) => allowed.includes(k));
-  if (fields.length === 0)
-    return res
-      .status(400)
-      .json({ status: "error", message: "No valid fields provided for update" });
+  if (fields.length === 0) {
+    return res.status(400).json({ status: "error", message: "No valid fields provided for update" });
+  }
 
   const setClause = fields.map((f, i) => `${f} = $${i + 3}`).join(", ");
   const values = [restaurantId, id, ...fields.map((f) => updates[f])];
@@ -139,8 +194,9 @@ router.put("/:id", async (req, res) => {
       `UPDATE products SET ${setClause} WHERE restaurant_id=$1 AND id=$2 RETURNING *`,
       values
     );
-    if (result.rowCount === 0)
+    if (result.rowCount === 0) {
       return res.status(404).json({ status: "error", message: "Product not found" });
+    }
 
     res.json({ status: "success", message: "Product updated", product: result.rows[0] });
   } catch (err) {
@@ -148,6 +204,7 @@ router.put("/:id", async (req, res) => {
     res.status(500).json({ status: "error", message: "Failed to update product" });
   }
 });
+
 
 // ✅ Delete product
 router.delete("/:id", async (req, res) => {
