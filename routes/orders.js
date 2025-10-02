@@ -1736,7 +1736,7 @@ console.log("✅ confirm-online route loaded");
     await client.query("BEGIN");
 
     // 1. Get order
-    const { rows } = await client.query("SELECT * FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1", [id]);
+        const { rows } = await client.query("SELECT * FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1", [id]);
     const order = rows[0];
     if (!order) {
       await client.query("ROLLBACK");

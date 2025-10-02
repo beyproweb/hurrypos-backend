@@ -343,26 +343,30 @@ const authMiddleware = require("../middleware/authMiddleware");
   });
 
   // ✅ Get stock item
-  router.get("/stock/:id", async (req, res) => {
-    try {
-      const { id } = req.params;
-      const restaurantId = req.user.restaurant_id;
-
-      const result = await pool.query(
-        `SELECT * FROM stock WHERE restaurant_id=$1 AND id=$2`,
-        [restaurantId, id]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Stock item not found." });
-      }
-
-      res.json({ stock: result.rows[0] });
-    } catch (error) {
-      console.error("❌ Error fetching stock by ID:", error);
-      res.status(500).json({ error: "Database error fetching stock." });
+router.get("/stock/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (isNaN(Number(id))) {
+      return res.status(400).json({ error: "Stock ID must be a number" });
     }
-  });
+
+    const restaurantId = req.user.restaurant_id;
+    const result = await pool.query(
+      `SELECT * FROM stock WHERE restaurant_id=$1 AND id=$2`,
+      [restaurantId, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Stock item not found." });
+    }
+
+    res.json({ stock: result.rows[0] });
+  } catch (error) {
+    console.error("❌ Error fetching stock by ID:", error);
+    res.status(500).json({ error: "Database error fetching stock." });
+  }
+});
+
 
   // ✅ Update cart item quantity
   router.patch("/supplier-cart-items/:id", async (req, res) => {

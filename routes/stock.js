@@ -77,7 +77,25 @@ router.get("/", async (req, res) => {
   }
 });
 
+  router.get("/critical", async (req, res) => {
+    try {
+      const restaurantId = req.user.restaurant_id;
 
+      const result = await pool.query(
+        `SELECT *
+         FROM stock
+         WHERE restaurant_id = $1
+           AND quantity <= critical_quantity
+         ORDER BY name ASC`,
+        [restaurantId]
+      );
+
+      res.json(result.rows);
+    } catch (error) {
+      console.error("❌ Error fetching critical stock:", error);
+      res.status(500).json({ error: "Database error fetching critical stock" });
+    }
+  });
   // ==============================
   // GET /stock/:id
   // ==============================
@@ -230,25 +248,7 @@ router.get("/", async (req, res) => {
   // ==============================
   // GET /stock/critical
   // ==============================
-  router.get("/critical", async (req, res) => {
-    try {
-      const restaurantId = req.user.restaurant_id;
 
-      const result = await pool.query(
-        `SELECT *
-         FROM stock
-         WHERE restaurant_id = $1
-           AND quantity <= critical_quantity
-         ORDER BY name ASC`,
-        [restaurantId]
-      );
-
-      res.json(result.rows);
-    } catch (error) {
-      console.error("❌ Error fetching critical stock:", error);
-      res.status(500).json({ error: "Database error fetching critical stock" });
-    }
-  });
 
   return router;
 };
