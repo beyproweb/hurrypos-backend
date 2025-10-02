@@ -112,33 +112,10 @@ router.post("/", async (req, res) => {
 
 
 // ✅ Update product
-// ✅ Update product (safe JSON handling)
 router.put("/:id", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   const { id } = req.params;
-  const updates = { ...req.body };
-
-  // 🔒 Normalize JSON fields
-  ["ingredients", "extras", "selected_extras_group"].forEach((key) => {
-    if (updates[key]) {
-      try {
-        if (typeof updates[key] === "string") {
-          updates[key] = JSON.parse(updates[key]);
-        }
-      } catch (e) {
-        console.warn(`⚠️ Failed to parse ${key}, resetting to []`);
-        updates[key] = [];
-      }
-    }
-  });
-
-  // Force extras numbers to be numeric
-  if (Array.isArray(updates.extras)) {
-    updates.extras = updates.extras.map((e) => ({
-      name: e.name,
-      extraPrice: Number(e.extraPrice) || 0,
-    }));
-  }
+  const updates = req.body;
 
   const allowed = [
     "name",
@@ -162,21 +139,35 @@ router.put("/:id", async (req, res) => {
 
   const fields = Object.keys(updates).filter((k) => allowed.includes(k));
   if (fields.length === 0) {
-    return res
-      .status(400)
-      .json({ status: "error", message: "No valid fields provided for update" });
+    return res.status(400).json({
+      status: "error",
+      message: "No valid fields provided for update",
+    });
   }
+
+  // 🔑 Ensure JSON fields are properly stringified
+  ["ingredients", "extras", "selected_extras_group"].forEach((f) => {
+    if (updates[f] !== undefined && typeof updates[f] !== "string") {
+      updates[f] = JSON.stringify(updates[f]);
+    }
+  });
 
   const setClause = fields.map((f, i) => `${f} = $${i + 3}`).join(", ");
   const values = [restaurantId, id, ...fields.map((f) => updates[f])];
 
   try {
     const result = await pool.query(
-      `UPDATE products SET ${setClause} WHERE restaurant_id=$1 AND id=$2 RETURNING *`,
+      `UPDATE products
+       SET ${setClause}
+       WHERE restaurant_id=$1 AND id=$2
+       RETURNING *`,
       values
     );
+
     if (result.rowCount === 0) {
-      return res.status(404).json({ status: "error", message: "Product not found" });
+      return res
+        .status(404)
+        .json({ status: "error", message: "Product not found" });
     }
 
     res.json({
@@ -191,6 +182,7 @@ router.put("/:id", async (req, res) => {
       .json({ status: "error", message: "Failed to update product" });
   }
 });
+
 
 
 
