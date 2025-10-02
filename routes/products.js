@@ -288,7 +288,7 @@ router.get("/extras-group", async (req, res) => {
   try {
     const groups = await pool.query(
       `
-      SELECT id, name, required, max_selection, created_at
+      SELECT id, group_name AS name, required, max_selection, created_at
       FROM extras_groups
       WHERE restaurant_id=$1
       ORDER BY name
@@ -300,7 +300,7 @@ router.get("/extras-group", async (req, res) => {
     const ids = groups.rows.map((g) => g.id);
     const items = await pool.query(
       `
-      SELECT id, group_id, name, price, amount, unit
+      SELECT id, group_id, ingredient_name AS name, price, amount, unit
       FROM extras_group_items
       WHERE restaurant_id=$1 AND group_id=ANY($2::int[])
       ORDER BY group_id, name
@@ -342,7 +342,7 @@ router.post("/extras-group", async (req, res) => {
     if (items.length > 0) {
       await pool.query(
         `
-        INSERT INTO extras_group_items (restaurant_id, group_id, name, price, amount, unit)
+        INSERT INTO extras_group_items (restaurant_id, group_id, ingredient_name, price, amount, unit)
         VALUES ${items
           .map((_, i) => `($1,$2,$${i * 4 + 3},$${i * 4 + 4},$${i * 4 + 5},$${i * 4 + 6})`)
           .join(", ")}
