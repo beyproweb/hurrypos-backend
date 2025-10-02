@@ -71,87 +71,99 @@ module.exports = (io) => {
 
   // ---------------- TRANSACTIONS ----------------
 
-  // POST /suppliers/transactions
-  router.post("/transactions", upload.single("receipt"), async (req, res) => {
-    try {
-      const restaurantId = req.user.restaurant_id;
-      const {
+// POST /suppliers/transactions
+router.post("/transactions", upload.single("receipt"), async (req, res) => {
+  try {
+    const restaurantId = req.user.restaurant_id;
+    let {
+      supplier_id,
+      ingredient,
+      quantity,
+      unit,
+      total_cost,
+      amount_paid,
+      payment_method,
+    } = req.body;
+
+    // ✅ Sanitize numbers
+    quantity = parseFloat(quantity);
+    if (isNaN(quantity) || quantity < 0) quantity = 0;
+
+    total_cost = parseFloat(total_cost);
+    if (isNaN(total_cost) || total_cost < 0) total_cost = 0;
+
+    amount_paid = parseFloat(amount_paid);
+    if (isNaN(amount_paid) || amount_paid < 0) amount_paid = 0;
+
+    // ✅ Compute due and unit price safely
+    const supplierRes = await pool.query(
+      "SELECT total_due, name FROM suppliers WHERE restaurant_id=$1 AND id=$2",
+      [restaurantId, supplier_id]
+    );
+    if (supplierRes.rowCount === 0) {
+      return res.status(404).json({ error: "Supplier not found" });
+    }
+
+    let currentDue = parseFloat(supplierRes.rows[0].total_due) || 0;
+    let newDue = currentDue + total_cost - amount_paid;
+    if (newDue < 0) newDue = 0;
+
+    const receiptUrl = req.file
+      ? `/uploads/receipts/${req.file.filename}`
+      : null;
+
+    const pricePerUnit = quantity > 0 ? total_cost / quantity : 0;
+
+    // ✅ Insert transaction
+    const transactionResult = await pool.query(
+      `INSERT INTO transactions
+       (restaurant_id, supplier_id, ingredient, quantity, unit, total_cost, amount_paid, due_after, payment_method, delivery_date, price_per_unit, receipt_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11)
+       RETURNING *`,
+      [
+        restaurantId,
         supplier_id,
-        ingredient,
+        (ingredient || "").trim(),
         quantity,
-        unit,
+        unit || null,
         total_cost,
         amount_paid,
-        payment_method,
-      } = req.body;
+        newDue,
+        payment_method || "Cash",
+        pricePerUnit,
+        receiptUrl,
+      ]
+    );
 
-      // Get supplier
-      const supplierRes = await pool.query(
-        "SELECT total_due, name FROM suppliers WHERE restaurant_id=$1 AND id=$2",
-        [restaurantId, supplier_id]
-      );
-      if (supplierRes.rowCount === 0)
-        return res.status(404).json({ error: "Supplier not found" });
+    await pool.query(
+      `UPDATE suppliers SET total_due=$1 WHERE restaurant_id=$2 AND id=$3`,
+      [newDue, restaurantId, supplier_id]
+    );
 
-      let currentDue = parseFloat(supplierRes.rows[0].total_due) || 0;
-      let supplierName = supplierRes.rows[0].name;
-      let newDue =
-        currentDue + parseFloat(total_cost) - parseFloat(amount_paid);
-      if (newDue < 0) newDue = 0;
-
-      const receiptUrl = req.file
-        ? `/uploads/receipts/${req.file.filename}`
-        : null;
-
-      // Save transaction
-      const transactionResult = await pool.query(
-        `INSERT INTO transactions
-         (restaurant_id, supplier_id, ingredient, quantity, unit, total_cost, amount_paid, due_after, payment_method, delivery_date, price_per_unit, receipt_url)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11)
-         RETURNING *`,
-        [
-          restaurantId,
-          supplier_id,
-          ingredient,
-          quantity,
-          unit,
-          total_cost,
-          amount_paid,
-          newDue,
-          payment_method,
-          total_cost / (quantity || 1),
-          receiptUrl,
-        ]
-      );
-
+    // ✅ Update stock if not a Payment record
+    if (ingredient !== "Payment") {
       await pool.query(
-        `UPDATE suppliers SET total_due=$1 WHERE restaurant_id=$2 AND id=$3`,
-        [newDue, restaurantId, supplier_id]
+        `INSERT INTO stock (restaurant_id, name, quantity, unit, supplier_id)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (restaurant_id,name,unit)
+         DO UPDATE SET quantity=stock.quantity+EXCLUDED.quantity
+         RETURNING *`,
+        [restaurantId, ingredient.trim(), quantity, unit, supplier_id]
       );
-
-      // Update stock (if not just a Payment)
-      if (ingredient !== "Payment") {
-        await pool.query(
-          `INSERT INTO stock (restaurant_id, name, quantity, unit, supplier_id)
-           VALUES ($1,$2,$3,$4,$5)
-           ON CONFLICT (restaurant_id,name,unit)
-           DO UPDATE SET quantity=stock.quantity+EXCLUDED.quantity
-           RETURNING *`,
-          [restaurantId, ingredient.trim(), quantity, unit, supplier_id]
-        );
-        io.emit("stock-updated");
-      }
-
-      res.json({
-        success: true,
-        transaction: transactionResult.rows[0],
-        supplier_due: newDue,
-      });
-    } catch (error) {
-      console.error("❌ Error saving transaction:", error);
-      res.status(500).json({ error: "Database error" });
+      io.emit("stock-updated");
     }
-  });
+
+    res.json({
+      success: true,
+      transaction: transactionResult.rows[0],
+      supplier_due: newDue,
+    });
+  } catch (error) {
+    console.error("❌ Error saving transaction:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
 
   // ---------------- INGREDIENTS ----------------
 
