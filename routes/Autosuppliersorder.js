@@ -56,61 +56,71 @@ const authMiddleware = require("../middleware/authMiddleware");
   });
 
   // ✅ Add item to supplier cart
-  router.post("/supplier-cart-items", async (req, res) => {
-    try {
-      const { stock_id, product_name, quantity, unit, cart_id } = req.body;
-      const restaurantId = req.user.restaurant_id;
+  // ✅ Add item to supplier cart
+router.post("/supplier-cart-items", async (req, res) => {
+  try {
+    const { stock_id, product_name, quantity, unit, cart_id } = req.body;
+    const restaurantId = req.user.restaurant_id;
 
-      if (!stock_id || !product_name || !quantity || !unit || !cart_id) {
-        return res.status(400).json({ error: "Missing required fields" });
-      }
-
-      // Check critical status
-      const stockRes = await pool.query(
-        `SELECT quantity, critical_quantity
-         FROM stock
-         WHERE restaurant_id=$1 AND id=$2`,
-        [restaurantId, stock_id]
-      );
-      const stock = stockRes.rows[0];
-      if (!stock) return res.status(404).json({ error: "Stock item not found." });
-
-      if (parseFloat(stock.quantity) > parseFloat(stock.critical_quantity)) {
-        return res
-          .status(400)
-          .json({ error: "Stock is not below critical threshold." });
-      }
-
-      // Ensure cart exists
-      const cartCheck = await pool.query(
-        `SELECT id FROM supplier_carts WHERE restaurant_id=$1 AND id=$2`,
-        [restaurantId, cart_id]
-      );
-      if (cartCheck.rows.length === 0) {
-        return res.status(404).json({ error: "Cart not found." });
-      }
-
-      await pool.query(
-        `UPDATE supplier_carts SET confirmed=true WHERE restaurant_id=$1 AND id=$2`,
-        [restaurantId, cart_id]
-      );
-
-      // Insert/Update item
-      const result = await pool.query(
-        `INSERT INTO supplier_cart_items (restaurant_id, stock_id, product_name, quantity, unit, cart_id)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (cart_id, product_name, unit)
-         DO UPDATE SET quantity=supplier_cart_items.quantity+EXCLUDED.quantity
-         RETURNING *`,
-        [restaurantId, stock_id, product_name.trim(), parseFloat(quantity), unit.trim(), cart_id]
-      );
-
-      res.json(result.rows[0]);
-    } catch (err) {
-      console.error("❌ Error in /supplier-cart-items:", err);
-      res.status(500).json({ error: "Internal server error" });
+    if (!stock_id || !product_name || !quantity || !unit || !cart_id) {
+      return res.status(400).json({ error: "Missing required fields" });
     }
-  });
+
+    // Check critical status
+    const stockRes = await pool.query(
+      `SELECT quantity, critical_quantity
+       FROM stock
+       WHERE restaurant_id=$1 AND id=$2`,
+      [restaurantId, stock_id]
+    );
+    const stock = stockRes.rows[0];
+    if (!stock) return res.status(404).json({ error: "Stock item not found." });
+
+    if (parseFloat(stock.quantity) > parseFloat(stock.critical_quantity)) {
+      return res
+        .status(400)
+        .json({ error: "Stock is not below critical threshold." });
+    }
+
+    // Ensure cart exists
+    const cartCheck = await pool.query(
+      `SELECT id FROM supplier_carts WHERE restaurant_id=$1 AND id=$2`,
+      [restaurantId, cart_id]
+    );
+    if (cartCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Cart not found." });
+    }
+
+    await pool.query(
+      `UPDATE supplier_carts SET confirmed=true WHERE restaurant_id=$1 AND id=$2`,
+      [restaurantId, cart_id]
+    );
+
+    // Insert/Update item
+    await pool.query(
+      `INSERT INTO supplier_cart_items (restaurant_id, stock_id, product_name, quantity, unit, cart_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (cart_id, product_name, unit)
+       DO UPDATE SET quantity=supplier_cart_items.quantity+EXCLUDED.quantity`,
+      [restaurantId, stock_id, product_name.trim(), parseFloat(quantity), unit.trim(), cart_id]
+    );
+
+    // 🔄 Fetch full updated cart
+    const itemsRes = await pool.query(
+      `SELECT * FROM supplier_cart_items WHERE restaurant_id=$1 AND cart_id=$2`,
+      [restaurantId, cart_id]
+    );
+
+    res.json({
+      cart_id,
+      items: itemsRes.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error in /supplier-cart-items:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 
   // ✅ Confirm supplier cart
   router.put("/supplier-carts/:id/confirm", async (req, res) => {
@@ -369,34 +379,48 @@ router.get("/stock/:id", async (req, res) => {
 
 
   // ✅ Update cart item quantity
-  router.patch("/supplier-cart-items/:id", async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { quantity } = req.body;
-      const restaurantId = req.user.restaurant_id;
+// ✅ Update cart item quantity
+router.patch("/supplier-cart-items/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { quantity } = req.body;
+    const restaurantId = req.user.restaurant_id;
 
-      if (!quantity || isNaN(quantity)) {
-        return res.status(400).json({ error: "Invalid quantity." });
-      }
-
-      const updateRes = await pool.query(
-        `UPDATE supplier_cart_items
-         SET quantity=$1
-         WHERE restaurant_id=$2 AND id=$3
-         RETURNING *`,
-        [quantity, restaurantId, id]
-      );
-
-      if (updateRes.rows.length === 0) {
-        return res.status(404).json({ error: "Cart item not found." });
-      }
-
-      res.json(updateRes.rows[0]);
-    } catch (error) {
-      console.error("❌ Error updating cart item quantity:", error);
-      res.status(500).json({ error: "Database error updating item." });
+    if (!quantity || isNaN(quantity)) {
+      return res.status(400).json({ error: "Invalid quantity." });
     }
-  });
+
+    // First update the row
+    const updateRes = await pool.query(
+      `UPDATE supplier_cart_items
+       SET quantity=$1
+       WHERE restaurant_id=$2 AND id=$3
+       RETURNING cart_id`,
+      [quantity, restaurantId, id]
+    );
+
+    if (updateRes.rows.length === 0) {
+      return res.status(404).json({ error: "Cart item not found." });
+    }
+
+    const cartId = updateRes.rows[0].cart_id;
+
+    // 🔄 Fetch full updated cart
+    const itemsRes = await pool.query(
+      `SELECT * FROM supplier_cart_items WHERE restaurant_id=$1 AND cart_id=$2`,
+      [restaurantId, cartId]
+    );
+
+    res.json({
+      cart_id: cartId,
+      items: itemsRes.rows,
+    });
+  } catch (error) {
+    console.error("❌ Error updating cart item quantity:", error);
+    res.status(500).json({ error: "Database error updating item." });
+  }
+});
+
 
   // ✅ History
   router.get("/supplier-carts/history", async (req, res) => {
