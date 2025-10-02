@@ -1,14 +1,14 @@
+// routes/Autosuppliersorder.js
 module.exports = (io) => {
-const express = require("express");
-const router = express.Router();
-const { pool } = require("../db");
+  const express = require("express");
+  const router = express.Router();
+  const { pool } = require("../db");
 
+  /*===============================
+           Auto supplier orders
+  ===============================*/
 
-/*===============================
-         Auto supplier orders
-===============================*/
-// POST /supplier-carts
-// ✅ Create supplier cart
+  // ✅ Create supplier cart
   router.post("/supplier-carts", async (req, res) => {
     try {
       const { supplier_id, scheduled_at, auto_confirm } = req.body;
@@ -35,12 +35,14 @@ const { pool } = require("../db");
         const existing = await pool.query(
           `SELECT * FROM supplier_carts
            WHERE restaurant_id=$1 AND supplier_id=$2
-           AND confirmed=false AND archived=false
+             AND confirmed=false AND archived=false
            LIMIT 1`,
           [restaurantId, supplier_id]
         );
         if (existing.rows.length === 0) {
-          return res.status(500).json({ error: "Failed to fetch cart after conflict." });
+          return res
+            .status(500)
+            .json({ error: "Failed to fetch cart after conflict." });
         }
         cart = existing.rows[0];
       }
@@ -51,7 +53,7 @@ const { pool } = require("../db");
       res.status(500).json({ error: "Database error creating cart." });
     }
   });
-// POST /supplier-cart-items
+
   // ✅ Add item to supplier cart
   router.post("/supplier-cart-items", async (req, res) => {
     try {
@@ -73,7 +75,9 @@ const { pool } = require("../db");
       if (!stock) return res.status(404).json({ error: "Stock item not found." });
 
       if (parseFloat(stock.quantity) > parseFloat(stock.critical_quantity)) {
-        return res.status(400).json({ error: "Stock is not below critical threshold." });
+        return res
+          .status(400)
+          .json({ error: "Stock is not below critical threshold." });
       }
 
       // Ensure cart exists
@@ -107,8 +111,7 @@ const { pool } = require("../db");
     }
   });
 
-
-// ✅ Confirm supplier cart
+  // ✅ Confirm supplier cart
   router.put("/supplier-carts/:id/confirm", async (req, res) => {
     try {
       const { id } = req.params;
@@ -151,9 +154,6 @@ const { pool } = require("../db");
       res.status(500).json({ error: "Database error confirming cart." });
     }
   });
-
-
-
 
   // ✅ Send supplier cart
   router.post("/supplier-carts/:id/send", async (req, res) => {
@@ -217,7 +217,8 @@ const { pool } = require("../db");
           `SELECT * FROM supplier_carts WHERE restaurant_id=$1 AND id=$2`,
           [restaurantId, cart_id]
         );
-        if (!cartRes.rows.length) return res.status(404).json({ error: "Cart not found." });
+        if (!cartRes.rows.length)
+          return res.status(404).json({ error: "Cart not found." });
         targetCart = cartRes.rows[0];
       } else if (supplier_id) {
         const cartRes = await pool.query(
@@ -227,7 +228,8 @@ const { pool } = require("../db");
            ORDER BY created_at DESC LIMIT 1`,
           [restaurantId, supplier_id]
         );
-        if (!cartRes.rows.length) return res.status(404).json({ error: "No open cart found." });
+        if (!cartRes.rows.length)
+          return res.status(404).json({ error: "No open cart found." });
         targetCart = cartRes.rows[0];
       } else {
         return res.status(400).json({ error: "supplier_id or cart_id required." });
@@ -243,257 +245,260 @@ const { pool } = require("../db");
       res.status(500).json({ error: "Database error fetching cart items." });
     }
   });
-// PATCH /stock/:id
-router.patch("/stock/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { quantity, critical_quantity, reorder_quantity } = req.body;
 
-    const currentRes = await pool.query(`SELECT * FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`, [id]);
-    const current = currentRes.rows[0];
+  // ✅ Patch stock
+  router.patch("/stock/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { quantity, critical_quantity, reorder_quantity } = req.body;
+      const restaurantId = req.user.restaurant_id;
 
-    if (!current) return res.status(404).json({ error: "Stock not found." });
-
-    const updateRes = await pool.query(
-      `UPDATE stock
-       SET quantity = COALESCE($1, quantity),
-           critical_quantity = COALESCE($2, critical_quantity),
-           reorder_quantity = COALESCE($3, reorder_quantity)
-       WHERE restaurant_id = $1 AND id = $4
-       RETURNING *`,
-      [quantity, critical_quantity, reorder_quantity, id]
-    );
-
-    const updated = updateRes.rows[0];
-
-    // ✅ Reset auto flags if restocked above critical
-    if (
-      typeof quantity === "number" &&
-      quantity > (updated.critical_quantity || 0)
-    ) {
-      await pool.query(
-        `UPDATE stock
-         SET auto_added_to_cart = FALSE,
-             last_auto_add_at = NULL
-         WHERE restaurant_id = $1 AND id = $1`,
-        [id]
+      const currentRes = await pool.query(
+        `SELECT * FROM stock WHERE restaurant_id=$1 AND id=$2`,
+        [restaurantId, id]
       );
-      updated.auto_added_to_cart = false;
-      updated.last_auto_add_at = null;
-      console.log(`🧹 Manually restocked ${updated.name} — cleared auto-add flags`);
-    }
+      const current = currentRes.rows[0];
 
-    // ✅ If still below critical, ensure system can re-trigger later
-    if (
-      typeof quantity === "number" &&
-      quantity <= (updated.critical_quantity || 0) &&
-      updated.last_auto_add_at
-    ) {
-      await pool.query(
+      if (!current) return res.status(404).json({ error: "Stock not found." });
+
+      const updateRes = await pool.query(
         `UPDATE stock
-         SET last_auto_add_at = NULL
-         WHERE restaurant_id = $1 AND id = $1`,
-        [id]
+         SET quantity = COALESCE($1, quantity),
+             critical_quantity = COALESCE($2, critical_quantity),
+             reorder_quantity = COALESCE($3, reorder_quantity)
+         WHERE restaurant_id=$4 AND id=$5
+         RETURNING *`,
+        [quantity, critical_quantity, reorder_quantity, restaurantId, id]
       );
-      updated.last_auto_add_at = null;
-      console.log(`🔁 ${updated.name} still below critical — cleared last_auto_add_at to re-trigger`);
-    }
 
-    io.emit("stock-updated", { stockId: id });
+      const updated = updateRes.rows[0];
 
-    res.json({ success: true, stock: updated });
-
-  } catch (error) {
-    console.error("❌ Error updating stock:", error);
-    res.status(500).json({ error: "Database error updating stock." });
-  }
-});
-
-
-// PATCH /stock/:id/flag-auto-added
-router.patch("/stock/:id/flag-auto-added", async (req, res) => {
-  const { id } = req.params;
-  const { last_auto_add_at } = req.body;
-
-  try {
-    const result = await pool.query(
-      `UPDATE stock SET last_auto_add_at = $1 WHERE restaurant_id = $1 AND id = $2 RETURNING *`,
-      [last_auto_add_at, id]
-    );
-    res.json({ updated: result.rows[0] });
-  } catch (err) {
-    console.error("❌ Error updating last_auto_add_at:", err);
-    res.status(500).json({ error: "Failed to update auto-add timestamp" });
-  }
-});
-
-
-// GET /stock/:id
-router.get("/stock/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query("SELECT * FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1", [id]);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Stock item not found." });
-    }
-
-    res.json({ stock: result.rows[0] });
-  } catch (error) {
-    console.error("❌ Error fetching stock by ID:", error);
-    res.status(500).json({ error: "Database error fetching stock." });
-  }
-});
-
-
-// PATCH /supplier-cart-items/:id
-router.patch("/supplier-cart-items/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { quantity } = req.body;
-
-    if (!quantity || isNaN(quantity)) {
-      return res.status(400).json({ error: "Invalid quantity." });
-    }
-
-    const updateRes = await pool.query(
-      `UPDATE supplier_cart_items
-       SET quantity = $1
-       WHERE restaurant_id = $1 AND id = $2
-       RETURNING *`,
-      [quantity, id]
-    );
-
-    if (updateRes.rows.length === 0) {
-      return res.status(404).json({ error: "Cart item not found." });
-    }
-
-    res.json(updateRes.rows[0]);
-  } catch (error) {
-    console.error("❌ Error updating cart item quantity:", error);
-    res.status(500).json({ error: "Database error updating item." });
-  }
-});
-
-// GET /supplier-carts/history?supplier_id=...
-router.get("/supplier-carts/history", async (req, res) => {
-  const { supplier_id } = req.query;
-
-  if (!supplier_id || isNaN(Number(supplier_id))) {
-    return res.status(400).json({ error: "Valid supplier_id is required." });
-  }
-
-  try {
-    const historyRes = await pool.query(
-      `SELECT sc.*, sc.skipped, array_agg(json_build_object(
-  'product_name', sci.product_name,
-  'quantity', sci.quantity,
-  'unit', sci.unit
-)) AS items
- FROM supplier_carts sc
- LEFT JOIN supplier_cart_items sci ON sci.cart_id = sc.id
- WHERE sc.supplier_id = $1 AND sc.archived = true
- GROUP BY sc.id
- ORDER BY sc.scheduled_at DESC
- LIMIT 5`
-,
-      [Number(supplier_id)]
-    );
-
-    res.json({ history: historyRes.rows });
-  } catch (error) {
-    console.error("❌ Error fetching supplier cart history:", error);
-    res.status(500).json({ error: "Database error fetching history." });
-  }
-});
-
-// GET /supplier-carts/scheduled?supplier_id=...
-router.get("/supplier-carts/scheduled", async (req, res) => {
-  const { supplier_id } = req.query;
-
-  if (!supplier_id || isNaN(Number(supplier_id))) {
-    return res.status(400).json({ error: "Valid supplier_id is required." });
-  }
-
-  try {
-    const cartRes = await pool.query(`
-      SELECT * FROM supplier_carts
-      WHERE supplier_id = $1 AND confirmed = true AND archived = false
-      ORDER BY scheduled_at ASC
-      LIMIT 1
-    `, [Number(supplier_id)]);
-
-    const cart = cartRes.rows[0];
-    if (!cart) return res.status(404).json({ error: "No scheduled cart found." });
-
-    const itemsRes = await pool.query(
-      `SELECT * FROM supplier_cart_items WHERE cart_id = $1`,
-      [cart.id]
-    );
-
-    res.json({
-      cart_id: cart.id,
-      items: itemsRes.rows,
-      scheduled_at: cart.scheduled_at,
-      repeat_type: cart.repeat_type,
-      repeat_days: cart.repeat_days,
-      auto_confirm: cart.auto_confirm,
-    });
-
-  } catch (err) {
-    console.error("❌ Error fetching scheduled cart:", err);
-    res.status(500).json({ error: "Database error fetching scheduled cart." });
-  }
-});
-
-router.get("/ingredients/average-prices", async (req, res) => {
-
-  try {
-    const { rows } = await pool.query(`
-      SELECT DISTINCT ON (ingredient_name)
-        ingredient_name AS name,
-        unit,
-        supplier_name AS supplier,
-        price AS current_price,
-        changed_at,
-        reason
-      FROM ingredient_price_history
-      ORDER BY ingredient_name, changed_at DESC
-    `);
-
-    const historyMap = {};
-
-    // Fetch previous price per ingredient
-    const { rows: history } = await pool.query(`
-      SELECT ingredient_name, price, changed_at
-      FROM ingredient_price_history
-      ORDER BY ingredient_name, changed_at DESC
-    `);
-
-    for (const row of history) {
-      const key = row.ingredient_name;
-      if (!historyMap[key]) {
-        historyMap[key] = [row]; // latest
-      } else if (historyMap[key].length === 1) {
-        historyMap[key].push(row); // previous
+      // Reset flags if restocked
+      if (
+        typeof quantity === "number" &&
+        quantity > (updated.critical_quantity || 0)
+      ) {
+        await pool.query(
+          `UPDATE stock
+           SET auto_added_to_cart = FALSE,
+               last_auto_add_at = NULL
+           WHERE restaurant_id=$1 AND id=$2`,
+          [restaurantId, id]
+        );
+        updated.auto_added_to_cart = false;
+        updated.last_auto_add_at = null;
       }
+
+      if (
+        typeof quantity === "number" &&
+        quantity <= (updated.critical_quantity || 0) &&
+        updated.last_auto_add_at
+      ) {
+        await pool.query(
+          `UPDATE stock
+           SET last_auto_add_at = NULL
+           WHERE restaurant_id=$1 AND id=$2`,
+          [restaurantId, id]
+        );
+        updated.last_auto_add_at = null;
+      }
+
+      io.emit("stock-updated", { stockId: id });
+      res.json({ success: true, stock: updated });
+    } catch (error) {
+      console.error("❌ Error updating stock:", error);
+      res.status(500).json({ error: "Database error updating stock." });
+    }
+  });
+
+  // ✅ Flag auto-added
+  router.patch("/stock/:id/flag-auto-added", async (req, res) => {
+    const { id } = req.params;
+    const { last_auto_add_at } = req.body;
+    const restaurantId = req.user.restaurant_id;
+
+    try {
+      const result = await pool.query(
+        `UPDATE stock SET last_auto_add_at=$1
+         WHERE restaurant_id=$2 AND id=$3
+         RETURNING *`,
+        [last_auto_add_at, restaurantId, id]
+      );
+      res.json({ updated: result.rows[0] });
+    } catch (err) {
+      console.error("❌ Error updating last_auto_add_at:", err);
+      res.status(500).json({ error: "Failed to update auto-add timestamp" });
+    }
+  });
+
+  // ✅ Get stock item
+  router.get("/stock/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const restaurantId = req.user.restaurant_id;
+
+      const result = await pool.query(
+        `SELECT * FROM stock WHERE restaurant_id=$1 AND id=$2`,
+        [restaurantId, id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "Stock item not found." });
+      }
+
+      res.json({ stock: result.rows[0] });
+    } catch (error) {
+      console.error("❌ Error fetching stock by ID:", error);
+      res.status(500).json({ error: "Database error fetching stock." });
+    }
+  });
+
+  // ✅ Update cart item quantity
+  router.patch("/supplier-cart-items/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { quantity } = req.body;
+      const restaurantId = req.user.restaurant_id;
+
+      if (!quantity || isNaN(quantity)) {
+        return res.status(400).json({ error: "Invalid quantity." });
+      }
+
+      const updateRes = await pool.query(
+        `UPDATE supplier_cart_items
+         SET quantity=$1
+         WHERE restaurant_id=$2 AND id=$3
+         RETURNING *`,
+        [quantity, restaurantId, id]
+      );
+
+      if (updateRes.rows.length === 0) {
+        return res.status(404).json({ error: "Cart item not found." });
+      }
+
+      res.json(updateRes.rows[0]);
+    } catch (error) {
+      console.error("❌ Error updating cart item quantity:", error);
+      res.status(500).json({ error: "Database error updating item." });
+    }
+  });
+
+  // ✅ History
+  router.get("/supplier-carts/history", async (req, res) => {
+    const { supplier_id } = req.query;
+
+    if (!supplier_id || isNaN(Number(supplier_id))) {
+      return res.status(400).json({ error: "Valid supplier_id is required." });
     }
 
-    const result = rows.map((item) => {
-      const history = historyMap[item.name] || [];
-      const prev = history[1];
-      return {
-        ...item,
-        previous_price: prev ? prev.price : null,
-      };
-    });
+    try {
+      const historyRes = await pool.query(
+        `SELECT sc.*, sc.skipped, array_agg(json_build_object(
+          'product_name', sci.product_name,
+          'quantity', sci.quantity,
+          'unit', sci.unit
+        )) AS items
+         FROM supplier_carts sc
+         LEFT JOIN supplier_cart_items sci ON sci.cart_id=sc.id
+         WHERE sc.supplier_id=$1 AND sc.archived=true
+         GROUP BY sc.id
+         ORDER BY sc.scheduled_at DESC
+         LIMIT 5`,
+        [Number(supplier_id)]
+      );
 
-    res.json(result);
-  } catch (err) {
-    console.error("❌ Failed to fetch ingredient prices", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+      res.json({ history: historyRes.rows });
+    } catch (error) {
+      console.error("❌ Error fetching supplier cart history:", error);
+      res.status(500).json({ error: "Database error fetching history." });
+    }
+  });
+
+  // ✅ Scheduled
+  router.get("/supplier-carts/scheduled", async (req, res) => {
+    const { supplier_id } = req.query;
+
+    if (!supplier_id || isNaN(Number(supplier_id))) {
+      return res.status(400).json({ error: "Valid supplier_id is required." });
+    }
+
+    try {
+      const cartRes = await pool.query(
+        `SELECT * FROM supplier_carts
+         WHERE supplier_id=$1 AND confirmed=true AND archived=false
+         ORDER BY scheduled_at ASC
+         LIMIT 1`,
+        [Number(supplier_id)]
+      );
+
+      const cart = cartRes.rows[0];
+      if (!cart) return res.status(404).json({ error: "No scheduled cart found." });
+
+      const itemsRes = await pool.query(
+        `SELECT * FROM supplier_cart_items WHERE cart_id=$1`,
+        [cart.id]
+      );
+
+      res.json({
+        cart_id: cart.id,
+        items: itemsRes.rows,
+        scheduled_at: cart.scheduled_at,
+        repeat_type: cart.repeat_type,
+        repeat_days: cart.repeat_days,
+        auto_confirm: cart.auto_confirm,
+      });
+    } catch (err) {
+      console.error("❌ Error fetching scheduled cart:", err);
+      res.status(500).json({ error: "Database error fetching scheduled cart." });
+    }
+  });
+
+  // ✅ Ingredient average prices
+  router.get("/ingredients/average-prices", async (req, res) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT DISTINCT ON (ingredient_name)
+          ingredient_name AS name,
+          unit,
+          supplier_name AS supplier,
+          price AS current_price,
+          changed_at,
+          reason
+        FROM ingredient_price_history
+        ORDER BY ingredient_name, changed_at DESC
+      `);
+
+      const historyMap = {};
+      const { rows: history } = await pool.query(`
+        SELECT ingredient_name, price, changed_at
+        FROM ingredient_price_history
+        ORDER BY ingredient_name, changed_at DESC
+      `);
+
+      for (const row of history) {
+        const key = row.ingredient_name;
+        if (!historyMap[key]) {
+          historyMap[key] = [row];
+        } else if (historyMap[key].length === 1) {
+          historyMap[key].push(row);
+        }
+      }
+
+      const result = rows.map((item) => {
+        const h = historyMap[item.name] || [];
+        const prev = h[1];
+        return {
+          ...item,
+          previous_price: prev ? prev.price : null,
+        };
+      });
+
+      res.json(result);
+    } catch (err) {
+      console.error("❌ Failed to fetch ingredient prices", err);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
 
   return router;
-}
+};
