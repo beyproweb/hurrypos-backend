@@ -390,7 +390,7 @@ router.patch("/supplier-cart-items/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid quantity." });
     }
 
-    // First update the row
+    // Update item
     const updateRes = await pool.query(
       `UPDATE supplier_cart_items
        SET quantity=$1
@@ -403,23 +403,21 @@ router.patch("/supplier-cart-items/:id", async (req, res) => {
       return res.status(404).json({ error: "Cart item not found." });
     }
 
-    const cartId = updateRes.rows[0].cart_id;
+    const cart_id = updateRes.rows[0].cart_id;
 
-    // 🔄 Fetch full updated cart
+    // Fetch full updated cart
     const itemsRes = await pool.query(
       `SELECT * FROM supplier_cart_items WHERE restaurant_id=$1 AND cart_id=$2`,
-      [restaurantId, cartId]
+      [restaurantId, cart_id]
     );
 
-    res.json({
-      cart_id: cartId,
-      items: itemsRes.rows,
-    });
+    res.json({ cart_id, items: itemsRes.rows });
   } catch (error) {
     console.error("❌ Error updating cart item quantity:", error);
     res.status(500).json({ error: "Database error updating item." });
   }
 });
+
 
 
   // ✅ History
