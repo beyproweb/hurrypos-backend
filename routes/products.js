@@ -291,7 +291,7 @@ router.get("/extras-group", async (req, res) => {
       SELECT id, group_name AS name, required, max_selection, created_at
       FROM extras_groups
       WHERE restaurant_id=$1
-      ORDER BY name
+      ORDER BY group_name
       `,
       [restaurantId]
     );
@@ -303,7 +303,7 @@ router.get("/extras-group", async (req, res) => {
       SELECT id, group_id, ingredient_name AS name, price, amount, unit
       FROM extras_group_items
       WHERE restaurant_id=$1 AND group_id=ANY($2::int[])
-      ORDER BY group_id, name
+      ORDER BY group_id, ingredient_name
       `,
       [restaurantId, ids]
     );
