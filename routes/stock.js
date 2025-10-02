@@ -12,63 +12,71 @@ module.exports = (io) => {
   // ==============================
   // GET /stock - list all stock with price per unit
   // ==============================
-  router.get("/", async (req, res) => {
-    try {
-      const restaurantId = req.user.restaurant_id;
+router.get("/", async (req, res) => {
+  try {
+    const restaurantId = req.user.restaurant_id;
 
-      const notifRes = await pool.query(
-        `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'notifications'`,
-        [restaurantId]
-      );
-      let cooldownMinutes = 30;
-      let stockAlertEnabled = true;
+    const notifRes = await pool.query(
+      `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'notifications'`,
+      [restaurantId]
+    );
+    let cooldownMinutes = 30;
+    let stockAlertEnabled = true;
 
-      if (notifRes.rows[0]) {
-        const config = JSON.parse(notifRes.rows[0].value);
-        cooldownMinutes = config.stockAlert?.cooldownMinutes ?? 30;
-        stockAlertEnabled = config.stockAlert?.enabled !== false;
-      }
-
-      const result = await pool.query(
-        `
-        SELECT s.*, sp.name AS supplier_name,
-          COALESCE(
-            NULLIF(ip1.price_per_unit, 0),
-            NULLIF(ip2.price_per_unit, 0),
-            (SELECT ROUND(total_cost / NULLIF(quantity, 0), 4)
-             FROM transactions
-             WHERE LOWER(ingredient) = LOWER(s.name) AND unit = s.unit AND quantity > 0
-             ORDER BY delivery_date DESC LIMIT 1),
-            0
-          ) AS price_per_unit
-        FROM stock s
-        LEFT JOIN suppliers sp ON s.supplier_id = sp.id
-        LEFT JOIN LATERAL (
-          SELECT price AS price_per_unit
-          FROM ingredient_price_history
-          WHERE LOWER(ingredient_name) = LOWER(s.name) AND unit = s.unit
-          ORDER BY changed_at DESC
-          LIMIT 1
-        ) ip1 ON true
-        LEFT JOIN LATERAL (
-          SELECT ROUND(total_cost / NULLIF(quantity, 0), 4) AS price_per_unit
-          FROM transactions
-          WHERE LOWER(ingredient) = LOWER(s.name) AND unit = s.unit
-          ORDER BY delivery_date DESC
-          LIMIT 1
-        ) ip2 ON true
-        WHERE s.restaurant_id = $1
-        ORDER BY s.name ASC
-        `,
-        [restaurantId]
-      );
-
-      res.json(result.rows);
-    } catch (error) {
-      console.error("❌ Error fetching stock:", error);
-      res.status(500).json({ error: "Database error" });
+    if (notifRes.rows[0]) {
+      const config = JSON.parse(notifRes.rows[0].value);
+      cooldownMinutes = config.stockAlert?.cooldownMinutes ?? 30;
+      stockAlertEnabled = config.stockAlert?.enabled !== false;
     }
-  });
+
+    const result = await pool.query(
+      `
+      SELECT s.*, sp.name AS supplier_name,
+        COALESCE(
+          NULLIF(ip1.price_per_unit, 0),
+          NULLIF(ip2.price_per_unit, 0),
+          (SELECT ROUND(total_cost / NULLIF(quantity, 0), 4)
+           FROM transactions
+           WHERE restaurant_id = s.restaurant_id
+             AND LOWER(ingredient) = LOWER(s.name)
+             AND unit = s.unit
+             AND quantity > 0
+           ORDER BY delivery_date DESC LIMIT 1),
+          0
+        ) AS price_per_unit
+      FROM stock s
+      LEFT JOIN suppliers sp
+        ON s.supplier_id = sp.id
+       AND sp.restaurant_id = s.restaurant_id
+      LEFT JOIN LATERAL (
+        SELECT price AS price_per_unit
+        FROM ingredient_price_history
+        WHERE LOWER(ingredient_name) = LOWER(s.name) AND unit = s.unit
+        ORDER BY changed_at DESC
+        LIMIT 1
+      ) ip1 ON true
+      LEFT JOIN LATERAL (
+        SELECT ROUND(total_cost / NULLIF(quantity, 0), 4) AS price_per_unit
+        FROM transactions
+        WHERE restaurant_id = s.restaurant_id
+          AND LOWER(ingredient) = LOWER(s.name)
+          AND unit = s.unit
+        ORDER BY delivery_date DESC
+        LIMIT 1
+      ) ip2 ON true
+      WHERE s.restaurant_id = $1
+      ORDER BY s.name ASC
+      `,
+      [restaurantId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("❌ Error fetching stock:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
 
   // ==============================
   // GET /stock/:id
