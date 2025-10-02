@@ -221,20 +221,30 @@ const authMiddleware = require("../middleware/authMiddleware");
         if (!cartRes.rows.length)
           return res.status(404).json({ error: "Cart not found." });
         targetCart = cartRes.rows[0];
-      } else if (supplier_id) {
-        const cartRes = await pool.query(
-          `SELECT * FROM supplier_carts
-           WHERE restaurant_id=$1 AND supplier_id=$2
-             AND confirmed=false AND archived=false
-           ORDER BY created_at DESC LIMIT 1`,
-          [restaurantId, supplier_id]
-        );
-        if (!cartRes.rows.length)
-          return res.status(404).json({ error: "No open cart found." });
-        targetCart = cartRes.rows[0];
-      } else {
-        return res.status(400).json({ error: "supplier_id or cart_id required." });
-      }
+     } else if (supplier_id) {
+  const cartRes = await pool.query(
+    `SELECT * FROM supplier_carts
+     WHERE restaurant_id=$1 AND supplier_id=$2
+       AND confirmed=false AND archived=false
+     ORDER BY created_at DESC LIMIT 1`,
+    [restaurantId, supplier_id]
+  );
+
+  if (cartRes.rows.length) {
+    targetCart = cartRes.rows[0];
+  } else {
+    // 🚀 Auto-create a new empty cart if none exists
+    const insertRes = await pool.query(
+      `INSERT INTO supplier_carts (restaurant_id, supplier_id, confirmed, archived)
+       VALUES ($1, $2, false, false)
+       RETURNING *`,
+      [restaurantId, supplier_id]
+    );
+    targetCart = insertRes.rows[0];
+    console.log(`🆕 Auto-created new supplier cart id=${targetCart.id} for supplier=${supplier_id}`);
+  }
+}
+
 
       const itemsRes = await pool.query(
         `SELECT * FROM supplier_cart_items WHERE cart_id=$1`,
