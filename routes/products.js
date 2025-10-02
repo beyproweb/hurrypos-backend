@@ -288,8 +288,10 @@ router.get("/extras-group", async (req, res) => {
   try {
     const groups = await pool.query(
       `
-      SELECT id,name,required,max_selection,created_at
-      FROM extras_groups WHERE restaurant_id=$1 ORDER BY name
+      SELECT id, name, required, max_selection, created_at
+      FROM extras_groups
+      WHERE restaurant_id=$1
+      ORDER BY name
       `,
       [restaurantId]
     );
@@ -298,10 +300,10 @@ router.get("/extras-group", async (req, res) => {
     const ids = groups.rows.map((g) => g.id);
     const items = await pool.query(
       `
-      SELECT id,group_id,name,price
+      SELECT id, group_id, name, price, amount, unit
       FROM extras_group_items
       WHERE restaurant_id=$1 AND group_id=ANY($2::int[])
-      ORDER BY group_id,name
+      ORDER BY group_id, name
       `,
       [restaurantId, ids]
     );
@@ -330,9 +332,9 @@ router.post("/extras-group", async (req, res) => {
   try {
     const group = await pool.query(
       `
-      INSERT INTO extras_groups (restaurant_id,name,required,max_selection)
+      INSERT INTO extras_groups (restaurant_id, name, required, max_selection)
       VALUES ($1,$2,$3,$4)
-      RETURNING id,name,required,max_selection,created_at
+      RETURNING id, name, required, max_selection, created_at
       `,
       [restaurantId, name, required, max_selection]
     );
@@ -340,12 +342,21 @@ router.post("/extras-group", async (req, res) => {
     if (items.length > 0) {
       await pool.query(
         `
-        INSERT INTO extras_group_items (restaurant_id,group_id,name,price)
+        INSERT INTO extras_group_items (restaurant_id, group_id, name, price, amount, unit)
         VALUES ${items
-          .map((_, i) => `($1,$2,$${i * 2 + 3},$${i * 2 + 4})`)
+          .map((_, i) => `($1,$2,$${i * 4 + 3},$${i * 4 + 4},$${i * 4 + 5},$${i * 4 + 6})`)
           .join(", ")}
         `,
-        [restaurantId, group.rows[0].id, ...items.flatMap((x) => [x.name, x.price || 0])]
+        [
+          restaurantId,
+          group.rows[0].id,
+          ...items.flatMap((x) => [
+            x.name,
+            x.price || 0,
+            x.amount || 1,
+            x.unit || null,
+          ]),
+        ]
       );
     }
 
@@ -389,12 +400,21 @@ router.put("/extras-group/:id", async (req, res) => {
     if (items.length > 0) {
       await pool.query(
         `
-        INSERT INTO extras_group_items (restaurant_id,group_id,name,price)
+        INSERT INTO extras_group_items (restaurant_id, group_id, name, price, amount, unit)
         VALUES ${items
-          .map((_, i) => `($1,$2,$${i * 2 + 3},$${i * 2 + 4})`)
+          .map((_, i) => `($1,$2,$${i * 4 + 3},$${i * 4 + 4},$${i * 4 + 5},$${i * 4 + 6})`)
           .join(", ")}
         `,
-        [restaurantId, id, ...items.flatMap((x) => [x.name, x.price || 0])]
+        [
+          restaurantId,
+          id,
+          ...items.flatMap((x) => [
+            x.name,
+            x.price || 0,
+            x.amount || 1,
+            x.unit || null,
+          ]),
+        ]
       );
     }
 
@@ -404,6 +424,7 @@ router.put("/extras-group/:id", async (req, res) => {
     res.status(500).json({ status: "error", message: "Failed to update extras group" });
   }
 });
+
 
 // ✅ Delete extras group
 router.delete("/extras-group/:id", async (req, res) => {
