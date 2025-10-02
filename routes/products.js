@@ -215,7 +215,7 @@ router.delete("/:id", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `DELETE FROM products WHERE restaurant_id=$1 AND id=$2 RETURNING id,name`,
+      `DELETE FROM products WHERE restaurant_id=$1 AND id=$2 RETURNING id, group_name AS name`,
       [restaurantId, id]
     );
     if (result.rowCount === 0)
@@ -239,7 +239,7 @@ router.delete("/", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `DELETE FROM products WHERE restaurant_id=$1 AND id=ANY($2::int[]) RETURNING id,name`,
+      `DELETE FROM products WHERE restaurant_id=$1 AND id=ANY($2::int[]) RETURNING id, group_name AS name`,
       [restaurantId, ids]
     );
     res.json({
@@ -386,7 +386,7 @@ router.put("/extras-group/:id", async (req, res) => {
     await pool.query(
       `
       UPDATE extras_groups
-      SET name=$3, required=$4, max_selection=$5
+      SET group_name=$3, required=$4, max_selection=$5
       WHERE restaurant_id=$1 AND id=$2
       `,
       [restaurantId, id, name, required, max_selection]
@@ -436,7 +436,7 @@ router.delete("/extras-group/:id", async (req, res) => {
       [restaurantId, id]
     );
     const del = await pool.query(
-      `DELETE FROM extras_groups WHERE restaurant_id=$1 AND id=$2 RETURNING id,name`,
+      `DELETE FROM extras_groups WHERE restaurant_id=$1 AND id=$2 RETURNING id, group_name AS name`,
       [restaurantId, id]
     );
     if (del.rowCount === 0)
