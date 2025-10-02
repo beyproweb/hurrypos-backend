@@ -3,10 +3,11 @@ module.exports = (io) => {
   const express = require("express");
   const router = express.Router();
   const { pool } = require("../db");
-
+const authMiddleware = require("../middleware/authMiddleware");
   /*===============================
            Auto supplier orders
   ===============================*/
+  router.use(authMiddleware);
 
   // ✅ Create supplier cart
   router.post("/supplier-carts", async (req, res) => {
