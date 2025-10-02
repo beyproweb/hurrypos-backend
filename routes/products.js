@@ -24,58 +24,12 @@ const log = (path, method, data) =>
 
 // ----------------- PRODUCTS -----------------
 
-// ✅ Fetch all products (tenant-safe)
-// ✅ Fetch all products (tenant-safe)
-router.get("/", async (req, res) => {
-  const restaurantId = req.user.restaurant_id;
-  log("/api/products", "GET", { restaurantId });
-
-  try {
-    const result = await pool.query(
-      `
-      SELECT id, name, category, price, preparation_time, description,
-             discount_type, discount_value, visible, tags, allergens,
-             promo_start, promo_end, image, image_url, ingredients, extras,
-             selected_extras_group, created_at
-      FROM products
-      WHERE restaurant_id = $1
-      ORDER BY id DESC
-      `,
-      [restaurantId]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error("❌ Fetch products error:", err);
-    res.status(500).json({ status: "error", message: "Failed to fetch products" });
-  }
-});
 
 
-// ✅ Fetch single product
-router.get("/:id", async (req, res) => {
-  const restaurantId = req.user.restaurant_id;
-  const { id } = req.params;
 
-  try {
-    const result = await pool.query(
-      `
-      SELECT id, name, category, price, cost, image, stock, unit, description, status, created_at
-      FROM products
-      WHERE restaurant_id = $1 AND id = $2
-      `,
-      [restaurantId, id]
-    );
-    if (result.rowCount === 0)
-      return res.status(404).json({ status: "error", message: "Product not found" });
 
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error("❌ Fetch product error:", err);
-    res.status(500).json({ status: "error", message: "Failed to fetch product" });
-  }
-});
 
-// ✅ Add new product
+
 // ✅ Add new product
 router.post("/", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
@@ -446,6 +400,55 @@ router.delete("/extras-group/:id", async (req, res) => {
   } catch (err) {
     console.error("❌ Delete extras group error:", err);
     res.status(500).json({ status: "error", message: "Failed to delete extras group" });
+  }
+});
+
+
+router.get("/:id", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, name, category, price, cost, image, stock, unit, description, status, created_at
+      FROM products
+      WHERE restaurant_id = $1 AND id = $2
+      `,
+      [restaurantId, id]
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ status: "error", message: "Product not found" });
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("❌ Fetch product error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch product" });
+  }
+});
+
+// ✅ Fetch all products (tenant-safe)
+router.get("/", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  log("/api/products", "GET", { restaurantId });
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, name, category, price, preparation_time, description,
+             discount_type, discount_value, visible, tags, allergens,
+             promo_start, promo_end, image, image_url, ingredients, extras,
+             selected_extras_group, created_at
+      FROM products
+      WHERE restaurant_id = $1
+      ORDER BY id DESC
+      `,
+      [restaurantId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Fetch products error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch products" });
   }
 });
 
