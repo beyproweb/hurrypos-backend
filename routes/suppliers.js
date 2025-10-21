@@ -139,6 +139,23 @@ router.post("/transactions", upload.single("receipt"), async (req, res) => {
       `UPDATE suppliers SET total_due=$1 WHERE restaurant_id=$2 AND id=$3`,
       [newDue, restaurantId, supplier_id]
     );
+// ✅ Record ingredient price change into ingredient_price_history
+if (ingredient && ingredient !== "Payment" && pricePerUnit > 0) {
+  try {
+    await pool.query(
+  `INSERT INTO ingredient_price_history
+   (restaurant_id, ingredient_name, unit, price, changed_at, reason, supplier_name)
+   VALUES ($1, LOWER($2), $3, $4, NOW(), 'Purchase update',
+           (SELECT name FROM suppliers WHERE id=$5 AND restaurant_id=$1 LIMIT 1))`,
+  [restaurantId, ingredient.trim(), unit, pricePerUnit, supplier_id]
+);
+
+  } catch (err) {
+    console.error("⚠️ Failed to record ingredient price:", err.message);
+  }
+}
+
+
 
     // ✅ Update stock if not a Payment record
     if (ingredient !== "Payment") {
@@ -165,25 +182,43 @@ router.post("/transactions", upload.single("receipt"), async (req, res) => {
 });
 
 
-  // ---------------- INGREDIENTS ----------------
 
-  router.get("/ingredients", async (req, res) => {
-    try {
-      const restaurantId = req.user.restaurant_id;
-      const result = await pool.query(
-        `SELECT name, unit
-         FROM stock
-         WHERE restaurant_id=$1 AND name IS NOT NULL AND name<>''
-         GROUP BY name, unit
-         ORDER BY LOWER(name) ASC`,
-        [restaurantId]
-      );
-      res.json(result.rows);
-    } catch (err) {
-      console.error("❌ Error fetching ingredients:", err.message);
-      res.status(500).json({ error: "Database error" });
-    }
-  });
+// ---------------- INGREDIENTS ----------------
+
+router.get("/ingredients", async (req, res) => {
+  try {
+    const restaurantId = req.user.restaurant_id;
+
+    const result = await pool.query(
+      `
+      SELECT
+        s.name,
+        s.unit,
+        COALESCE((
+          SELECT t.price_per_unit
+          FROM transactions t
+          WHERE t.restaurant_id = $1
+            AND LOWER(t.ingredient) = LOWER(s.name)
+            AND t.unit = s.unit
+          ORDER BY t.delivery_date DESC
+          LIMIT 1
+        ), 0) AS price_per_unit
+      FROM stock s
+      WHERE s.restaurant_id = $1
+        AND s.name IS NOT NULL
+        AND s.name <> ''
+      GROUP BY s.name, s.unit
+      ORDER BY LOWER(s.name) ASC
+      `,
+      [restaurantId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching ingredients:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
 
   // ---------------- SINGLE SUPPLIER ----------------
 

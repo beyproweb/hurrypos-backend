@@ -1,49 +1,100 @@
+// utils/socket.js
 const { Server } = require("socket.io");
 let io = null;
 
 function initSocket(server) {
   if (io) {
-    console.log("!!! WARNING: Socket.IO already initialized");
+    console.log("⚠️ Socket.IO already initialized");
     return io;
   }
 
   io = new Server(server, {
     cors: {
-      origin: "*",
-      methods: ["GET", "POST", "PATCH", "PUT"],
+      origin: [
+        "http://localhost:5173",
+        "https://pos.beypro.com",
+        "https://hurrypos-frontend.onrender.com",
+      ],
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+      credentials: true,
     },
+    transports: ["websocket", "polling"],
   });
 
-  io.on("connection", (socket) => {
-    console.log("✅ Socket connected:", socket.id);
+  /* ------------------------------------------------------------------
+     🧠 Optional Redis adapter (auto-skipped in local dev if no REDIS_URL)
+  ------------------------------------------------------------------ */
+  if (process.env.REDIS_URL) {
+    try {
+      const { createAdapter } = require("@socket.io/redis-adapter");
+      const { createClient } = require("redis");
+      const pubClient = createClient({ url: process.env.REDIS_URL });
+      const subClient = pubClient.duplicate();
 
-    // Client tells us which restaurant they belong to
+      pubClient.on("error", (err) => console.error("❌ Redis pub error:", err));
+      subClient.on("error", (err) => console.error("❌ Redis sub error:", err));
+
+      pubClient.connect();
+      subClient.connect();
+      io.adapter(createAdapter(pubClient, subClient));
+
+      console.log("✅ Redis adapter enabled for multi-instance scaling");
+    } catch (err) {
+      console.warn("⚠️ Redis adapter skipped:", err.message);
+    }
+  } else {
+    console.log("⚠️ No REDIS_URL found — running without Redis adapter");
+  }
+
+  /* ------------------------------------------------------------------
+     🔒 Tenant-safe socket connections
+  ------------------------------------------------------------------ */
+  io.on("connection", (socket) => {
+    console.log(`✅ Socket connected: ${socket.id}`);
+
+    // 1️⃣ Manual join from frontend
     socket.on("join_restaurant", (restaurantId) => {
       if (!restaurantId) return;
       socket.join(`restaurant_${restaurantId}`);
-      console.log(`👥 Socket ${socket.id} joined restaurant_${restaurantId}`);
+      socket.data.restaurantId = restaurantId;
+      console.log(`👥 ${socket.id} joined restaurant_${restaurantId}`);
     });
 
+    // 2️⃣ Auto join from auth handshake (if JWT decoded on frontend)
+    const auth = socket.handshake?.auth;
+    if (auth?.restaurantId) {
+      socket.join(`restaurant_${auth.restaurantId}`);
+      socket.data.restaurantId = auth.restaurantId;
+      console.log(`🔐 Auto-joined from auth: restaurant_${auth.restaurantId}`);
+    }
+
+    // 3️⃣ Reconnect auto rejoin
+    socket.on("reconnect_attempt", () => {
+      if (socket.data.restaurantId) {
+        socket.join(`restaurant_${socket.data.restaurantId}`);
+        console.log(`♻️ Rejoined restaurant_${socket.data.restaurantId}`);
+      }
+    });
+
+    // Leave when requested
     socket.on("leave_restaurant", (restaurantId) => {
       if (!restaurantId) return;
       socket.leave(`restaurant_${restaurantId}`);
-      console.log(`👋 Socket ${socket.id} left restaurant_${restaurantId}`);
+      console.log(`👋 ${socket.id} left restaurant_${restaurantId}`);
     });
 
-    socket.on("disconnect", () => {
-      console.log("❌ Socket disconnected:", socket.id);
+    socket.on("disconnect", (reason) => {
+      console.log(`❌ Socket disconnected: ${socket.id} (${reason})`);
     });
   });
 
-  global.io = io; // optional global ref for debugging
-
+  global.io = io; // Debug access
+  console.log("🚀 Socket.IO initialized (tenant-safe)");
   return io;
 }
 
 function getIO() {
-  if (!io) {
-    throw new Error("❌ Socket.io not initialized yet!");
-  }
+  if (!io) throw new Error("❌ Socket.IO not initialized yet!");
   return io;
 }
 

@@ -1,12 +1,82 @@
 const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
+const authMiddleware = require("../middleware/authMiddleware");
 
+// ✅ protect all settings routes with tenant-safe auth
+router.use(authMiddleware);
 // Allowed setting sections
 const allowedSections = [
   "notifications", "appearance", "payments", "register",
   "users", "subscription", "integrations", "log_files" ,"localization"
 ];
+
+const JSON_COLUMN_TYPES = new Set(["json", "jsonb"]);
+const DEFAULT_LOCALIZATION = { language: "en", currency: "₺ TRY" };
+
+async function getSettingsSchemaInfo() {
+  const { rows } = await pool.query(
+    `
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'settings'
+    `
+  );
+
+  const find = (name) => rows.find((row) => row.column_name === name);
+
+  return {
+    hasLocalization: Boolean(find("localization")),
+    localizationType: find("localization")?.data_type || null,
+    hasRestaurantId: Boolean(find("restaurant_id")),
+    hasValue: Boolean(find("value")),
+  };
+}
+
+function parseMaybeJson(value) {
+  if (value === null || typeof value === "undefined") return undefined;
+  if (typeof value === "object") return value;
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    ) {
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return value;
+      }
+    }
+  }
+
+  return value;
+}
+
+function normalizeCurrency(currency) {
+  if (!currency) return DEFAULT_LOCALIZATION.currency;
+
+  const map = {
+    "₺": "₺ TRY",
+    "try": "₺ TRY",
+    "₺ try": "₺ TRY",
+    "try ₺": "₺ TRY",
+  };
+
+  const key = String(currency).trim().toLowerCase();
+  return map[key] || currency;
+}
+
+function buildLocalizationResponse(rawLocalization = {}) {
+  const merged = {
+    ...DEFAULT_LOCALIZATION,
+    ...rawLocalization,
+  };
+
+  merged.currency = normalizeCurrency(merged.currency);
+  return merged;
+}
 
 // POST /settings/shop-hours
 router.post("/shop-hours/all", async (req, res) => {
@@ -158,59 +228,166 @@ router.get("/shop-hours/all", async (req, res) => {
 
 router.get("/localization", async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT key, value FROM settings WHERE key IN ('language', 'currency')`
+    const schema = await getSettingsSchemaInfo();
+
+    if (schema.hasLocalization && schema.hasRestaurantId) {
+      const restaurantId = req.user.restaurant_id;
+      const result = await pool.query(
+        `
+          SELECT localization, value
+          FROM settings
+          WHERE restaurant_id = $1 AND key = 'global'
+          LIMIT 1
+        `,
+        [restaurantId]
+      );
+
+      const row = result.rows?.[0] || {};
+      let localization = row.localization;
+
+      if (!localization || typeof localization !== "object") {
+        const parsedLocalization = parseMaybeJson(localization);
+        if (parsedLocalization && typeof parsedLocalization === "object") {
+          localization = parsedLocalization;
+        } else {
+          const parsed = parseMaybeJson(row.value);
+          if (parsed && typeof parsed === "object" && parsed.localization) {
+            localization = parsed.localization;
+          } else {
+            localization = {};
+          }
+        }
+      }
+
+      return res.json(buildLocalizationResponse(localization));
+    }
+
+    const restaurantId = schema.hasRestaurantId ? req.user.restaurant_id : null;
+    const params = [];
+    let query = `
+      SELECT key, value
+      FROM settings
+      WHERE key IN ('language', 'currency')
+    `;
+
+    if (schema.hasRestaurantId) {
+      query += " AND restaurant_id = $1";
+      params.push(restaurantId);
+    }
+
+    const fallbackResult = await pool.query(query, params);
+
+    const settingsMap = fallbackResult.rows.reduce((acc, row) => {
+      const parsed = parseMaybeJson(row.value);
+      acc[row.key] = parsed?.value ?? parsed ?? row.value;
+      return acc;
+    }, {});
+
+    res.json(
+      buildLocalizationResponse({
+        language: settingsMap.language,
+        currency: settingsMap.currency,
+      })
     );
-
-    const settings = {};
-    result.rows.forEach(({ key, value }) => {
-      settings[key] = value;
-    });
-
-    res.json(settings);
   } catch (err) {
     console.error("❌ Error fetching localization:", err);
     res.status(500).json({ error: "Failed to fetch settings" });
   }
 });
 
+
+
 router.post("/localization", async (req, res) => {
   const { language, currency } = req.body;
 
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
+    const schema = await getSettingsSchemaInfo();
+    const normalizedCurrency = normalizeCurrency(currency);
+    const localizationPayload = JSON.stringify({
+      language,
+      currency: normalizedCurrency,
+    });
 
-    await client.query(
-      `INSERT INTO settings (restaurant_id, key, value)
-       VALUES ('language', $1)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [language]
-    );
+    if (schema.hasLocalization && schema.hasRestaurantId) {
+      const restaurantId = req.user.restaurant_id;
+      const isJsonColumn = JSON_COLUMN_TYPES.has(
+        (schema.localizationType || "").toLowerCase()
+      );
 
-    await client.query(
-      `INSERT INTO settings (restaurant_id, key, value)
-       VALUES ('currency', $1)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [currency]
-    );
+      const query = `
+        INSERT INTO settings (restaurant_id, key, localization)
+        VALUES ($1, 'global', ${isJsonColumn ? "$2::" + schema.localizationType : "$2"})
+        ON CONFLICT (restaurant_id, key)
+        DO UPDATE SET localization = EXCLUDED.localization
+      `;
 
-    await client.query("COMMIT");
-    res.json({ success: true });
+      await pool.query(query, [restaurantId, localizationPayload]);
+
+      return res.json({
+        success: true,
+        localization: { language, currency: normalizedCurrency },
+      });
+    }
+
+    const hasRestaurant = schema.hasRestaurantId;
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const insertSql = hasRestaurant
+        ? `
+            INSERT INTO settings (restaurant_id, key, value)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (restaurant_id, key) DO UPDATE SET value = EXCLUDED.value
+          `
+        : `
+            INSERT INTO settings (key, value)
+            VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+          `;
+
+      const langParams = hasRestaurant
+        ? [req.user.restaurant_id, "language", language]
+        : ["language", language];
+
+      const currencyParams = hasRestaurant
+        ? [req.user.restaurant_id, "currency", normalizedCurrency]
+        : ["currency", normalizedCurrency];
+
+      await client.query(insertSql, langParams);
+      await client.query(insertSql, currencyParams);
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({
+      success: true,
+      localization: { language, currency: normalizedCurrency },
+    });
   } catch (err) {
-    await client.query("ROLLBACK");
     console.error("❌ Error saving localization settings:", err);
-    res.status(500).json({ error: "Failed to save settings" });
-  } finally {
-    client.release();
+    res.status(500).json({ error: "Failed to save localization settings" });
   }
 });
+
 
 // GET /api/settings/qr-menu-disabled
 router.get("/qr-menu-disabled", async (req, res) => {
   try {
+    const restaurantId = req.user?.restaurant_id;
+    if (!restaurantId) {
+      return res.status(400).json({ error: "restaurant_id is required" });
+    }
+
     const result = await pool.query(
-      "SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'qr-menu-disabled' LIMIT 1"
+      "SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'qr-menu-disabled' LIMIT 1",
+      [restaurantId]
     );
     // Try to parse value as JSON array, fallback to empty
     let disabled = [];
@@ -233,12 +410,14 @@ router.get("/qr-menu-disabled", async (req, res) => {
 router.post("/qr-menu-disabled", async (req, res) => {
   const { disabled } = req.body; // expects an array of IDs
   try {
-    await pool.query(
-      `INSERT INTO settings (restaurant_id, key, value)
-       VALUES ('qr-menu-disabled', $1)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [JSON.stringify(Array.isArray(disabled) ? disabled : [])]
-    );
+    const restaurantId = req.user.restaurant_id;
+await pool.query(
+  `INSERT INTO settings (restaurant_id, key, value)
+   VALUES ($1, 'qr-menu-disabled', $2)
+   ON CONFLICT (restaurant_id, key) DO UPDATE SET value = EXCLUDED.value`,
+  [restaurantId, JSON.stringify(Array.isArray(disabled) ? disabled : [])]
+);
+
     res.json({ success: true });
   } catch (err) {
     console.error("❌ Failed to update qr-menu-disabled:", err);
@@ -246,79 +425,84 @@ router.post("/qr-menu-disabled", async (req, res) => {
   }
 });
 
-// ✅ Update role permissions
+// ✅ Correct: save role permissions into settings.key='users' (not 'global')
 router.post("/roles", async (req, res) => {
   const { role, permissions } = req.body;
+  const restaurantId = req.user.restaurant_id;
 
   if (!role || !Array.isArray(permissions)) {
     return res.status(400).json({ error: "Role and permissions required" });
   }
 
-  const roleKey = role.toLowerCase();
-
   try {
-    const result = await pool.query("SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1");
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Settings not found" });
-    }
+    // 1️⃣ Fetch current user config (key='users')
+    const result = await pool.query(
+      `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'users' LIMIT 1`,
+      [restaurantId]
+    );
 
-    let users = result.rows[0].users || { roles: {} };
+    let config = result.rows[0]?.value || { roles: {} };
+    if (typeof config === "string") config = JSON.parse(config);
 
-    // Ensure JSON object
-    if (typeof users === "string") {
-      try {
-        users = JSON.parse(users);
-      } catch {
-        users = { roles: {} };
-      }
-    }
+    // 2️⃣ Update that role
+    const roleKey = role.toLowerCase();
+    config.roles = config.roles || {};
+    config.roles[roleKey] = permissions.map((p) => p.toLowerCase());
 
-    // Normalize role keys & permission strings
-    users.roles = users.roles || {};
-    users.roles[roleKey] = permissions.map((p) => p.toLowerCase());
+    // 3️⃣ Save back into key='users'
+    await pool.query(
+      `
+      INSERT INTO settings (restaurant_id, key, value)
+      VALUES ($1, 'users', $2::jsonb)
+      ON CONFLICT (restaurant_id, key)
+      DO UPDATE SET value = EXCLUDED.value;
+      `,
+      [restaurantId, JSON.stringify(config)]
+    );
 
-    await pool.query("UPDATE settings SET users = $1::json WHERE restaurant_id = $1 AND key = 'global'", [
-      JSON.stringify(users),
-    ]);
-
-    res.json({ success: true, roles: users.roles });
+    res.json({ success: true, roles: config.roles });
   } catch (err) {
     console.error("❌ Failed to update role permissions:", err);
     res.status(500).json({ error: "Failed to update role permissions" });
   }
 });
 
+
+
 // ✅ Delete role
+// ✅ Delete role from key='users'
 router.delete("/roles/:role", async (req, res) => {
   const role = req.params.role?.toLowerCase();
-  if (!role) {
-    return res.status(400).json({ error: "Role is required" });
-  }
+  const restaurantId = req.user.restaurant_id;
+
+  if (!role) return res.status(400).json({ error: "Role is required" });
 
   try {
-    const result = await pool.query("SELECT users FROM settings WHERE restaurant_id = $1 AND key = 'global' LIMIT 1");
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Settings not found" });
+    const result = await pool.query(
+      `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'users' LIMIT 1`,
+      [restaurantId]
+    );
+
+    let config = result.rows[0]?.value || { roles: {} };
+    if (typeof config === "string") config = JSON.parse(config);
+
+    if (!config.roles || !config.roles[role]) {
+      return res.status(404).json({ error: `Role '${role}' not found` });
     }
 
-    let users = result.rows[0].users;
-    if (typeof users === "string") {
-      users = JSON.parse(users);
-    }
+    delete config.roles[role];
 
-if (!users.roles || !users.roles[role]) {
-   console.warn(`⚠️ Role '${role}' not found in DB. Available: ${Object.keys(users.roles)}`);
-   return res.status(404).json({ error: `Role '${role}' not found` });
- }
+    await pool.query(
+      `
+      INSERT INTO settings (restaurant_id, key, value)
+      VALUES ($1, 'users', $2::jsonb)
+      ON CONFLICT (restaurant_id, key)
+      DO UPDATE SET value = EXCLUDED.value;
+      `,
+      [restaurantId, JSON.stringify(config)]
+    );
 
-    delete users.roles[role]; // ❌ remove the role
-
-    await pool.query("UPDATE settings SET users = $1::json WHERE restaurant_id = $1 AND key = 'global'", [
-      JSON.stringify(users),
-    ]);
-
-    console.log(`🗑️ Deleted role '${role}'`);
-    res.json({ success: true, roles: users.roles });
+    res.json({ success: true, roles: config.roles });
   } catch (err) {
     console.error("❌ Failed to delete role:", err);
     res.status(500).json({ error: "Failed to delete role" });
@@ -326,9 +510,11 @@ if (!users.roles || !users.roles[role]) {
 });
 
 
+
 // ✅ GET /api/settings/:section
 router.get("/:section", async (req, res) => {
   const { section } = req.params;
+  const restaurantId = req.user.restaurant_id; // ✅ tenant-safe
 
   if (!allowedSections.includes(section)) {
     console.warn(`⚠️ Invalid GET section: ${section}`);
@@ -336,9 +522,14 @@ router.get("/:section", async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      `SELECT ${section} FROM settings WHERE restaurant_id = $1 AND key = 'global' LIMIT 1`
-    );
+
+    const restaurantId = req.user.restaurant_id;
+const result = await pool.query(
+  `SELECT ${section} FROM settings WHERE restaurant_id = $1 AND key = 'global' LIMIT 1`,
+  [restaurantId]
+);
+
+
     const raw = result.rows?.[0]?.[section] || {};
 
     const defaults = {
@@ -380,6 +571,7 @@ router.get("/:section", async (req, res) => {
 });
 
 // ✅ POST /api/settings/:section
+// ✅ POST /api/settings/:section
 router.post("/:section", async (req, res) => {
   const { section } = req.params;
   let newData = req.body;
@@ -389,22 +581,24 @@ router.post("/:section", async (req, res) => {
     return res.status(400).json({ error: "Invalid section" });
   }
 
+  // 🔹 Merge defaults for notifications (keeps all expected fields)
   if (section === "notifications") {
     const defaults = {
       enabled: true,
-      defaultSound: "ding",
+      defaultSound: "ding.mp3",
       channels: { kitchen: "app", cashier: "app", manager: "app" },
       escalation: { enabled: true, delayMinutes: 3 },
+      stockAlert: { enabled: true, cooldownMinutes: 30 },
       eventSounds: {
         new_order: "new_order.mp3",
-        order_preparing: "pop",
-        order_ready: "chime",
-        order_delivered: "success",
-        payment_made: "cash",
-        stock_low: "warning",
-        stock_restocked: "ding",
-        order_delayed: "alarm",
-        driver_arrived: "horn",
+        order_preparing: "pop.mp3",
+        order_ready: "chime.mp3",
+        order_delivered: "success.mp3",
+        payment_made: "cash.mp3",
+        stock_low: "warning.mp3",
+        stock_restocked: "ding.mp3",
+        order_delayed: "alarm.mp3",
+        driver_arrived: "horn.mp3",
       },
     };
 
@@ -419,16 +613,26 @@ router.post("/:section", async (req, res) => {
   }
 
   try {
+    const restaurantId = req.user.restaurant_id;
+
+    // ✅ Upsert (INSERT or UPDATE) tenant-safe JSON section
     await pool.query(
-      `UPDATE settings SET ${section} = $1::jsonb WHERE restaurant_id = $1 AND key = 'global'`,
-      [JSON.stringify(newData)]
+      `
+      INSERT INTO settings (restaurant_id, key, ${section})
+      VALUES ($1, 'global', $2::jsonb)
+      ON CONFLICT (restaurant_id, key)
+      DO UPDATE SET ${section} = EXCLUDED.${section};
+      `,
+      [restaurantId, JSON.stringify(newData)]
     );
-    res.json({ success: true });
+
+    res.json({ success: true, [section]: newData });
   } catch (err) {
     console.error(`❌ Failed to save ${section} settings:`, err);
     res.status(500).json({ error: "Failed to save settings" });
   }
 });
+
 
 
 module.exports = router;

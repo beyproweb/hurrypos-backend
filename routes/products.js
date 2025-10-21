@@ -231,32 +231,76 @@ router.delete("/", async (req, res) => {
   }
 });
 
-// ✅ Costs overview
 router.get("/costs", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   try {
     const result = await pool.query(
       `
       SELECT
-        p.id, p.name, p.category, p.cost, p.price, p.stock, p.unit,
-        COALESCE(SUM(i.price * pi.quantity),0) AS ingredient_cost
+        p.id,
+        p.name,
+        p.category,
+        p.price,
+        COALESCE((
+          SELECT SUM(
+            (ing->>'quantity')::numeric *
+            COALESCE((
+              SELECT t.price_per_unit
+              FROM transactions t
+              WHERE t.restaurant_id = p.restaurant_id
+                AND LOWER(TRIM(t.ingredient)) = LOWER(TRIM(ing->>'ingredient'))
+                AND (
+                  LOWER(TRIM(t.unit)) = LOWER(TRIM(ing->>'unit'))
+                  OR t.unit IS NULL
+                  OR ing->>'unit' IS NULL
+                )
+              ORDER BY t.delivery_date DESC
+              LIMIT 1
+            ), (
+              -- fallback: any latest price for ingredient (ignore unit mismatch)
+              SELECT t2.price_per_unit
+              FROM transactions t2
+              WHERE t2.restaurant_id = p.restaurant_id
+                AND LOWER(TRIM(t2.ingredient)) = LOWER(TRIM(ing->>'ingredient'))
+              ORDER BY t2.delivery_date DESC
+              LIMIT 1
+            ), 0)
+          )
+          FROM jsonb_array_elements(p.ingredients) AS ing
+        ), 0) AS ingredient_cost,
+        COALESCE((
+          SELECT SUM(
+            (ing->>'quantity')::numeric *
+            COALESCE((
+              SELECT t.price_per_unit
+              FROM transactions t
+              WHERE t.restaurant_id = p.restaurant_id
+                AND LOWER(TRIM(t.ingredient)) = LOWER(TRIM(ing->>'ingredient'))
+              ORDER BY t.delivery_date DESC
+              LIMIT 1
+            ), 0)
+          )
+          FROM jsonb_array_elements(p.ingredients) AS ing
+        ), 0) AS cost
       FROM products p
-      LEFT JOIN product_ingredients pi
-        ON pi.product_id=p.id AND pi.restaurant_id=p.restaurant_id
-      LEFT JOIN ingredients i
-        ON i.id=pi.ingredient_id AND i.restaurant_id=p.restaurant_id
-      WHERE p.restaurant_id=$1
-      GROUP BY p.id,p.name,p.category,p.cost,p.price,p.stock,p.unit
-      ORDER BY p.category,p.name
+      WHERE p.restaurant_id = $1
+      ORDER BY p.category, p.name
       `,
       [restaurantId]
     );
+
     res.json(result.rows);
   } catch (err) {
     console.error("❌ Fetch cost error:", err);
-    res.status(500).json({ status: "error", message: "Failed to fetch cost data" });
+    res
+      .status(500)
+      .json({ status: "error", message: "Failed to fetch cost data" });
   }
 });
+
+
+
+
 
 // ----------------- EXTRAS GROUPS -----------------
 

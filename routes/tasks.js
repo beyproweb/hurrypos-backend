@@ -3,8 +3,17 @@ const router = express.Router();
 const { pool } = require("../db");
 const { getIO } = require("../utils/socket");
 const OpenAI = require("openai");
+const authMiddleware = require("../middleware/authMiddleware");
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Only protect task endpoints so other /api routes remain accessible
+router.use((req, res, next) => {
+  if (req.path.startsWith("/tasks") || req.path.startsWith("/voice-command")) {
+    return authMiddleware(req, res, next);
+  }
+  return next();
+});
 
 // ✅ AI Voice Command Task Parser
 // ✅ AI Voice Command Task Parser (Multilingual)
@@ -12,8 +21,13 @@ router.post("/voice-command", async (req, res) => {
   console.log("🎙️ /voice-command hit");
   const { message, created_by } = req.body;
   const clientLang = req.headers["x-client-lang"] || "en"; // from frontend
+  const restaurantId = req.user?.restaurant_id;
   if (!created_by) {
     return res.status(400).json({ error: "Missing created_by" });
+  }
+
+  if (!restaurantId) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
 
   const langMap = {
@@ -25,7 +39,10 @@ router.post("/voice-command", async (req, res) => {
   const languageLabel = langMap[clientLang] || "English";
 
   try {
-    const staffRes = await pool.query("SELECT name FROM staff");
+    const staffRes = await pool.query(
+      "SELECT name FROM staff WHERE restaurant_id = $1",
+      [restaurantId]
+    );
     const staffNames = staffRes.rows.map(r => r.name).join(", ");
 
     const prompt = `You are a multilingual restaurant task assistant.
@@ -82,8 +99,12 @@ User said (in ${languageLabel}): "${message}"
     let assigned_to = null;
     if (assignedName) {
       const match = await pool.query(
-        `SELECT id FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE LOWER(unaccent(name)) = LOWER(unaccent($1)) LIMIT 1`,
-        [assignedName]
+        `SELECT id
+           FROM staff
+          WHERE restaurant_id = $1
+            AND LOWER(unaccent(name)) = LOWER(unaccent($2))
+          LIMIT 1`,
+        [restaurantId, assignedName]
       );
       assigned_to = match.rows[0]?.id || null;
     }
@@ -100,11 +121,13 @@ User said (in ${languageLabel}): "${message}"
 
     const insert = await pool.query(
       `INSERT INTO tasks (
+        restaurant_id,
         title, description, assigned_to, created_by, due_at,
         priority, input_method, station, voice_response
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING *`,
       [
+        restaurantId,
         title,
         description,
         assigned_to,
@@ -136,6 +159,7 @@ router.post("/tasks", async (req, res) => {
   const {
     title,
     description,
+    assigned_to,
     assigned_to_name,
     due_at,
     created_by,
@@ -144,6 +168,11 @@ router.post("/tasks", async (req, res) => {
     station,
     voice_response,
   } = req.body;
+
+  const restaurantId = req.user?.restaurant_id;
+  if (!restaurantId) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 
 
   // 🔍 Debug incoming data
@@ -154,27 +183,33 @@ router.post("/tasks", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields: title or created_by" });
   }
 
-  let assigned_to = null;
-  if (assigned_to_name?.trim()) {
+  let staffId = assigned_to ?? null;
+  if (!staffId && assigned_to_name?.trim()) {
     const result = await pool.query(
-      `SELECT id FROM staff WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE LOWER(unaccent(name)) = LOWER(unaccent($1)) LIMIT 1`,
-      [assigned_to_name.trim()]
+      `SELECT id
+         FROM staff
+        WHERE restaurant_id = $1
+          AND LOWER(unaccent(name)) = LOWER(unaccent($2))
+        LIMIT 1`,
+      [restaurantId, assigned_to_name.trim()]
     );
-    assigned_to = result.rows[0]?.id || null;
+    staffId = result.rows[0]?.id || null;
   }
 
   try {
     const insert = await pool.query(
       `INSERT INTO tasks (
+        restaurant_id,
         title, description, assigned_to, created_by, due_at,
         priority, input_method, station, voice_response
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING *`,
       [
+        restaurantId,
         title,
         description || "",
-        assigned_to,
+        staffId,
         created_by,
         due_at || null,
         priority || "medium",
@@ -197,10 +232,18 @@ router.post("/tasks", async (req, res) => {
 router.patch("/tasks/:id/start", async (req, res) => {
   try {
     const { id } = req.params;
+    const restaurantId = req.user?.restaurant_id;
+    if (!restaurantId) return res.status(401).json({ error: "Unauthorized" });
     const result = await pool.query(
-      `UPDATE tasks SET started_at = NOW(), status = 'in_progress' WHERE restaurant_id = $1 AND id = $1 RETURNING *`,
-      [id]
+      `UPDATE tasks
+         SET started_at = NOW(), status = 'in_progress'
+       WHERE restaurant_id = $1 AND id = $2
+       RETURNING *`,
+      [restaurantId, id]
     );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Task not found" });
+    }
     getIO(req)?.emit("task_updated", result.rows[0]);
     res.json(result.rows[0]);
   } catch (err) {
@@ -213,10 +256,18 @@ router.patch("/tasks/:id/start", async (req, res) => {
 router.patch("/tasks/:id/complete", async (req, res) => {
   try {
     const { id } = req.params;
+    const restaurantId = req.user?.restaurant_id;
+    if (!restaurantId) return res.status(401).json({ error: "Unauthorized" });
     const result = await pool.query(
-      `UPDATE tasks SET completed_at = NOW(), status = 'completed' WHERE restaurant_id = $1 AND id = $1 RETURNING *`,
-      [id]
+      `UPDATE tasks
+         SET completed_at = NOW(), status = 'completed'
+       WHERE restaurant_id = $1 AND id = $2
+       RETURNING *`,
+      [restaurantId, id]
     );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Task not found" });
+    }
     getIO(req)?.emit("task_updated", result.rows[0]);
     res.json(result.rows[0]);
   } catch (err) {
@@ -229,17 +280,21 @@ router.patch("/tasks/:id/complete", async (req, res) => {
 router.get("/tasks", async (req, res) => {
   const { assigned_to, status } = req.query;
   try {
-    let query = 'SELECT * FROM tasks WHERE 1=1';
-    const params = [];
+    const restaurantId = req.user?.restaurant_id;
+    if (!restaurantId) return res.status(401).json({ error: "Unauthorized" });
+
+    let query = 'SELECT * FROM tasks WHERE restaurant_id = $1';
+    const params = [restaurantId];
+    let idx = 2;
 
     if (assigned_to) {
       params.push(assigned_to);
-      query += ` AND assigned_to = $${params.length}`;
+      query += ` AND assigned_to = $${idx++}`;
     }
 
     if (status) {
       params.push(status);
-      query += ` AND status = $${params.length}`;
+      query += ` AND status = $${idx++}`;
     }
 
     query += " ORDER BY created_at DESC";
@@ -263,6 +318,8 @@ router.put("/tasks/:id", async (req, res) => {
     priority,
     station,
   } = req.body;
+  const restaurantId = req.user?.restaurant_id;
+  if (!restaurantId) return res.status(401).json({ error: "Unauthorized" });
 
   if (!title) {
     return res.status(400).json({ error: "Task title is required." });
@@ -271,16 +328,29 @@ router.put("/tasks/:id", async (req, res) => {
   try {
     const update = await pool.query(
       `UPDATE tasks
-       SET title = $1,
-           description = $2,
-           assigned_to = $3,
-           due_at = $4,
-           priority = $5,
-           station = $6
-       WHERE restaurant_id = $1 AND id = $7
+         SET title = $1,
+             description = $2,
+             assigned_to = $3,
+             due_at = $4,
+             priority = $5,
+             station = $6
+       WHERE restaurant_id = $7 AND id = $8
        RETURNING *`,
-      [title, description || "", assigned_to || null, due_at || null, priority || "medium", station || null, id]
+      [
+        title,
+        description || "",
+        assigned_to || null,
+        due_at || null,
+        priority || "medium",
+        station || null,
+        restaurantId,
+        id,
+      ]
     );
+
+    if (update.rowCount === 0) {
+      return res.status(404).json({ error: "Task not found" });
+    }
 
     const updatedTask = update.rows[0];
     getIO(req)?.emit("task_updated", updatedTask);
@@ -294,7 +364,10 @@ router.put("/tasks/:id", async (req, res) => {
 // ✅ Clear all tasks (use with caution)
 router.delete("/tasks/clear", async (req, res) => {
   try {
-    await pool.query("DELETE FROM tasks");
+    const restaurantId = req.user?.restaurant_id;
+    if (!restaurantId) return res.status(401).json({ error: "Unauthorized" });
+
+    await pool.query("DELETE FROM tasks WHERE restaurant_id = $1", [restaurantId]);
     getIO(req)?.emit("tasks_cleared");
     res.status(200).json({ message: "All tasks deleted." });
   } catch (err) {
@@ -306,7 +379,13 @@ router.delete("/tasks/clear", async (req, res) => {
 // ✅ Clear only completed tasks
 router.delete("/tasks/clear-completed", async (req, res) => {
   try {
-    const result = await pool.query("DELETE FROM tasks WHERE status = 'completed'");
+    const restaurantId = req.user?.restaurant_id;
+    if (!restaurantId) return res.status(401).json({ error: "Unauthorized" });
+
+    const result = await pool.query(
+      "DELETE FROM tasks WHERE restaurant_id = $1 AND status = 'completed'",
+      [restaurantId]
+    );
     const count = result.rowCount;
 
     getIO(req)?.emit("tasks_cleared_completed");

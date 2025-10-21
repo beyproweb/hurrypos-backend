@@ -8,7 +8,9 @@ const {
   emitOrderDelivered,
   emitAlert,
 } = require("../utils/realtime");
+const authMiddleware = require("../middleware/authMiddleware");
 
+router.use(authMiddleware);
 const { getIO } = require("../utils/socket");
 
 const { generateReportPDF, generateReportCSV } = require("../utils/exportUtils");
@@ -74,15 +76,17 @@ router.get("/summary", async (req, res) => {
     `, [startDate, endDate]);
     const grossSales = parseFloat(grossSalesRes.rows[0].gross_sales);
 
-    const netSalesRes = await client.query(`
-      SELECT COALESCE(SUM(total - p.discount_value), 0) AS net_sales
-      FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 o
-      JOIN order_items oi ON o.id = oi.order_id
-      JOIN products p ON oi.product_id = p.id
-      WHERE o.status IN ('paid', 'closed')
-        AND o.created_at >= $1::date
-        AND o.created_at < ($2::date + INTERVAL '1 day')
-    `, [startDate, endDate]);
+   const netSalesRes = await client.query(`
+  SELECT COALESCE(SUM(o.total - p.discount_value), 0) AS net_sales
+  FROM orders o
+  JOIN order_items oi ON o.id = oi.order_id
+  JOIN products p ON oi.product_id = p.id
+  WHERE o.restaurant_id = $1
+    AND o.status IN ('paid', 'closed')
+    AND o.created_at >= $2::date
+    AND o.created_at < ($3::date + INTERVAL '1 day')
+`, [req.user.restaurant_id, startDate, endDate]);
+
     const netSales = parseFloat(netSalesRes.rows[0].net_sales);
 
     // Expenses
@@ -250,7 +254,7 @@ router.get("/sales-by-payment-method-detailed", async (req, res) => {
 // GET /reports/profit-loss?range=daily|weekly|monthly
 router.get("/profit-loss", async (req, res) => {
   const { timeframe, from, to } = req.query;
-
+  const restaurantId = req.user?.restaurant_id;
   const startDate = from || "2000-01-01";
   const endDate = to || "2100-01-01";
 
@@ -274,22 +278,24 @@ router.get("/profit-loss", async (req, res) => {
         SELECT
           ${groupByClause} AS group_date,
           COALESCE(SUM(o.total - p.discount_value), 0) AS profit
-        FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 o
+        FROM orders o
         LEFT JOIN order_items oi ON o.id = oi.order_id
         LEFT JOIN products p ON oi.product_id = p.id
-        WHERE o.status IN ('paid', 'closed')
-          AND o.created_at >= $1::date
-          AND o.created_at < ($2::date + INTERVAL '1 day')
+        WHERE o.restaurant_id = $1
+          AND o.status IN ('paid', 'closed')
+          AND o.created_at >= $2::date
+          AND o.created_at < ($3::date + INTERVAL '1 day')
         GROUP BY group_date
       ),
       payment_losses AS (
         SELECT
           TO_CHAR(t.delivery_date, ${dateFormat}) AS group_date,
           COALESCE(SUM(t.amount_paid), 0) AS loss
-        FROM transactions WHERE restaurant_id = $1 WHERE restaurant_id = $1 t
-        WHERE t.ingredient = 'Payment'
-          AND t.delivery_date >= $1::date
-          AND t.delivery_date < ($2::date + INTERVAL '1 day')
+        FROM transactions t
+        WHERE t.restaurant_id = $1
+          AND t.ingredient = 'Payment'
+          AND t.delivery_date >= $2::date
+          AND t.delivery_date < ($3::date + INTERVAL '1 day')
         GROUP BY group_date
       )
       SELECT
@@ -299,7 +305,7 @@ router.get("/profit-loss", async (req, res) => {
       FROM order_profits op
       LEFT JOIN payment_losses pl ON op.group_date = pl.group_date
       ORDER BY date
-    `, [startDate, endDate]);
+    `, [restaurantId, startDate, endDate]);
 
     res.json(result.rows);
   } catch (err) {
@@ -308,6 +314,48 @@ router.get("/profit-loss", async (req, res) => {
   }
 });
 
+
+router.get("/staff-performance", async (req, res) => {
+  const { from, to } = req.query;
+  const restaurantId = req.user?.restaurant_id;
+
+  if (!from || !to) return res.status(400).json({ error: "Missing date range" });
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        COALESCE(
+          s.name,
+          CASE
+            WHEN o.order_type IN ('online', 'packet') THEN 'Online Orders'
+            WHEN o.order_type = 'phone' THEN 'Phone Orders'
+            ELSE 'Unassigned'
+          END
+        ) AS staff_name,
+        COUNT(DISTINCT o.id) AS orders_handled,
+        COALESCE(SUM(o.total), 0) AS total_sales,
+        COALESCE(AVG(o.total), 0) AS avg_order_value,
+        COALESCE(SUM(oi.quantity), 0) AS total_items_sold
+      FROM orders o
+      LEFT JOIN order_items oi ON o.id = oi.order_id
+      LEFT JOIN staff s ON o.created_by = s.id
+      WHERE o.restaurant_id = $1
+        AND o.status IN ('paid', 'closed')
+        AND o.created_at >= $2::date
+        AND o.created_at < ($3::date + INTERVAL '1 day')
+      GROUP BY 1
+      ORDER BY total_sales DESC
+      `,
+      [restaurantId, from, to]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error in /reports/staff-performance:", err);
+    res.status(500).json({ error: "Failed to fetch staff performance" });
+  }
+});
 
 // GET /reports/daily-expenses
 router.get("/daily-expenses", async (req, res) => {
@@ -790,9 +838,13 @@ const todayStr = istNow.toISOString().slice(0, 10);
   try {
     // Keep close logic unchanged (block if orders open or before shop close time)
     if (type === "close") {
-      const openOrdersRes = await pool.query(`
-        SELECT COUNT(*) FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE status != 'closed'
-      `);
+      const openOrdersRes = await pool.query(
+  `SELECT COUNT(*) FROM orders
+   WHERE restaurant_id = $1
+     AND status != 'closed'`,
+  [req.user.restaurant_id]
+);
+
       const openCount = parseInt(openOrdersRes.rows[0].count, 10);
       if (openCount > 0) {
         return res.status(400).json({
@@ -995,25 +1047,34 @@ router.post("/receipt-methods", async (req, res) => {
 });
 
 // GET /api/reports/supplier-cash-payments?from=YYYY-MM-DD&to=YYYY-MM-DD
+// ✅ GET /api/reports/supplier-cash-payments?from=YYYY-MM-DD&to=YYYY-MM-DD
 router.get("/supplier-cash-payments", async (req, res) => {
   const { from, to } = req.query;
+  const restaurantId = req.user?.restaurant_id; // tenant-safe scope
+
   try {
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT
         t.amount_paid AS amount,
         t.created_at,
         s.name AS note,
         'supplier' AS type
-      FROM transactions WHERE restaurant_id = $1 WHERE restaurant_id = $1 t
+      FROM transactions t
       JOIN suppliers s ON t.supplier_id = s.id
-      WHERE t.ingredient = 'Payment'
+      WHERE t.restaurant_id = $1
+        AND t.ingredient = 'Payment'
         AND LOWER(t.payment_method) = 'cash'
-        AND t.delivery_date >= $1
-        AND t.delivery_date < ($2::date + INTERVAL '1 day')
+        AND t.delivery_date >= $2::date
+        AND t.delivery_date < ($3::date + INTERVAL '1 day')
       ORDER BY t.created_at ASC
-    `, [from, to]);
+      `,
+      [restaurantId, from, to]
+    );
+
     res.json(result.rows);
   } catch (err) {
+    console.error("❌ Failed to fetch supplier cash payments:", err);
     res.status(500).json({ error: "Failed to fetch supplier cash payments" });
   }
 });
