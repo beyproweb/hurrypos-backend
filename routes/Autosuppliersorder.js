@@ -8,6 +8,12 @@ const authMiddleware = require("../middleware/authMiddleware");
            Auto supplier orders
   ===============================*/
   router.use(authMiddleware);
+// Helper: normalize Postgres text[] to JS array
+const normalizeArray = (val) => {
+  if (!val) return [];
+  if (Array.isArray(val)) return val;
+  return val.replace(/[{}"]/g, "").split(",").filter(Boolean);
+};
 
   // ✅ Create supplier cart
   router.post("/supplier-carts", async (req, res) => {
@@ -91,10 +97,6 @@ router.post("/supplier-cart-items", async (req, res) => {
       return res.status(404).json({ error: "Cart not found." });
     }
 
-    await pool.query(
-      `UPDATE supplier_carts SET confirmed=true WHERE restaurant_id=$1 AND id=$2`,
-      [restaurantId, cart_id]
-    );
 
     // Insert/Update item
     await pool.query(
@@ -123,48 +125,59 @@ router.post("/supplier-cart-items", async (req, res) => {
 
 
   // ✅ Confirm supplier cart
-  router.put("/supplier-carts/:id/confirm", async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { scheduled_at, repeat_type, repeat_days, auto_confirm } = req.body;
-      const restaurantId = req.user.restaurant_id;
+// ✅ Confirm supplier cart
+router.put("/supplier-carts/:id/confirm", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { scheduled_at, repeat_type, repeat_days, auto_confirm } = req.body;
+    const restaurantId = req.user.restaurant_id;
 
-      if (!scheduled_at) {
-        return res.status(400).json({ error: "Scheduled date/time is required." });
-      }
-
-      const currentRes = await pool.query(
-        `SELECT * FROM supplier_carts WHERE restaurant_id=$1 AND id=$2`,
-        [restaurantId, id]
-      );
-      const current = currentRes.rows[0];
-      if (!current) return res.status(404).json({ error: "Cart not found." });
-
-      const updateRes = await pool.query(
-        `UPDATE supplier_carts
-         SET confirmed=true,
-             scheduled_at=$1,
-             repeat_type=$2,
-             repeat_days=$3,
-             auto_confirm=$4
-         WHERE restaurant_id=$5 AND id=$6
-         RETURNING *`,
-        [
-          scheduled_at,
-          repeat_type ?? current.repeat_type,
-          Array.isArray(repeat_days) ? repeat_days : current.repeat_days,
-          typeof auto_confirm === "boolean" ? auto_confirm : current.auto_confirm,
-          restaurantId,
-          id,
-        ]
-      );
-
-      res.json({ cart: updateRes.rows[0], message: "Cart confirmed and scheduled." });
-    } catch (error) {
-      console.error("❌ Error confirming supplier cart:", error);
-      res.status(500).json({ error: "Database error confirming cart." });
+    if (!scheduled_at) {
+      return res.status(400).json({ error: "Scheduled date/time is required." });
     }
-  });
+
+    const currentRes = await pool.query(
+      `SELECT * FROM supplier_carts WHERE restaurant_id=$1 AND id=$2`,
+      [restaurantId, id]
+    );
+    const current = currentRes.rows[0];
+    if (!current) return res.status(404).json({ error: "Cart not found." });
+
+    // ✅ Properly cast JS array → Postgres text[]
+    const repeatDaysArray = Array.isArray(repeat_days)
+      ? repeat_days
+      : normalizeArray(current.repeat_days);
+
+    const updateRes = await pool.query(
+      `UPDATE supplier_carts
+       SET confirmed = true,
+           scheduled_at = $1,
+           repeat_type = $2,
+           repeat_days = $3::text[],
+           auto_confirm = $4
+       WHERE restaurant_id = $5 AND id = $6
+       RETURNING *`,
+      [
+        scheduled_at,
+        repeat_type ?? current.repeat_type,
+        repeatDaysArray,
+        typeof auto_confirm === "boolean" ? auto_confirm : current.auto_confirm,
+        restaurantId,
+        id,
+      ]
+    );
+
+    res.json({
+      cart: updateRes.rows[0],
+      message: "Cart confirmed and scheduled.",
+    });
+  } catch (error) {
+    console.error("❌ Error confirming supplier cart:", error);
+    res.status(500).json({ error: "Database error confirming cart." });
+  }
+});
+
+
 
   // ✅ Send supplier cart
   router.post("/supplier-carts/:id/send", async (req, res) => {
@@ -216,56 +229,99 @@ router.post("/supplier-cart-items", async (req, res) => {
     }
   });
 
-  // ✅ Get cart items
-  router.get("/supplier-carts/items", async (req, res) => {
-    const { supplier_id, cart_id } = req.query;
-    const restaurantId = req.user.restaurant_id;
+// ✅ Get cart items (tenant-safe, with fallback to scheduled)
+router.get("/supplier-carts/items", async (req, res) => {
+  const { supplier_id, cart_id } = req.query;
+  const restaurantId = req.user.restaurant_id;
 
-    try {
-      let targetCart;
-      if (cart_id) {
-        const cartRes = await pool.query(
-          `SELECT * FROM supplier_carts WHERE restaurant_id=$1 AND id=$2`,
-          [restaurantId, cart_id]
-        );
-        if (!cartRes.rows.length)
-          return res.status(404).json({ error: "Cart not found." });
-        targetCart = cartRes.rows[0];
-     } else if (supplier_id) {
-  const cartRes = await pool.query(
-    `SELECT * FROM supplier_carts
-     WHERE restaurant_id=$1 AND supplier_id=$2
-       AND confirmed=false AND archived=false
-     ORDER BY created_at DESC LIMIT 1`,
-    [restaurantId, supplier_id]
-  );
+  try {
+    let targetCart;
 
-  if (cartRes.rows.length) {
-    targetCart = cartRes.rows[0];
-  } else {
-    // 🚀 Auto-create a new empty cart if none exists
-    const insertRes = await pool.query(
-      `INSERT INTO supplier_carts (restaurant_id, supplier_id, confirmed, archived)
-       VALUES ($1, $2, false, false)
-       RETURNING *`,
-      [restaurantId, supplier_id]
-    );
-    targetCart = insertRes.rows[0];
-    console.log(`🆕 Auto-created new supplier cart id=${targetCart.id} for supplier=${supplier_id}`);
-  }
-}
-
-
-      const itemsRes = await pool.query(
-        `SELECT * FROM supplier_cart_items WHERE cart_id=$1`,
-        [targetCart.id]
+    if (cart_id) {
+      // Try fetch specific cart
+      const cartRes = await pool.query(
+        `SELECT * FROM supplier_carts WHERE restaurant_id=$1 AND id=$2`,
+        [restaurantId, cart_id]
       );
-      res.json({ cart_id: targetCart.id, items: itemsRes.rows });
-    } catch (error) {
-      console.error("❌ Error fetching cart items:", error);
-      res.status(500).json({ error: "Database error fetching cart items." });
+
+      if (cartRes.rows.length) {
+        targetCart = cartRes.rows[0];
+      } else {
+        // 🔄 fallback: last confirmed scheduled cart for supplier
+        const fallbackRes = await pool.query(
+          `SELECT * FROM supplier_carts
+           WHERE restaurant_id=$1 AND supplier_id=$2
+             AND confirmed=true AND archived=false
+           ORDER BY scheduled_at DESC
+           LIMIT 1`,
+          [restaurantId, supplier_id]
+        );
+        if (!fallbackRes.rows.length) {
+          return res.status(404).json({ error: "Cart not found." });
+        }
+        targetCart = fallbackRes.rows[0];
+      }
+    } else if (supplier_id) {
+      // 1. Try open cart (unconfirmed)
+      let cartRes = await pool.query(
+        `SELECT * FROM supplier_carts
+         WHERE restaurant_id=$1 AND supplier_id=$2
+           AND confirmed=false AND archived=false
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [restaurantId, supplier_id]
+      );
+
+      // 2. Fallback → last confirmed scheduled
+      if (cartRes.rows.length === 0) {
+        cartRes = await pool.query(
+          `SELECT * FROM supplier_carts
+           WHERE restaurant_id=$1 AND supplier_id=$2
+             AND confirmed=true AND archived=false
+           ORDER BY scheduled_at DESC
+           LIMIT 1`,
+          [restaurantId, supplier_id]
+        );
+      }
+
+      if (cartRes.rows.length) {
+        targetCart = cartRes.rows[0];
+      } else {
+        // 3. If nothing at all → create fresh empty cart
+        const insertRes = await pool.query(
+          `INSERT INTO supplier_carts (restaurant_id, supplier_id, confirmed, archived)
+           VALUES ($1, $2, false, false)
+           RETURNING *`,
+          [restaurantId, supplier_id]
+        );
+        targetCart = insertRes.rows[0];
+        console.log(
+          `🆕 Auto-created new supplier cart id=${targetCart.id} for supplier=${supplier_id}`
+        );
+      }
     }
-  });
+
+    // Get items for the cart
+    const itemsRes = await pool.query(
+      `SELECT * FROM supplier_cart_items WHERE restaurant_id=$1 AND cart_id=$2`,
+      [restaurantId, targetCart.id]
+    );
+
+    res.json({
+      cart_id: targetCart.id,
+      items: itemsRes.rows,
+      scheduled_at: targetCart.scheduled_at || null,
+ repeat_type: targetCart.repeat_type || "none",
+ repeat_days: normalizeArray(targetCart.repeat_days) || [],
+ auto_confirm: targetCart.auto_confirm === true, // always boolean
+    });
+  } catch (error) {
+    console.error("❌ Error fetching cart items:", error);
+    res.status(500).json({ error: "Database error fetching cart items." });
+  }
+});
+
+
 
   // ✅ Patch stock
   router.patch("/stock/:id", async (req, res) => {
@@ -352,33 +408,8 @@ router.post("/supplier-cart-items", async (req, res) => {
     }
   });
 
-  // ✅ Get stock item
-router.get("/stock/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (isNaN(Number(id))) {
-      return res.status(400).json({ error: "Stock ID must be a number" });
-    }
-
-    const restaurantId = req.user.restaurant_id;
-    const result = await pool.query(
-      `SELECT * FROM stock WHERE restaurant_id=$1 AND id=$2`,
-      [restaurantId, id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Stock item not found." });
-    }
-
-    res.json({ stock: result.rows[0] });
-  } catch (error) {
-    console.error("❌ Error fetching stock by ID:", error);
-    res.status(500).json({ error: "Database error fetching stock." });
-  }
-});
 
 
-  // ✅ Update cart item quantity
 // ✅ Update cart item quantity
 router.patch("/supplier-cart-items/:id", async (req, res) => {
   try {
@@ -421,74 +452,167 @@ router.patch("/supplier-cart-items/:id", async (req, res) => {
 
 
   // ✅ History
-  router.get("/supplier-carts/history", async (req, res) => {
-    const { supplier_id } = req.query;
+router.get("/supplier-carts/history", async (req, res) => {
+  const { supplier_id } = req.query;
+  const restaurantId = req.user.restaurant_id;
 
-    if (!supplier_id || isNaN(Number(supplier_id))) {
-      return res.status(400).json({ error: "Valid supplier_id is required." });
-    }
+  if (!supplier_id || isNaN(Number(supplier_id))) {
+    return res.status(400).json({ error: "Valid supplier_id is required." });
+  }
 
-    try {
-      const historyRes = await pool.query(
-        `SELECT sc.*, sc.skipped, array_agg(json_build_object(
+  try {
+    const historyRes = await pool.query(
+      `SELECT sc.*, sc.skipped, array_agg(json_build_object(
           'product_name', sci.product_name,
           'quantity', sci.quantity,
           'unit', sci.unit
         )) AS items
-         FROM supplier_carts sc
-         LEFT JOIN supplier_cart_items sci ON sci.cart_id=sc.id
-         WHERE sc.supplier_id=$1 AND sc.archived=true
-         GROUP BY sc.id
-         ORDER BY sc.scheduled_at DESC
-         LIMIT 5`,
-        [Number(supplier_id)]
-      );
+       FROM supplier_carts sc
+       LEFT JOIN supplier_cart_items sci ON sci.cart_id=sc.id
+       WHERE sc.restaurant_id=$1 AND sc.supplier_id=$2 AND sc.archived=true
+       GROUP BY sc.id
+       ORDER BY sc.scheduled_at DESC
+       LIMIT 5`,
+      [restaurantId, Number(supplier_id)]
+    );
 
-      res.json({ history: historyRes.rows });
-    } catch (error) {
-      console.error("❌ Error fetching supplier cart history:", error);
-      res.status(500).json({ error: "Database error fetching history." });
-    }
-  });
+    const history = historyRes.rows.map((row) => ({
+      ...row,
+      repeat_days: normalizeArray(row.repeat_days), // ✅ normalize here
+    }));
+
+    res.json({ history });
+  } catch (error) {
+    console.error("❌ Error fetching supplier cart history:", error);
+    res.status(500).json({ error: "Database error fetching history." });
+  }
+});
+
 
   // ✅ Scheduled
-  router.get("/supplier-carts/scheduled", async (req, res) => {
-    const { supplier_id } = req.query;
+// ✅ Scheduled (always returns something: scheduled → open → new empty)
+router.get("/supplier-carts/scheduled", async (req, res) => {
+  const { supplier_id } = req.query;
+  const restaurantId = req.user.restaurant_id;
 
-    if (!supplier_id || isNaN(Number(supplier_id))) {
-      return res.status(400).json({ error: "Valid supplier_id is required." });
-    }
+  if (!supplier_id || isNaN(Number(supplier_id))) {
+    return res.status(400).json({ error: "Valid supplier_id is required." });
+  }
 
-    try {
-      const cartRes = await pool.query(
+  try {
+    // 1. Prefer last confirmed scheduled
+    let cartRes = await pool.query(
+      `SELECT * FROM supplier_carts
+       WHERE restaurant_id=$1 AND supplier_id=$2
+         AND confirmed=true AND archived=false
+       ORDER BY scheduled_at DESC
+       LIMIT 1`,
+      [restaurantId, Number(supplier_id)]
+    );
+
+    let cart = cartRes.rows[0];
+
+    // 2. If no scheduled → fallback to latest open (unconfirmed)
+    if (!cart) {
+      cartRes = await pool.query(
         `SELECT * FROM supplier_carts
-         WHERE supplier_id=$1 AND confirmed=true AND archived=false
-         ORDER BY scheduled_at ASC
+         WHERE restaurant_id=$1 AND supplier_id=$2
+           AND confirmed=false AND archived=false
+         ORDER BY created_at DESC
          LIMIT 1`,
-        [Number(supplier_id)]
+        [restaurantId, Number(supplier_id)]
       );
-
-      const cart = cartRes.rows[0];
-      if (!cart) return res.status(404).json({ error: "No scheduled cart found." });
-
-      const itemsRes = await pool.query(
-        `SELECT * FROM supplier_cart_items WHERE cart_id=$1`,
-        [cart.id]
-      );
-
-      res.json({
-        cart_id: cart.id,
-        items: itemsRes.rows,
-        scheduled_at: cart.scheduled_at,
-        repeat_type: cart.repeat_type,
-        repeat_days: cart.repeat_days,
-        auto_confirm: cart.auto_confirm,
-      });
-    } catch (err) {
-      console.error("❌ Error fetching scheduled cart:", err);
-      res.status(500).json({ error: "Database error fetching scheduled cart." });
+      cart = cartRes.rows[0];
     }
-  });
+
+    // 3. If still nothing → create new empty cart
+    if (!cart) {
+      const insertRes = await pool.query(
+        `INSERT INTO supplier_carts (restaurant_id, supplier_id, confirmed, archived)
+         VALUES ($1, $2, false, false)
+         RETURNING *`,
+        [restaurantId, supplier_id]
+      );
+      cart = insertRes.rows[0];
+      console.log(`🆕 Auto-created new supplier cart id=${cart.id} for supplier=${supplier_id}`);
+    }
+
+    // Fetch items for this cart
+    const itemsRes = await pool.query(
+      `SELECT * FROM supplier_cart_items WHERE restaurant_id=$1 AND cart_id=$2`,
+      [restaurantId, cart.id]
+    );
+
+    res.json({
+      cart_id: cart.id,
+      items: itemsRes.rows,
+      scheduled_at: cart.scheduled_at || null,
+      repeat_type: cart.repeat_type || "none",
+      repeat_days: normalizeArray(cart.repeat_days) || [],
+      auto_confirm: cart.auto_confirm === true,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching scheduled cart:", err);
+    res.status(500).json({ error: "Database error fetching scheduled cart." });
+  }
+});
+
+
+// ✅ Get all pending scheduled (confirmed + not archived) orders for a supplier
+router.get("/supplier-carts/pending", async (req, res) => {
+  const { supplier_id } = req.query;
+  const restaurantId = req.user.restaurant_id;
+
+  if (!supplier_id || isNaN(Number(supplier_id))) {
+    return res.status(400).json({ error: "Valid supplier_id is required." });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM supplier_carts
+       WHERE restaurant_id=$1 AND supplier_id=$2
+         AND confirmed=true AND archived=false
+       ORDER BY scheduled_at ASC`,
+      [restaurantId, Number(supplier_id)]
+    );
+
+    const carts = rows.map((cart) => ({
+      ...cart,
+      repeat_days: normalizeArray(cart.repeat_days),
+    }));
+
+    res.json({ pending: carts });
+  } catch (err) {
+    console.error("❌ Error fetching pending scheduled orders:", err);
+    res.status(500).json({ error: "Database error fetching pending scheduled orders." });
+  }
+});
+
+// ✅ Cancel a scheduled supplier cart (mark archived=true)
+router.put("/supplier-carts/:id/cancel", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const restaurantId = req.user.restaurant_id;
+
+    const updateRes = await pool.query(
+      `UPDATE supplier_carts
+       SET archived=true
+       WHERE restaurant_id=$1 AND id=$2
+       RETURNING *`,
+      [restaurantId, id]
+    );
+
+    if (updateRes.rows.length === 0) {
+      return res.status(404).json({ error: "Cart not found or already archived." });
+    }
+
+    res.json({ success: true, cart: updateRes.rows[0] });
+  } catch (err) {
+    console.error("❌ Error canceling scheduled order:", err);
+    res.status(500).json({ error: "Database error canceling scheduled order." });
+  }
+});
+
 
   // ✅ Ingredient average prices
   router.get("/ingredients/average-prices", async (req, res) => {

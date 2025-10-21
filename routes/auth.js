@@ -26,7 +26,9 @@ router.post("/login", async (req, res) => {
 
     console.log("🛠️ Querying users table…");
     const userRes = await pool.query(
-      "SELECT id, full_name AS name, email, password_hash AS password, restaurant_id, role FROM users WHERE email = $1 LIMIT 1",
+      `SELECT id, full_name, email, password_hash, role, restaurant_id
+       FROM users
+       WHERE email = $1`,
       [email]
     );
 
@@ -40,9 +42,11 @@ router.post("/login", async (req, res) => {
     if (!user) {
       console.log("🛠️ Querying staff table…");
       const staffRes = await pool.query(
-        "SELECT id, name, email, password, restaurant_id, role FROM staff WHERE email = $1 LIMIT 1",
+        `SELECT id, name, email, pin, restaurant_id, role
+         FROM staff WHERE email = $1 LIMIT 1`,
         [email]
       );
+
       if (staffRes.rows.length > 0) {
         user = staffRes.rows[0];
         source = "staff";
@@ -58,12 +62,15 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    // check password
+    // check password or PIN
     let passwordMatch = false;
     try {
-      passwordMatch = await bcrypt.compare(password, user.password);
+      passwordMatch =
+        source === "staff"
+          ? user.pin === password // compare PIN directly
+          : await bcrypt.compare(password, user.password_hash);
     } catch (e) {
-      passwordMatch = user.password === password;
+      passwordMatch = false;
     }
 
     if (!passwordMatch) {
@@ -74,11 +81,11 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    // create token
+    // create JWT token
     const token = jwt.sign(
       {
         id: user.id,
-        name: user.name,
+        name: user.name || user.full_name,
         role: user.role || "staff",
         restaurant_id: user.restaurant_id,
       },
@@ -88,16 +95,61 @@ router.post("/login", async (req, res) => {
 
     console.log(`✅ ${source} login success:`, user.email);
 
+    // ✅ Fetch role permissions (MERGED from both users + global)
+    let permissions = [];
+    const roleKey = user.role?.toLowerCase();
+
+    try {
+      const result = await pool.query(
+        `SELECT key, value, users
+         FROM settings
+         WHERE restaurant_id = $1
+           AND key IN ('users', 'global')`,
+        [user.restaurant_id]
+      );
+
+      let valueConfig = {};
+      let usersConfig = {};
+
+      for (const row of result.rows) {
+        if (row.key === "users" && row.value) valueConfig = row.value;
+        if (row.key === "global" && row.users) usersConfig = row.users;
+      }
+
+      // 🧩 Merge both configs safely
+      const merged = {
+        roles: {
+          ...(usersConfig.roles || {}),
+          ...(valueConfig.roles || {}), // value overwrites same roles
+        },
+      };
+
+      if (merged.roles?.[roleKey]) {
+        permissions = merged.roles[roleKey];
+      } else if (merged.roles?.boss) {
+        permissions = merged.roles.boss;
+      } else if (roleKey === "boss" && merged.roles?.admin) {
+        permissions = merged.roles.admin;
+      }
+
+      console.log("🔎 Merged Roles:", merged.roles);
+      console.log(`✅ Final permissions for ${roleKey}:`, permissions);
+    } catch (err) {
+      console.error("⚠️ Error loading permissions:", err);
+    }
+
+    // ✅ Respond with token and normalized user data
     res.json({
       success: true,
       message: "Login successful",
       source,
       user: {
         id: user.id,
-        name: user.name,
+        name: user.name || user.full_name,
         email: user.email,
         role: user.role,
         restaurant_id: user.restaurant_id,
+        permissions,
       },
       token,
     });

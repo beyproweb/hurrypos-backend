@@ -8,7 +8,9 @@
 const { performance } = require("perf_hooks");
 const dlog = (...args) =>
   console.log(new Date().toISOString(), "[orders]", ...args);
+const authMiddleware = require("../middleware/authMiddleware");
 
+router.use(authMiddleware);
 
 // Track the last write/update time per order id to spot read-after-write timing
 const ORDER_TOUCH = new Map(); // id:number -> { when:number(ms), source:string }
@@ -25,16 +27,39 @@ function since(id) {
 }
 
 
-  const { emitAlert, emitStockUpdate,emitOrderUpdate,emitOrderConfirmed,emitOrderDelivered} = require('../utils/realtime');
+const { emitAlert, emitStockUpdate, emitOrderUpdate, emitOrderConfirmed, emitOrderDelivered, emitPaymentMade } = require('../utils/realtime');
+
+let ordersHasCreatedByColumn = null;
+async function hasOrdersCreatedByColumn() {
+  if (ordersHasCreatedByColumn !== null) return ordersHasCreatedByColumn;
+  try {
+    const { rows } = await pool.query(
+      `
+      SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'orders'
+          AND column_name = 'created_by'
+      ) AS exists
+      `
+    );
+    ordersHasCreatedByColumn = !!rows?.[0]?.exists;
+  } catch (err) {
+    console.warn("⚠️ Unable to detect orders.created_by column:", err.message);
+    ordersHasCreatedByColumn = false;
+  }
+  return ordersHasCreatedByColumn;
+}
 
 
 // ---- Shared payload builder for printer (no order_number) ----
-async function buildFullOrderPayload(orderId) {
+async function buildFullOrderPayload(orderId, restaurantId) {
   const { rows: orderRows } = await pool.query(
     `SELECT id, status, table_number, order_type, total, created_at
-     FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
-    [orderId]
+     FROM orders WHERE restaurant_id = $1 AND id = $2`,
+    [restaurantId, orderId]
   );
+
   if (!orderRows.length) throw new Error(`Order ${orderId} not found`);
 
   const { rows: itemRows } = await pool.query(
@@ -56,13 +81,12 @@ async function buildFullOrderPayload(orderId) {
     [orderId]
   );
 
-  const items = itemRows.map((it) => ({
+  const items = itemRows.map(it => ({
     ...it,
     name: it.order_item_name || it.product_name || "Item",
-    extras:
-      typeof it.extras === "string"
-        ? (() => { try { return JSON.parse(it.extras); } catch { return []; } })()
-        : (it.extras || []),
+    extras: typeof it.extras === "string"
+      ? (() => { try { return JSON.parse(it.extras); } catch { return []; } })()
+      : (it.extras || []),
     total: (parseFloat(it.price) || 0) * (it.quantity || 1),
   }));
 
@@ -82,50 +106,56 @@ async function buildFullOrderPayload(orderId) {
 }
 
 
-// GET /orders - Returns all active orders or filters by table_number if provided
-// AFTER: join in receipt_methods so every order row carries its own array
+
+// GET /orders
+// Supports: ?status=open_phone to return ONLY non-closed phone/packet orders
 router.get("/", async (req, res) => {
   try {
-    const { table_number, type } = req.query;
-    const clauses = [];
-    const params = [];
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    const restaurantId = req.user.restaurant_id;
+    const { status, table_number, type } = req.query;
+
+    // 🔐 Special mode: always and only open phone/packet
+    if (String(status).toLowerCase() === "open_phone") {
+      const { rows } = await pool.query(
+        `SELECT *
+           FROM orders
+          WHERE restaurant_id = $1
+            AND order_type IN ('phone','packet')
+            AND status <> 'closed'
+          ORDER BY id DESC`,
+        [restaurantId]
+      );
+      return res.json(rows);
+    }
+
+    // 🔎 default behavior
+    let sql = "SELECT * FROM orders WHERE restaurant_id = $1";
+    const params = [restaurantId];
+    let idx = 2;
+
+    if (status) {
+      sql += ` AND status = $${idx++}`;
+      params.push(status);
+    }
     if (table_number) {
+      sql += ` AND table_number = $${idx++}`;
       params.push(table_number);
-      clauses.push(`o.table_number = $${params.length}`);
-      clauses.push(`o.status != 'closed'`);
     }
     if (type) {
+      sql += ` AND order_type = $${idx++}`;
       params.push(type);
-      clauses.push(`o.order_type = $${params.length}`);
-      clauses.push(`o.status != 'closed'`);
     }
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    const sql = `
-      SELECT
-        o.*,
-        COALESCE(
-          JSON_AGG(
-            JSON_BUILD_OBJECT(
-              'payment_method', r.payment_method,
-              'amount',         r.amount
-            ) ORDER BY r.id
-          ) FILTER (WHERE r.id IS NOT NULL),
-          '[]'
-        ) AS receipt_methods
-      FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 o
-      LEFT JOIN receipt_methods r
-        ON r.receipt_id = o.receipt_id
-      ${where}
-      GROUP BY o.id
-      ORDER BY o.created_at DESC
-    `;
-    const { rows } = await pool.query(sql, params);
-    res.json(rows);
+    sql += " ORDER BY id DESC";
+
+    const result = await pool.query(sql, params);
+    res.json(result.rows);
   } catch (err) {
-    console.error(err);
+    console.error("❌ Orders fetch failed:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
+
 
 
 
@@ -169,33 +199,98 @@ router.post("/", async (req, res) => {
     } = req.body;
 
     console.log("ORDER TYPE from payload:", order_type);
+    const hasCreatedByColumn = await hasOrdersCreatedByColumn();
     await client.query("BEGIN");
 
     const hasItems = Array.isArray(items) && items.length > 0;
-    const initialStatus = hasItems ? "confirmed" : "occupied";
+const initialStatus =
+  hasItems ? "confirmed" :
+  order_type === "phone" ? "occupied" :
+  "occupied";
 
-    const orderResult = await client.query(
-      `
-      INSERT INTO orders (
-        table_number, status, total, order_type,
-        customer_name, customer_phone, customer_address, payment_method
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *
-      `,
-      [
-        table_number || null,
-        initialStatus,
-        total,
-        order_type || null,
-        customer_name || null,
-        customer_phone || null,
-        customer_address || null,
-        payment_method || null
-      ]
+const orderInsertQuery = hasCreatedByColumn
+  ? `
+    INSERT INTO orders (
+      restaurant_id,
+      table_number, status, total, order_type,
+      customer_name, customer_phone, customer_address, payment_method,
+      created_by
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    RETURNING *
+  `
+  : `
+    INSERT INTO orders (
+      restaurant_id,
+      table_number, status, total, order_type,
+      customer_name, customer_phone, customer_address, payment_method
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    RETURNING *
+  `;
+
+const orderInsertParams = hasCreatedByColumn
+  ? [
+      req.user.restaurant_id,
+      table_number || null,
+      initialStatus,
+      total,
+      order_type || null,
+      customer_name || null,
+      customer_phone || null,
+      customer_address || null,
+      payment_method || null,
+      req.user?.id || null,
+    ]
+  : [
+      req.user.restaurant_id,
+      table_number || null,
+      initialStatus,
+      total,
+      order_type || null,
+      customer_name || null,
+      customer_phone || null,
+      customer_address || null,
+      payment_method || null,
+    ];
+
+const orderResult = await client.query(orderInsertQuery, orderInsertParams);
+
+const order = orderResult.rows[0];
+const restaurantId = req.user.restaurant_id;
+
+// ✅ Immediately persist customer + address (so it shows on frontend top bar)
+if (customer_phone && customer_address) {
+  // ---- Safe insert: only if phone not found for this restaurant ----
+  const existingCustomer = await pool.query(
+    `SELECT id FROM customers WHERE phone = $1 AND restaurant_id = $2 LIMIT 1`,
+    [customer_phone, restaurantId]
+  );
+
+  let customerId;
+  if (existingCustomer.rowCount === 0) {
+    const inserted = await pool.query(
+      `INSERT INTO customers (restaurant_id, name, phone)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [restaurantId, customer_name || 'Customer', customer_phone]
     );
+    customerId = inserted.rows[0].id;
+  } else {
+    customerId = existingCustomer.rows[0].id;
+  }
 
-    const order = orderResult.rows[0];
+  // ---- Safe insert address (idempotent) ----
+  await pool.query(
+    `
+    INSERT INTO customer_addresses (customer_id, address, is_default, restaurant_id)
+    VALUES ($1, $2, true, $3)
+    ON CONFLICT (customer_id, address)
+    DO UPDATE SET is_default = EXCLUDED.is_default
+    `,
+    [customerId, customer_address, restaurantId]
+  );
+}
 
     // DEBUG
     dlog("POST /orders created", { id: order.id, order_type, table_number, total });
@@ -203,23 +298,26 @@ router.post("/", async (req, res) => {
 
     if (hasItems) {
       await saveOrderItems(order.id, items);
-      await updateStockForOrder(items);
+      await updateStockForOrder(items, restaurantId);
       dlog("POST /orders saved items", { id: order.id, count: items.length });
     }
 
-    await client.query("COMMIT");
-    touch(order.id, "POST /orders create+commit");
+   await client.query("COMMIT");
+touch(order.id, "POST /orders create+commit");
 
-    // Always notify lists
-    if (typeof emitOrderUpdate === "function") emitOrderUpdate(io);
+// ✅ Immediately notify this restaurant that a new order exists (so frontend refreshes instantly)
+io.to(`restaurant_${restaurantId}`).emit("orders_updated");
 
-    // 🔥 If the order was created WITH items, emit a full payload for auto‑print
+if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
+
+    // 🔥 If the order was created WITH items, emit a full payload for auto-print
     if (hasItems) {
       try {
         const { rows: orderRows } = await pool.query(
           `SELECT id, status, table_number, order_type, total, created_at
-           FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
-          [order.id]
+           FROM orders
+           WHERE restaurant_id = $1 AND id = $2`,
+          [restaurantId, order.id]
         );
 
         if (orderRows.length) {
@@ -261,8 +359,8 @@ router.post("/", async (req, res) => {
             number: header.order_number ?? undefined,
             order: {
               id: header.id,
-              status: header.status,              // likely 'confirmed' here
-              table_number: header.table_number,  // table orders ✅
+              status: header.status,
+              table_number: header.table_number,
               order_type: header.order_type,
               total: header.total,
               created_at: header.created_at,
@@ -270,11 +368,9 @@ router.post("/", async (req, res) => {
             },
           };
 
-          io.emit("order_confirmed", payload);
-          console.log(
-            "🖨️ [orders] order_confirmed emitted from POST /orders (created-with-items):",
-            header.id
-          );
+          // ✅ tenant-safe emit to correct restaurant room
+          io.to(`restaurant_${restaurantId}`).emit("order_confirmed", payload);
+          console.log(`🖨️ [orders] order_confirmed emitted for restaurant_${restaurantId}:`, header.id);
         }
       } catch (e) {
         console.error("❌ Failed to emit order_confirmed from POST /orders:", e);
@@ -304,6 +400,8 @@ router.put("/:id/pay", async (req, res) => {
   try {
     await client.query("BEGIN");
 
+    const hasCreatedByColumn = await hasOrdersCreatedByColumn();
+
     // 1️⃣ Insert payment
     const paymentResult = await client.query(
       `INSERT INTO payments (order_id, amount, payment_method)
@@ -314,14 +412,26 @@ router.put("/:id/pay", async (req, res) => {
 
     // 2️⃣ Update order
     const orderResult = await client.query(
-      `UPDATE orders
-       SET payment_method = $1,
-           total = $2,
-           is_paid = true
-       WHERE restaurant_id = $1 AND id = $3
-       RETURNING *`,
-      [payment_method, total, orderId]
-    );
+  `UPDATE orders
+   SET payment_method = $1,
+       total = $2,
+       is_paid = true
+   WHERE restaurant_id = $3 AND id = $4
+   RETURNING *`,
+  [payment_method, total, req.user.restaurant_id, orderId]
+);
+
+    if (hasCreatedByColumn && req.user?.id) {
+      await client.query(
+        `
+        UPDATE orders
+        SET created_by = COALESCE(created_by, $1)
+        WHERE restaurant_id = $2 AND id = $3
+        `,
+        [req.user.id, req.user.restaurant_id, orderId]
+      );
+    }
+
 
     // 3️⃣ Mark unpaid items as paid
     await client.query(
@@ -343,12 +453,27 @@ router.put("/:id/pay", async (req, res) => {
 
     console.log("🔍 Kitchen status after PAY:", kitchenCheck.rows);
 
-    await client.query("COMMIT");
-    emitOrderUpdate(io); // Pass io if needed
-    res.json({
-      order: orderResult.rows[0],
-      payment: paymentResult.rows[0],
-    });
+await client.query("COMMIT");
+
+// 🔒 tenant-safe orders_updated
+const restaurantId = req.user.restaurant_id;
+if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
+else io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+
+// 🔥 Notify frontend that a payment was made
+emitPaymentMade(io, restaurantId, orderId, payment_method, total);
+
+
+
+console.log(`💸 [orders] payment_made emitted for restaurant_${restaurantId}, order ${orderId}`);
+
+res.json({
+  order: orderResult.rows[0],
+  payment: paymentResult.rows[0],
+});
+
+
+
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Failed to update payment info:", err);
@@ -361,119 +486,47 @@ router.put("/:id/pay", async (req, res) => {
 
 
 // ✅ PUT /orders/:id/status
+// ✅ PUT /orders/:id/status (schema-safe)
 router.put("/:id/status", async (req, res) => {
   const { id } = req.params;
   const { status, total, payment_method } = req.body;
-
+  const restaurantId = req.user.restaurant_id;
   const client = await pool.connect();
+
   try {
     await client.query("BEGIN");
 
     const result = await client.query(
       `UPDATE orders
-       SET status = $1,
-           total = COALESCE($2, total),
-           payment_method = COALESCE($3, payment_method),
-           is_paid = CASE WHEN $1 = 'paid' THEN true ELSE is_paid END
-       WHERE restaurant_id = $1 AND id = $4
+       SET
+         status = $1,
+         total = COALESCE($2, total),
+         payment_method = COALESCE($3, payment_method),
+         is_paid = CASE
+                     WHEN $1 = 'paid' THEN true
+                     WHEN $1 IN ('confirmed', 'occupied') THEN false
+                     ELSE is_paid
+                   END
+       WHERE id = $4 AND restaurant_id = $5
        RETURNING *`,
-      [status, total, payment_method, id]
+      [status, total, payment_method, id, restaurantId]
     );
 
-    if (result.rows.length === 0) {
+    if (result.rowCount === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
     }
 
-    if (status === "paid") {
-      await client.query(
-        `UPDATE order_items
-         SET paid_at = NOW(), confirmed = true
-         WHERE order_id = $1 AND paid_at IS NULL`,
-        [id]
-      );
-    }
+   await client.query("COMMIT");
 
-await client.query("COMMIT");
+// 🔒 Tenant-safe emit only to this restaurant
+io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+res.json(result.rows[0]);
 
-if (status === "confirmed") {
-  const confirmedId = parseInt(id, 10);
-
-  try {
-    // 🔥 Emit full order payload immediately
-    const { rows: orderRows } = await pool.query(
-      `SELECT id, status, table_number, order_type, total, created_at
-       FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
-      [confirmedId]
-    );
-
-    if (!orderRows.length) {
-      console.warn(`⚠️ Tried to emit order_confirmed for non-existing order ${confirmedId}`);
-    } else {
-      const { rows: itemRows } = await pool.query(
-        `SELECT
-           oi.product_id,
-           oi.unique_id,
-           oi.name AS order_item_name,
-           p.name  AS product_name,
-           oi.quantity,
-           oi.price,
-           oi.extras,
-           oi.note,
-           oi.kitchen_status,
-           oi.paid_at
-         FROM order_items oi
-         LEFT JOIN products p ON oi.product_id = p.id
-         WHERE oi.order_id = $1
-         ORDER BY oi.id ASC`,
-        [confirmedId]
-      );
-
-      const items = itemRows.map((it) => ({
-        ...it,
-        name: it.order_item_name || it.product_name || "Item",
-        extras: typeof it.extras === "string"
-          ? (() => { try { return JSON.parse(it.extras) } catch { return [] } })()
-          : (it.extras || []),
-        total: (parseFloat(it.price) || 0) * (it.quantity || 1),
-      }));
-
-      const header = orderRows[0];
-      const payload = {
-        id: header.id,
-        order_number: header.order_number ?? undefined,
-        number: header.order_number ?? undefined,
-        order: {
-          id: header.id,
-          status: header.status,
-          table_number: header.table_number,
-          order_type: header.order_type,
-          total: header.total,
-          created_at: header.created_at,
-          items,
-        },
-      };
-
-      io.emit("order_confirmed", payload);
-      console.log("🖨️ [orders] order_confirmed emitted immediately:", payload.id);
-    }
-  } catch (err) {
-    console.error("❌ Error building full order payload for order_confirmed:", err);
-  }
-}
-
-
-    emitOrderUpdate(io);
-
-    // DEBUG
-    touch(id, "PUT /orders/:id/status");
-    dlog("PUT /orders/:id/status committed", { id, status, total, payment_method });
-
-    res.json(result.rows[0]);
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("❌ Error updating order status:", err);
-    res.status(500).json({ error: "Failed to update order" });
+    console.error("❌ Failed to update order status:", err);
+    res.status(500).json({ error: "Failed to update order status" });
   } finally {
     client.release();
   }
@@ -558,26 +611,43 @@ router.post("/order-items", async (req, res) => {
 
   try {
     await saveOrderItems(order_id, preparedItems);
-    await updateStockForOrder(preparedItems);
+    await updateStockForOrder(preparedItems, req.user.restaurant_id);
      // --- ADD THIS BLOCK:
-    const orderRes = await pool.query("SELECT status FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1", [order_id]);
-    if (["closed", "occupied"].includes(orderRes.rows[0]?.status)) {
-  await pool.query("UPDATE orders SET status = 'confirmed' WHERE restaurant_id = $1 AND id = $1", [order_id]);
+const orderRes = await pool.query(
+  "SELECT status FROM orders WHERE restaurant_id = $1 AND id = $2",
+  [req.user.restaurant_id, order_id]
+);
+if (["closed", "occupied"].includes(orderRes.rows[0]?.status)) {
+  await pool.query(
+    "UPDATE orders SET status = 'confirmed' WHERE restaurant_id = $1 AND id = $2",
+    [req.user.restaurant_id, order_id]
+  );
 }
 
-    emitOrderUpdate(io);
+// --- Ensure all items and stock updates are fully written before any emit ---
+await new Promise(resolve => setTimeout(resolve, 250)); // short wait ensures DB visibility
 
-// If posting items caused a closed/occupied order to become confirmed, emit full payload for printing
+// 🔒 Tenant-safe emit to this restaurant only
+const restaurantId = req.user.restaurant_id;
+
+// ✅ Build payload after all commits — full and fresh
 try {
-  const payload = await buildFullOrderPayload(order_id);
-  io.emit("order_confirmed", payload);
-  console.log("🖨️ [orders] order_confirmed emitted from /order-items:", payload.id);
+  const payload = await buildFullOrderPayload(order_id, restaurantId);
+
+  // emit both updates and confirmation together
+  io.to(`restaurant_${restaurantId}`).emit("order_confirmed", payload);
+  io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+
+  console.log(
+    `🖨️ [orders] order_confirmed+updated emitted after saveOrderItems for restaurant_${restaurantId}, order ${order_id}`
+  );
 } catch (e) {
   console.error("❌ Failed to emit order_confirmed after /order-items:", e);
 }
 
-
 res.json({ message: "Order items saved successfully" });
+
+
 
   } catch (err) {
     console.error("❌ Error saving order items:", err);
@@ -591,6 +661,7 @@ async function saveOrderItems(orderId, items) {
     const extrasString = JSON.stringify(item.extras || []);
     const unique_id = item.unique_id || uuidv4();
 
+    // ensure inserts finish before continuing
     const existing = await pool.query(
       "SELECT id FROM order_items WHERE unique_id = $1 AND order_id = $2",
       [unique_id, orderId]
@@ -598,13 +669,19 @@ async function saveOrderItems(orderId, items) {
 
     if (existing.rowCount > 0) {
       await pool.query(
-        "UPDATE order_items SET discount_type = $1, discount_value = $2 WHERE restaurant_id = $1 AND id = $3",
-        [item.discountType || null, item.discountValue || 0, existing.rows[0].id]
+        "UPDATE order_items SET discount_type=$1, discount_value=$2, price=$3, quantity=$4 WHERE id=$5",
+        [
+          item.discountType || null,
+          item.discountValue || 0,
+          parseFloat(item.price) || 0,
+          item.quantity || 1,
+          existing.rows[0].id,
+        ]
       );
       continue;
     }
 
-    // 🔥 FIXED INSERT STATEMENT (with kitchen_status)
+    // ✅ Await each insert fully
     await pool.query(
       `INSERT INTO order_items (
         order_id, product_id, quantity, price,
@@ -614,39 +691,38 @@ async function saveOrderItems(orderId, items) {
         external_product_id, external_product_name, name
       )
       VALUES (
-        $1, $2, $3, $4,
-        $5::jsonb, $6::jsonb, $7,
-        $8, $9, $10, $11, $12,
-        $13, $14,
-        $15, $16, $17
+        $1,$2,$3,$4,
+        $5::jsonb,$6::jsonb,$7,
+        $8,$9,$10,$11,$12,
+        $13,$14,
+        $15,$16,$17
       )`,
       [
         orderId,
         Number(item.product_id) || null,
-        item.quantity,
-        parseFloat(item.price),
+        item.quantity || 1,
+        parseFloat(item.price) || 0,
         JSON.stringify(item.ingredients || []),
         extrasString,
         unique_id,
-
-        !!item.confirmed,          // new, always boolean
-       // confirmed always true
-        item.kitchen_status || 'new',   // kitchen_status now correctly inserted
-
+        true,
+        item.kitchen_status || "new",
         item.payment_method || null,
         item.receipt_id || null,
         item.note || null,
-
         item.discountType || null,
         item.discountValue || 0,
-
         item.product_id || null,
         item.name || null,
-        item.name || null
+        item.name || null,
       ]
     );
   }
+
+  // ✅ Force DB commit visibility delay
+  await new Promise((resolve) => setTimeout(resolve, 300));
 }
+
 
 // GET /order-items/preparing - Returns IDs of order_items still preparing
 router.get("/order-items/preparing", async (req, res) => {
@@ -663,25 +739,43 @@ router.get("/order-items/preparing", async (req, res) => {
 });
 
 
-router.put('/:id', async (req, res) => {
-
+router.put("/:id", async (req, res) => {
   const { id } = req.params;
-  const { total, payment_method, driver_id, receipt_id, changed_by } = req.body; // changed_by is optional (send from frontend if you want)
-    // 💡 GUARD: Only allow string as payment_method
+  const { total, payment_method, driver_id, receipt_id, changed_by } = req.body;
+
   let _payment_method = payment_method;
+
+  // --- Normalize payment_method safely ---
   if (_payment_method && Array.isArray(_payment_method)) {
-    _payment_method = _payment_method[0]?.payment_method || _payment_method[0] || null;
+    _payment_method =
+      _payment_method[0]?.payment_method ||
+      _payment_method[0] ||
+      null;
+  } else if (
+    _payment_method &&
+    typeof _payment_method === "object" &&
+    _payment_method !== null
+  ) {
+    _payment_method = _payment_method.payment_method || null;
+  }
+
+  // Always cast to string if defined
+  if (_payment_method !== null && _payment_method !== undefined) {
+    _payment_method = String(_payment_method).trim();
   }
 
   try {
-    // 1. Fetch old payment method before updating
-    let old_method = undefined;
+    // 1️⃣ Get current payment_method for change log
+    let old_method;
     if (payment_method !== undefined) {
-      const oldOrder = await pool.query('SELECT payment_method FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1', [id]);
+      const oldOrder = await pool.query(
+        "SELECT payment_method FROM orders WHERE restaurant_id = $1 AND id = $2",
+        [req.user.restaurant_id, id]
+      );
       old_method = oldOrder.rows[0]?.payment_method;
     }
 
-    // 2. Build dynamic SET clause (so we don't overwrite fields with undefined/null)
+    // 2️⃣ Build SET clause dynamically
     let setClauses = [];
     let params = [];
     let idx = 1;
@@ -690,15 +784,17 @@ router.put('/:id', async (req, res) => {
       setClauses.push(`total = $${idx++}`);
       params.push(total);
     }
- if (_payment_method !== undefined) {
-  setClauses.push(`payment_method = $${idx++}`);
-  params.push(_payment_method);
-}
+
+    if (_payment_method) {
+      setClauses.push(`payment_method = $${idx++}::text`);
+      params.push(_payment_method);
+    }
 
     if (driver_id !== undefined) {
       setClauses.push(`driver_id = $${idx++}`);
       params.push(driver_id);
     }
+
     if (receipt_id !== undefined) {
       setClauses.push(`receipt_id = $${idx++}`);
       params.push(receipt_id);
@@ -708,33 +804,42 @@ router.put('/:id', async (req, res) => {
       return res.status(400).json({ error: "No fields to update" });
     }
 
-    params.push(id);
+    // 3️⃣ Add restaurant_id + id at end
+   // 3️⃣ Add restaurant_id and id at the END, not start
+params.push(req.user.restaurant_id); // now this will always be the last -1 param
+params.push(id);                     // and this will be the last param index
 
-    // 3. Update the order
-    const result = await pool.query(
-      `UPDATE orders
-       SET ${setClauses.join(", ")}
-       WHERE restaurant_id = $1 AND id = $${params.length}
-       RETURNING *`,
-      params
-    );
+// Calculate actual indexes properly
+const restaurantIdx = params.length - 1;
+const idIdx = params.length;
+
+const result = await pool.query(
+  `UPDATE orders
+   SET ${setClauses.join(", ")}
+   WHERE restaurant_id = $${restaurantIdx} AND id = $${idIdx}
+   RETURNING *`,
+  params
+);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    // 4. Log payment method change
-    if (payment_method !== undefined && payment_method !== old_method) {
+    // 5️⃣ Log payment change (optional)
+    if (
+      _payment_method !== undefined &&
+      old_method !== undefined &&
+      _payment_method !== old_method
+    ) {
       await pool.query(
         `INSERT INTO payment_method_changes (order_id, old_method, new_method, changed_by)
          VALUES ($1, $2, $3, $4)`,
-        [id, old_method, payment_method, changed_by || 'system']
+        [id, old_method, _payment_method, changed_by || "system"]
       );
     }
 
-    setTimeout(() => {
-      emitOrderUpdate(req.app.get('io'));
-    }, 250); // 250ms delay guarantees DB is fully committed
+    // 6️⃣ Emit update to frontend
+    setTimeout(() => emitOrderUpdate(req.app.get("io")), 250);
 
     res.json({ success: true });
   } catch (err) {
@@ -742,6 +847,7 @@ router.put('/:id', async (req, res) => {
     res.status(500).json({ error: "Update failed" });
   }
 });
+
 
 
 
@@ -754,9 +860,13 @@ router.post("/:id/close", async (req, res) => {
     await client.query("BEGIN");
 
     const result = await client.query(
-      `UPDATE orders SET status = 'closed' WHERE restaurant_id = $1 AND id = $1 RETURNING *`,
-      [id]
-    );
+  `UPDATE orders
+   SET status = 'closed'
+   WHERE restaurant_id = $1 AND id = $2
+   RETURNING *`,
+  [req.user.restaurant_id, id]
+);
+
 
     if (result.rows.length === 0) {
       await client.query("ROLLBACK");
@@ -771,10 +881,12 @@ router.post("/:id/close", async (req, res) => {
       );
     }
 
-    await client.query("COMMIT");
-    emitOrderUpdate(io);
-+   io.emit("order_closed", { orderId: Number(order.id) }); // 🔥 NEW EVENT
-    res.json({ message: "✅ Order closed" });
+await client.query("COMMIT");
+
+// 🔒 Tenant-safe emit to this restaurant only
+io.to(`restaurant_${req.user.restaurant_id}`).emit("order_closed", { orderId: Number(order.id) });
+res.json({ message: "✅ Order closed" });
+
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error in closing order:", err);
@@ -806,9 +918,8 @@ router.get('/debug/order-item-discounts', async (req, res) => {
 
 
 
-// ✅ Update stock based on ingredients and extras (fixed to respect Manage Extras Group amount+unit)
-// ✅ Update stock based on ingredients and extras (with fallback to DB for ingredients)
-async function updateStockForOrder(orderItems) {
+// ✅ Update stock based on ingredients and extras
+async function updateStockForOrder(orderItems, restaurantId) {
   console.log("🧾 Received order items:", orderItems);
 
   // Helper: resolve extras group amount/unit
@@ -823,10 +934,7 @@ async function updateStockForOrder(orderItems) {
     );
     if (!q.rows.length) return null;
     const r = q.rows[0] || {};
-    return {
-      amount: Number(r.amount),
-      unit: (r.unit || "").toLowerCase(),
-    };
+    return { amount: Number(r.amount), unit: (r.unit || "").toLowerCase() };
   }
 
   // Helper: fallback unit from stock
@@ -834,10 +942,10 @@ async function updateStockForOrder(orderItems) {
     const q = await pool.query(
       `SELECT unit
        FROM stock
-       WHERE LOWER(name) = LOWER($1)
+       WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2)
        ORDER BY id DESC
        LIMIT 1`,
-      [name]
+      [restaurantId, name]
     );
     if (!q.rows.length) return "";
     return (q.rows[0].unit || "").toLowerCase();
@@ -858,8 +966,10 @@ async function updateStockForOrder(orderItems) {
     if ((!ingredients || ingredients.length === 0) && item.product_id) {
       try {
         const q = await pool.query(
-          `SELECT ingredients FROM products WHERE restaurant_id = $1 AND id = $1`,
-          [item.product_id]
+          `SELECT ingredients
+           FROM products
+           WHERE restaurant_id = $1 AND id = $2`,
+          [restaurantId, item.product_id]
         );
         if (q.rows[0]?.ingredients) {
           const parsed =
@@ -868,9 +978,7 @@ async function updateStockForOrder(orderItems) {
               : q.rows[0].ingredients;
           if (Array.isArray(parsed)) {
             ingredients = parsed;
-            console.log(
-              `📦 Loaded ${parsed.length} ingredients from DB for product_id=${item.product_id}`
-            );
+            console.log(`📦 Loaded ${parsed.length} ingredients for product_id=${item.product_id}`);
           }
         }
       } catch (e) {
@@ -884,26 +992,29 @@ async function updateStockForOrder(orderItems) {
       let amountPerUnit = parseFloat(ing.quantity) * quantityMultiplier;
 
       const stockRes = await pool.query(
-        `SELECT id, unit FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE LOWER(name) = LOWER($1) LIMIT 1`,
-        [ing.ingredient || ing.name]
+        `SELECT id, unit
+         FROM stock
+         WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2)
+         LIMIT 1`,
+        [restaurantId, ing.ingredient || ing.name]
       );
 
       if (stockRes.rows.length) {
         const stockUnit = (stockRes.rows[0].unit || "").toLowerCase();
 
-        // Normalize units
+        // Normalize units (g/kg, ml/l, piece/portion)
         if (ingUnit && ingUnit !== stockUnit) {
           if (ingUnit === "g" && stockUnit === "kg") {
-            amountPerUnit = amountPerUnit / 1000;
+            amountPerUnit /= 1000;
             ingUnit = stockUnit;
           } else if (ingUnit === "kg" && stockUnit === "g") {
-            amountPerUnit = amountPerUnit * 1000;
+            amountPerUnit *= 1000;
             ingUnit = stockUnit;
           } else if (ingUnit === "ml" && stockUnit === "l") {
-            amountPerUnit = amountPerUnit / 1000;
+            amountPerUnit /= 1000;
             ingUnit = stockUnit;
           } else if (ingUnit === "l" && stockUnit === "ml") {
-            amountPerUnit = amountPerUnit * 1000;
+            amountPerUnit *= 1000;
             ingUnit = stockUnit;
           } else if (
             (ingUnit === "piece" && stockUnit === "portion") ||
@@ -914,99 +1025,79 @@ async function updateStockForOrder(orderItems) {
         }
       }
 
-      console.log(
-        `🔻 Deducting Ingredient: ${ing.ingredient || ing.name} -${amountPerUnit} ${ingUnit}`
-      );
+      console.log(`🔻 Deducting Ingredient: ${ing.ingredient || ing.name} -${amountPerUnit} ${ingUnit}`);
 
       const res = await pool.query(
         `UPDATE stock
          SET quantity = quantity - $1
-         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+         WHERE restaurant_id = $2 AND LOWER(name) = LOWER($3) AND LOWER(unit) = LOWER($4)
          RETURNING *`,
-        [amountPerUnit, ing.ingredient || ing.name, ingUnit]
+        [amountPerUnit, restaurantId, ing.ingredient || ing.name, ingUnit]
       );
 
       if (res.rowCount > 0) {
         const updatedStock = res.rows[0];
         emitStockUpdate(io, updatedStock.id);
 
-        if (
-          updatedStock.quantity > updatedStock.critical_quantity &&
-          updatedStock.auto_added_to_cart
-        ) {
+        if (updatedStock.quantity > updatedStock.critical_quantity && updatedStock.auto_added_to_cart) {
           await pool.query(
-            "UPDATE stock SET auto_added_to_cart = FALSE WHERE restaurant_id = $1 AND id = $1",
-            [updatedStock.id]
+            "UPDATE stock SET auto_added_to_cart = FALSE WHERE restaurant_id = $1 AND id = $2",
+            [restaurantId, updatedStock.id]
           );
         }
 
-        if (
-          updatedStock.critical_quantity &&
-          updatedStock.quantity <= updatedStock.critical_quantity
-        ) {
+        if (updatedStock.critical_quantity && updatedStock.quantity <= updatedStock.critical_quantity) {
           emitAlert(
-            io,
-            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-            updatedStock.id,
-            "stock",
-            { stockId: updatedStock.id }
-          );
+   io,
+   restaurantId,
+   `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
+   updatedStock.id,
+   "stock",
+   { stockId: updatedStock.id }
+ );
         }
-      } else {
-        console.warn(
-          `⚠️ No matching stock found for ingredient: ${ing.ingredient || ing.name} (${ingUnit})`
-        );
       }
     }
 
-    // 🔻 Deduct Extras (unchanged from your working version)
+    // 🔻 Deduct Extras
     for (const ex of extras) {
       const extraName = ex.name || ex.ingredient_name;
-      if (!extraName) {
-        console.warn("⚠️ Extra missing name/ingredient_name:", ex);
-        continue;
-      }
+      if (!extraName) continue;
 
       let amountPerPortion = Number(ex.amount);
       let extraUnit = (ex.unit || "").toLowerCase();
       const portionsPicked = parseInt(ex.quantity) || 1;
 
-      if (
-        !Number.isFinite(amountPerPortion) ||
-        amountPerPortion <= 0 ||
-        !extraUnit ||
-        (amountPerPortion === 1 && !ex.unit)
-      ) {
+      if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0 || !extraUnit) {
         const grp = await resolveExtraFromGroups(extraName);
         if (grp) {
           amountPerPortion = grp.amount;
           extraUnit = grp.unit;
-          console.log("🧩 Extras override from groups:", {
-            extraName,
-            amountPerPortion,
-            extraUnit,
-          });
         }
       }
 
       const stockRes = await pool.query(
-        `SELECT id, unit FROM stock WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE LOWER(name) = LOWER($1) LIMIT 1`,
-        [extraName]
+        `SELECT id, unit
+         FROM stock
+         WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2)
+         LIMIT 1`,
+        [restaurantId, extraName]
       );
+
       if (stockRes.rows.length) {
         const stockUnit = (stockRes.rows[0].unit || "").toLowerCase();
         if (extraUnit && extraUnit !== stockUnit) {
           if (extraUnit === "g" && stockUnit === "kg") {
-            amountPerPortion = amountPerPortion / 1000;
+            amountPerPortion /= 1000;
             extraUnit = stockUnit;
           } else if (extraUnit === "kg" && stockUnit === "g") {
-            amountPerPortion = amountPerPortion * 1000;
+            amountPerPortion *= 1000;
             extraUnit = stockUnit;
           } else if (extraUnit === "ml" && stockUnit === "l") {
-            amountPerPortion = amountPerPortion / 1000;
+            amountPerPortion /= 1000;
             extraUnit = stockUnit;
           } else if (extraUnit === "l" && stockUnit === "ml") {
-            amountPerPortion = amountPerPortion * 1000;
+            amountPerPortion *= 1000;
             extraUnit = stockUnit;
           } else if (
             (extraUnit === "piece" && stockUnit === "portion") ||
@@ -1022,46 +1113,33 @@ async function updateStockForOrder(orderItems) {
       }
 
       if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0) {
-        console.warn("❗ Extra amount invalid; defaulting to 1", {
-          extraName,
-          raw: ex.amount,
-        });
         amountPerPortion = 1;
       }
 
       const usedQty = amountPerPortion * portionsPicked * quantityMultiplier;
 
-      console.log(
-        `🔻 Deducting Extra: ${extraName} -${usedQty} ${extraUnit}`,
-        { rawExtra: ex }
-      );
+      console.log(`🔻 Deducting Extra: ${extraName} -${usedQty} ${extraUnit}`);
 
       const res = await pool.query(
         `UPDATE stock
          SET quantity = quantity - $1
-         WHERE LOWER(name) = LOWER($2) AND LOWER(unit) = LOWER($3)
+         WHERE restaurant_id = $2 AND LOWER(name) = LOWER($3) AND LOWER(unit) = LOWER($4)
          RETURNING *`,
-        [usedQty, extraName, extraUnit]
+        [usedQty, restaurantId, extraName, extraUnit]
       );
 
       if (res.rowCount > 0) {
         const updatedStock = res.rows[0];
         emitStockUpdate(io, updatedStock.id);
 
-        if (
-          updatedStock.quantity > updatedStock.critical_quantity &&
-          updatedStock.auto_added_to_cart
-        ) {
+        if (updatedStock.quantity > updatedStock.critical_quantity && updatedStock.auto_added_to_cart) {
           await pool.query(
-            "UPDATE stock SET auto_added_to_cart = FALSE WHERE restaurant_id = $1 AND id = $1",
-            [updatedStock.id]
+            "UPDATE stock SET auto_added_to_cart = FALSE WHERE restaurant_id = $1 AND id = $2",
+            [restaurantId, updatedStock.id]
           );
         }
 
-        if (
-          updatedStock.critical_quantity &&
-          updatedStock.quantity <= updatedStock.critical_quantity
-        ) {
+        if (updatedStock.critical_quantity && updatedStock.quantity <= updatedStock.critical_quantity) {
           emitAlert(
             io,
             `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
@@ -1070,14 +1148,11 @@ async function updateStockForOrder(orderItems) {
             { stockId: updatedStock.id }
           );
         }
-      } else {
-        console.warn(
-          `⚠️ No matching stock found for extra: ${extraName} (${extraUnit})`
-        );
       }
     }
   }
 }
+
 
 
 
@@ -1136,9 +1211,13 @@ router.patch("/:id/reset-if-empty", async (req, res) => {
     const itemCount = parseInt(itemsRes.rows[0].count, 10);
 
     if (itemCount === 0) {
-      await client.query("UPDATE orders SET status = 'closed' WHERE restaurant_id = $1 AND id = $1", [id]);
-        emitOrderUpdate(io);
-         io.emit("order_closed", { orderId: parseInt(id, 10) });// <-- ADD THIS
+await client.query(
+  "UPDATE orders SET status = 'closed' WHERE restaurant_id = $1 AND id = $2",
+  [req.user.restaurant_id, id]
+);
+
+// 🔒 Tenant-safe emit
+io.to(`restaurant_${req.user.restaurant_id}`).emit("order_closed", { orderId: parseInt(id, 10) });
 
       return res.json({ message: "Order status reset to closed" });
     }
@@ -1187,7 +1266,12 @@ router.post("/sub-orders", async (req, res) => {
       // kitchen_status intentionally not forced here
     }));
 
-    await saveOrderItems(order_id, itemsWithReceipt);
+    // ❌ Prevent double deduction if these items were already confirmed before payment
+const unconfirmedItems = itemsWithReceipt.filter(it => !it.confirmed && !it.paid_at);
+if (unconfirmedItems.length > 0) {
+  await updateStockForOrder(unconfirmedItems, req.user.restaurant_id);
+}
+
 
 
     const uniqueIds = itemsWithReceipt.map((i) => i.unique_id);
@@ -1224,14 +1308,25 @@ router.post("/sub-orders", async (req, res) => {
     // Keep order total in sync with the sub-order's total
     await client.query(
       `UPDATE orders
-       SET total = total + $1
-       WHERE restaurant_id = $1 AND id = $2`,
-      [total, order_id]
+SET total = total + $1
+WHERE restaurant_id = $2 AND id = $3`,
+     [total, req.user.restaurant_id, order_id]
     );
 
-    await client.query("COMMIT");
-    emitOrderUpdate(io);
-    res.json({ sub_order_id: subOrderId, mark_paid: !!mark_paid });
+await client.query("COMMIT");
+// 🔒 Tenant-safe emit only for this restaurant
+if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, req.user.restaurant_id);
+
+
+// 🔥 Emit payment event if marked paid
+if (mark_paid) {
+  const restaurantId = req.user.restaurant_id;
+ emitPaymentMade(io, restaurantId, order_id, payment_method, total);
+
+  console.log(`💸 [orders] payment_made emitted from sub-order for restaurant_${restaurantId}, order ${order_id}`);
+}
+
+res.json({ sub_order_id: subOrderId, mark_paid: !!mark_paid });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Sub-order failed:", err);
@@ -1251,24 +1346,26 @@ router.get("/:orderId/suborders", async (req, res) => {
         so.payment_method,
         so.total,
         so.created_at,
-        json_agg(
-          json_build_object(
-  'product_id', oi.product_id,
-  'name', p.name,
-  'quantity', oi.quantity,
-  'price', oi.price,
-  'ingredients', oi.ingredients,
-  'extras', oi.extras,
-  'unique_id', oi.unique_id,
-  'payment_method', oi.payment_method,
-  'paid_at', oi.paid_at,
-  'receipt_id', oi.receipt_id     -- ✅ ADD THIS LINE
-)
-
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'product_id', oi.product_id,
+              'name', COALESCE(oi.name, p.name, oi.external_product_name, 'Item'),
+              'quantity', oi.quantity,
+              'price', oi.price,
+              'ingredients', oi.ingredients,
+              'extras', oi.extras,
+              'unique_id', oi.unique_id,
+              'payment_method', oi.payment_method,
+              'paid_at', oi.paid_at,
+              'receipt_id', oi.receipt_id
+            )
+          ) FILTER (WHERE oi.id IS NOT NULL),
+          '[]'::json
         ) AS items
       FROM sub_orders so
-      JOIN order_items oi ON so.id = oi.sub_order_id
-      JOIN products p ON oi.product_id = p.id
+      LEFT JOIN order_items oi ON so.id = oi.sub_order_id
+      LEFT JOIN products p ON oi.product_id = p.id
       WHERE so.order_id = $1
       GROUP BY so.id
       ORDER BY so.created_at ASC
@@ -1283,30 +1380,69 @@ router.get("/:orderId/suborders", async (req, res) => {
 
 
 
+
+
 // ✅ PATCH /orders/:id/reopen
+// ✅ PATCH /orders/:id/reopen — restores paid order properly
 router.patch("/:id/reopen", async (req, res) => {
   const { id } = req.params;
+  const restaurantId = req.user.restaurant_id;
+  const client = await pool.connect();
 
   try {
-    // Fetch the order to ensure it exists
-    const result = await pool.query("SELECT * FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1", [id]);
-    if (result.rows.length === 0) {
+    await client.query("BEGIN");
+
+    // 1️⃣ Get the last order details
+    const { rows } = await client.query(
+      `SELECT * FROM orders WHERE restaurant_id = $1 AND id = $2`,
+      [restaurantId, id]
+    );
+    if (!rows.length) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
     }
 
-    // Set status back to "occupied" to trigger cart rehydration on the client
-    const update = await pool.query(
+    const order = rows[0];
+
+    // 2️⃣ If it's already closed or paid, reopen it visually only
+    const updated = await client.query(
       `UPDATE orders
-       SET status = 'occupied'
-       WHERE restaurant_id = $1 AND id = $1
+       SET status = 'confirmed',
+           is_paid = false
+       WHERE restaurant_id = $1 AND id = $2
        RETURNING *`,
+      [restaurantId, id]
+    );
+
+    // 3️⃣ Re-mark the table as occupied
+    if (order.table_number) {
+      await client.query(
+        `UPDATE tables SET is_occupied = TRUE WHERE number = $1`,
+        [order.table_number]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    // 4️⃣ Return the order with its items
+    const { rows: itemRows } = await client.query(
+      `SELECT *
+       FROM order_items
+       WHERE order_id = $1
+       ORDER BY id ASC`,
       [id]
     );
 
-    res.json(update.rows[0]);
+    res.json({
+      ...updated.rows[0],
+      items: itemRows,
+    });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("❌ Failed to reopen order:", err);
     res.status(500).json({ error: "Failed to reopen order" });
+  } finally {
+    client.release();
   }
 });
 
@@ -1356,17 +1492,17 @@ router.post("/receipt-methods", async (req, res) => {
     // If missing, generate new receipt_id and update order
     if ((!receipt_id || receipt_id === "null") && order_id) {
       const { rows } = await pool.query(
-        "UPDATE orders SET receipt_id = gen_random_uuid() WHERE restaurant_id = $1 AND id = $1 RETURNING receipt_id",
-        [order_id]
+        "UPDATE orders SET receipt_id = gen_random_uuid() WHERE restaurant_id = $1 AND id = $2 RETURNING receipt_id",
+        [req.user.restaurant_id, order_id]
       );
       receipt_id = rows[0].receipt_id;
     }
 
-    // PATCH: Always set the receipt_id on the order (even if already present)
+    // Always set receipt_id on order (even if already present)
     if (order_id && receipt_id) {
       await pool.query(
-        "UPDATE orders SET receipt_id = $1 WHERE restaurant_id = $1 AND id = $2",
-        [receipt_id, order_id]
+        "UPDATE orders SET receipt_id = $1 WHERE restaurant_id = $2 AND id = $3",
+        [receipt_id, req.user.restaurant_id, order_id]
       );
     }
 
@@ -1388,14 +1524,30 @@ router.post("/receipt-methods", async (req, res) => {
       }
     }
 
-    // Optionally update payment_method string on order for clarity
+    // Update payment_method string on order for clarity
     const paymentMethodStr = Object.keys(methods)
       .filter((k) => parseFloat(methods[k]) > 0)
       .join("+");
+
     await pool.query(
       `UPDATE orders SET payment_method = $1 WHERE receipt_id = $2`,
       [paymentMethodStr, receipt_id]
     );
+
+    // 🔥 Emit payment_made after split receipt saved
+    const restaurantId = req.user.restaurant_id;
+    const { rows } = await pool.query(
+      "SELECT id FROM orders WHERE receipt_id = $1 AND restaurant_id = $2",
+      [receipt_id, restaurantId]
+    );
+    const orderId = rows[0]?.id;
+    if (orderId) {
+ emitPaymentMade(io, restaurantId, orderId, paymentMethodStr || "Split", null);
+
+      console.log(
+        `💸 [orders] payment_made emitted after receipt_methods for restaurant_${restaurantId}, order ${orderId}`
+      );
+    }
 
     res.json({ message: "Receipt methods saved", receipt_id });
   } catch (err) {
@@ -1418,15 +1570,17 @@ router.put("/order-items/kitchen-status", async (req, res) => {
 
     // 1. Update kitchen_status for all items
     await client.query(
-      `UPDATE order_items SET kitchen_status = $1 WHERE restaurant_id = $1 AND id = ANY($2::int[])`,
-      [status, ids]
-    );
+  `UPDATE order_items SET kitchen_status = $1 WHERE restaurant_id = $2 AND id = ANY($3::int[])`,
+  [status, req.user.restaurant_id, ids]
+);
+
 
     // 2. Find affected order IDs
     const { rows: itemOrders } = await client.query(
-      `SELECT DISTINCT order_id FROM order_items WHERE restaurant_id = $1 AND id = ANY($1::int[])`,
-      [ids]
-    );
+  `SELECT DISTINCT order_id FROM order_items WHERE restaurant_id = $1 AND id = ANY($2::int[])`,
+  [req.user.restaurant_id, ids]
+);
+
     const orderIds = itemOrders.map((r) => r.order_id);
 
     // 3. For each order, set prep_started_at / estimated_ready_at / kitchen_delivered_at
@@ -1449,8 +1603,8 @@ router.put("/order-items/kitchen-status", async (req, res) => {
           `SELECT oi.quantity, p.preparation_time
            FROM order_items oi
            JOIN products p ON oi.product_id = p.id
-           WHERE oi.order_id = $1`,
-          [orderId]
+          WHERE oi.order_id = $1 AND oi.restaurant_id = $2`,
+         [id, req.user.restaurant_id]
         );
 
         const penaltyPerExtra = 2 * 60; // 2min per extra of same product
@@ -1475,39 +1629,43 @@ router.put("/order-items/kitchen-status", async (req, res) => {
 
         // Save to DB
         await client.query(
-          `UPDATE orders
-           SET prep_started_at = COALESCE(prep_started_at, NOW()),
-               estimated_ready_at = $1
-           WHERE restaurant_id = $1 AND id = $2`,
-          [estReadyAt, orderId]
-        );
+  `UPDATE orders
+   SET prep_started_at = COALESCE(prep_started_at, NOW()),
+       estimated_ready_at = $1
+   WHERE restaurant_id = $2 AND id = $3`,
+  [estReadyAt, req.user.restaurant_id, orderId]
+);
+
       } else {
         await client.query(
-          `UPDATE orders SET estimated_ready_at = NULL WHERE restaurant_id = $1 AND id = $1`,
-          [orderId]
-        );
+  `UPDATE orders SET estimated_ready_at = NULL WHERE restaurant_id = $1 AND id = $2`,
+  [req.user.restaurant_id, orderId]
+);
+
       }
 
       // a) PREP STARTED (prep_started_at always set above)
       // b) ALL DELIVERED
       if (statuses.length && statuses.every((s) => s === "delivered")) {
         await client.query(
-          `UPDATE orders SET kitchen_delivered_at = NOW() WHERE restaurant_id = $1 AND id = $1`,
-          [orderId]
-        );
+  `UPDATE orders SET kitchen_delivered_at = NOW() WHERE restaurant_id = $1 AND id = $2`,
+  [req.user.restaurant_id, orderId]
+);
+
         deliveredOrderIds.push(orderId);
       }
     }
 
-    await client.query("COMMIT");
+await client.query("COMMIT");
 
-    // 4. EMIT SOCKETS
-    const io = getIO();
-    io.emit("orders_updated");
+// 4️⃣ Tenant-safe socket emits
+const io = getIO();
+io.to(`restaurant_${req.user.restaurant_id}`).emit("orders_updated");
 
-    if (status === "ready") {
-      io.emit("order_ready", { orderIds });
-    }
+if (status === "ready") {
+  io.to(`restaurant_${req.user.restaurant_id}`).emit("order_ready", { orderIds });
+}
+
 
     if (status === "delivered" && deliveredOrderIds.length) {
       emitOrderDelivered(io, deliveredOrderIds);
@@ -1543,9 +1701,10 @@ router.patch("/:id/driver-status", async (req, res) => {
 
     // 🛑 Block driver status change if driver_id is not assigned
     const driverCheck = await client.query(
-      `SELECT driver_id FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
-      [id]
-    );
+  `SELECT driver_id FROM orders WHERE restaurant_id = $1 AND id = $2`,
+  [req.user.restaurant_id, id]
+);
+
     const order = driverCheck.rows[0];
     if (!order || !order.driver_id) {
       await client.query("ROLLBACK");
@@ -1553,26 +1712,31 @@ router.patch("/:id/driver-status", async (req, res) => {
     }
 
     // 1. Always update driver_status
-    await client.query(
-      `UPDATE orders
-       SET driver_status = $1
-       WHERE restaurant_id = $1 AND id = $2`,
-      [driver_status, id]
-    );
+   await client.query(
+  `UPDATE orders
+   SET driver_status = $1
+   WHERE restaurant_id = $2 AND id = $3`,
+  [driver_status, req.user.restaurant_id, id]
+);
+
 
     // 2. If delivered, set delivered_at
     if (driver_status === "delivered") {
       await client.query(
-        `UPDATE orders
-         SET delivered_at = NOW()
-         WHERE restaurant_id = $1 AND id = $1 AND delivered_at IS NULL`,
-        [id]
-      );
+  `UPDATE orders
+   SET delivered_at = NOW()
+   WHERE restaurant_id = $1 AND id = $2 AND delivered_at IS NULL`,
+  [req.user.restaurant_id, id]
+);
+
     }
 
     await client.query("COMMIT");
-    getIO().emit("orders_updated");
-    res.json({ success: true });
+
+// 🔒 Tenant-safe emit only to this restaurant
+getIO().to(`restaurant_${req.user.restaurant_id}`).emit("orders_updated");
+res.json({ success: true });
+
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Driver status update failed:", err);
@@ -1581,58 +1745,64 @@ router.patch("/:id/driver-status", async (req, res) => {
     client.release();
   }
 });
-
-
-// PATCH /api/orders/:id/move-table
+// ✅ PATCH /orders/:id/move-table
+// ✅ PATCH /orders/:id/move-table
 router.patch("/:id/move-table", async (req, res) => {
   const { id } = req.params;
   const { new_table_number } = req.body;
   const client = await pool.connect();
+
   try {
     await client.query("BEGIN");
 
-    // Find current table number
-    const orderRes = await client.query(
-      `SELECT table_number FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
-      [id]
+    const { rows } = await client.query(
+      `SELECT * FROM orders WHERE restaurant_id = $1 AND id = $2`,
+      [req.user.restaurant_id, id]
     );
-    const currentTable = orderRes.rows[0]?.table_number;
-    if (!currentTable) {
+
+    if (!rows.length) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Order or table not found" });
+      return res.status(404).json({ error: "Order not found" });
     }
 
-    // Check if destination table is occupied
-    const destRes = await client.query(
-      `SELECT is_occupied FROM tables WHERE number = $1`,
-      [new_table_number]
-    );
-    if (destRes.rows[0]?.is_occupied) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "Destination table is occupied" });
-    }
+    const order = rows[0];
 
-    // Move order to new table
-    await client.query(
-      `UPDATE orders SET table_number = $1 WHERE restaurant_id = $1 AND id = $2`,
-      [new_table_number, id]
-    );
+    // 1️⃣ Free old table
+    await client.query(`UPDATE tables SET is_occupied = FALSE WHERE number = $1`, [order.table_number]);
 
-    // Mark old table as free, new as occupied
-    await client.query(
-      `UPDATE tables SET is_occupied = FALSE WHERE number = $1`,
-      [currentTable]
-    );
-    await client.query(
-      `UPDATE tables SET is_occupied = TRUE WHERE number = $1`,
-      [new_table_number]
+    // 2️⃣ Occupy new table
+    await client.query(`UPDATE tables SET is_occupied = TRUE WHERE number = $1`, [new_table_number]);
+
+    // 3️⃣ Move the order
+    const updatedOrder = await client.query(
+      `UPDATE orders
+       SET table_number = $1,
+           status = CASE
+                      WHEN status = 'paid' THEN 'confirmed'
+                      ELSE status
+                    END
+       WHERE restaurant_id = $2 AND id = $3
+       RETURNING *`,
+      [new_table_number, req.user.restaurant_id, id]
     );
 
     await client.query("COMMIT");
-    if (typeof emitOrderUpdate === 'function') emitOrderUpdate(req.app.get('io'));
-    res.json({ success: true, new_table_number });
+
+    // Emit socket update
+    io.emit("table_moved", {
+      order_id: id,
+      from: order.table_number,
+      to: new_table_number,
+      order: updatedOrder.rows[0],
+    });
+
+    res.json({
+      message: `✅ Table moved from ${order.table_number} to ${new_table_number}`,
+      order: updatedOrder.rows[0],
+    });
   } catch (err) {
     await client.query("ROLLBACK");
+    console.error("❌ Move table failed:", err);
     res.status(500).json({ error: "Failed to move table" });
   } finally {
     client.release();
@@ -1640,90 +1810,117 @@ router.patch("/:id/move-table", async (req, res) => {
 });
 
 
-
-// PATCH /api/orders/:id/merge-table
-router.patch("/:id/merge-table", async (req, res) => {
-  const { id } = req.params; // Source order ID (from table being merged)
-  const { target_table_number } = req.body; // Destination table number
-
+// ✅ FINAL PATCH: Merge tables preserving all paid/unpaid states
+router.patch("/:orderId/merge-table", async (req, res) => {
+  const { orderId } = req.params;
+  const { target_table_number } = req.body;
   const client = await pool.connect();
+
   try {
     await client.query("BEGIN");
 
-    // 1. Find target order (must be active and not closed)
-    const targetOrderRes = await client.query(
-      `SELECT * FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE table_number = $1 AND status != 'closed' ORDER BY created_at DESC LIMIT 1`,
+    // 1️⃣ Find destination order (open)
+    const { rows: target } = await client.query(
+      `SELECT id, restaurant_id, total, is_paid
+         FROM orders
+        WHERE table_number = $1 AND status <> 'closed'
+        LIMIT 1`,
       [target_table_number]
     );
-    if (targetOrderRes.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Target table has no active order" });
-    }
-    const targetOrder = targetOrderRes.rows[0];
+    if (!target.length) throw new Error("Target order not found or closed");
+    const targetOrder = target[0];
 
-    // 2. Get all source order items
-    const { rows: sourceItems } = await client.query(
-      `SELECT * FROM order_items WHERE order_id = $1`,
-      [id]
+    // 2️⃣ Find source
+    const { rows: source } = await client.query(
+      `SELECT id, restaurant_id, total
+         FROM orders
+        WHERE id = $1
+        LIMIT 1`,
+      [orderId]
+    );
+    if (!source.length) throw new Error("Source order not found");
+    const sourceOrder = source[0];
+
+    if (targetOrder.restaurant_id !== sourceOrder.restaurant_id)
+      throw new Error("Cross-restaurant merge is not allowed");
+
+    const restaurantId = targetOrder.restaurant_id;
+
+    // 3️⃣ Move all order_items (preserve all payment info!)
+    await client.query(
+      `UPDATE order_items
+       SET order_id = $1
+       WHERE order_id = $2`,
+      [targetOrder.id, sourceOrder.id]
     );
 
-    // 3. For each source item: try to merge into target or move
-    for (const item of sourceItems) {
-      // Check for duplicate in target order
-      const { rows: dup } = await client.query(
-        `SELECT id, quantity FROM order_items WHERE order_id = $1 AND unique_id = $2`,
-        [targetOrder.id, item.unique_id]
-      );
-
-      if (dup.length > 0) {
-        // Combine quantities
-        await client.query(
-          `UPDATE order_items SET quantity = quantity + $1 WHERE restaurant_id = $1 AND id = $2`,
-          [item.quantity, dup[0].id]
-        );
-        // Remove the source item
-        await client.query(
-          `DELETE FROM order_items WHERE restaurant_id = $1 AND id = $1`,
-          [item.id]
-        );
-      } else {
-        // Move the item to the target order
-        await client.query(
-          `UPDATE order_items SET order_id = $1 WHERE restaurant_id = $1 AND id = $2`,
-          [targetOrder.id, item.id]
-        );
-      }
-    }
-
-    // 4. Close the source order and free its table
-    const sourceOrderRes = await client.query(
-      `SELECT table_number FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
-      [id]
+    // 4️⃣ Move sub_orders
+    await client.query(
+      `UPDATE sub_orders
+       SET order_id = $1
+       WHERE order_id = $2`,
+      [targetOrder.id, sourceOrder.id]
     );
-    const sourceTable = sourceOrderRes.rows[0]?.table_number;
+
+    // 5️⃣ Roll totals and detect if target should now be marked paid
+    const { rows: paidCheck } = await client.query(
+      `SELECT COUNT(*) FILTER (WHERE paid_at IS NULL) AS unpaid_count
+         FROM order_items
+        WHERE order_id = $1`,
+      [targetOrder.id]
+    );
+
+    const unpaidCount = parseInt(paidCheck[0].unpaid_count, 10) || 0;
+    const newStatus = unpaidCount === 0 ? "paid" : "confirmed";
 
     await client.query(
-      `UPDATE orders SET status = 'closed' WHERE restaurant_id = $1 AND id = $1`,
-      [id]
+      `UPDATE orders
+         SET total = COALESCE(total,0) + $2,
+             status = $3,
+             is_paid = $4
+       WHERE id = $1`,
+      [
+        targetOrder.id,
+        sourceOrder.total || 0,
+        newStatus,
+        unpaidCount === 0, // true if all paid
+      ]
     );
-    if (sourceTable) {
-      await client.query(
-        `UPDATE tables SET is_occupied = FALSE WHERE number = $1`,
-        [sourceTable]
-      );
-    }
+
+    // 6️⃣ Close and zero the source
+    await client.query(
+      `UPDATE orders SET status='closed', total=0 WHERE id=$1`,
+      [sourceOrder.id]
+    );
 
     await client.query("COMMIT");
-    if (typeof emitOrderUpdate === "function") emitOrderUpdate(req.app.get("io"));
-    res.json({ success: true });
+
+ // 7️⃣ Emit (tenant-safe)
+if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
+
+io.to(`restaurant_${restaurantId}`).emit("order_merged", {
+  order: { id: targetOrder.id, table_number: Number(target_table_number) },
+});
+
+    res.json({
+      ok: true,
+      target_id: targetOrder.id,
+      merged_status: newStatus,
+      message: unpaidCount === 0
+        ? "Merged successfully (all paid)"
+        : "Merged successfully (some unpaid items remain)",
+    });
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("❌ Merge table error:", err);
+    console.error("❌ merge-table failed:", err);
     res.status(500).json({ error: "Failed to merge table" });
   } finally {
     client.release();
   }
 });
+
+
+
 
 // POST /api/orders/:id/confirm-online
 router.post("/:id/confirm-online", async (req, res) => {
@@ -1736,7 +1933,17 @@ console.log("✅ confirm-online route loaded");
     await client.query("BEGIN");
 
     // 1. Get order
-        const { rows } = await client.query("SELECT * FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1", [id]);
+const orderRes = await pool.query(`
+  SELECT o.*,
+         c.name AS customer_name,
+         c.phone AS customer_phone,
+         ca.address AS customer_address
+  FROM orders o
+  LEFT JOIN customers c ON o.customer_phone = c.phone
+  LEFT JOIN customer_addresses ca ON ca.customer_id = c.id AND ca.is_default = true
+  WHERE o.restaurant_id = $1 AND o.id = $2
+`, [req.user.restaurant_id, req.params.id]);
+
     const order = rows[0];
     if (!order) {
       await client.query("ROLLBACK");
@@ -1756,21 +1963,31 @@ console.log("✅ confirm-online route loaded");
     }
 
     // 4. Update status to "confirmed"
-    const updateRes = await client.query(
-      `UPDATE orders SET status = 'confirmed' WHERE restaurant_id = $1 AND id = $1 RETURNING *`,
-      [id]
-    );
+   const updateRes = await client.query(
+  `UPDATE orders
+   SET status = 'confirmed'
+   WHERE restaurant_id = $1 AND id = $2
+   RETURNING *`,
+  [req.user.restaurant_id, id]
+);
+
     await client.query("COMMIT");
 
 const ioRef = req.app.get("io");
+const restaurantId = req.user.restaurant_id;
+
 try {
-  const payload = await buildFullOrderPayload(id);
-  ioRef.emit("order_confirmed", payload);
+  const payload = await buildFullOrderPayload(id, restaurantId);
+  ioRef.to(`restaurant_${restaurantId}`).emit("order_confirmed", payload);
+  console.log(`🖨️ [orders] order_confirmed emitted for restaurant_${restaurantId}:`, id);
 } catch (e) {
   console.error("❌ Failed to build full order payload for order_confirmed:", e);
 }
 
-emitOrderUpdate(ioRef);
+// 🔒 tenant-safe update emit
+if (typeof emitOrderUpdate === "function") emitOrderUpdate(ioRef, restaurantId);
+else ioRef.to(`restaurant_${restaurantId}`).emit("orders_updated");
+
 
 
 
@@ -1817,8 +2034,9 @@ router.get("/:raw", async (req, res) => {
     // 3) Fetch header
     const { rows: orderRows } = await pool.query(
       `SELECT id, status, table_number, order_type, total, created_at
-       FROM orders WHERE restaurant_id = $1 WHERE restaurant_id = $1 WHERE restaurant_id = $1 AND id = $1`,
-      [internalId]
+       FROM orders WHERE restaurant_id = $1 AND id = $2`,
+[req.user.restaurant_id, internalId]
+
     );
     if (!orderRows.length) {
       return res.status(404).json({ error: "Order not found", id: internalId });

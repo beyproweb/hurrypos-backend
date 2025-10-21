@@ -77,25 +77,21 @@ router.get("/", async (req, res) => {
   }
 });
 
-  router.get("/critical", async (req, res) => {
-    try {
-      const restaurantId = req.user.restaurant_id;
+router.get("/critical", async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    const restaurantId = req.user.restaurant_id;
 
-      const result = await pool.query(
-        `SELECT *
-         FROM stock
-         WHERE restaurant_id = $1
-           AND quantity <= critical_quantity
-         ORDER BY name ASC`,
-        [restaurantId]
-      );
-
-      res.json(result.rows);
-    } catch (error) {
-      console.error("❌ Error fetching critical stock:", error);
-      res.status(500).json({ error: "Database error fetching critical stock" });
-    }
-  });
+    const result = await pool.query(
+      "SELECT * FROM stock WHERE restaurant_id=$1 AND quantity < critical_quantity",
+      [restaurantId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Stock critical fetch failed:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
   // ==============================
   // GET /stock/:id
   // ==============================
@@ -180,13 +176,14 @@ router.get("/", async (req, res) => {
 
       // Alert if stock low
       if (updated.critical_quantity && updated.quantity <= updated.critical_quantity) {
-        emitAlert(
-          io,
-          `🧂 Stock Low: ${updated.name} (${updated.quantity} ${updated.unit})`,
-          updated.id,
-          "stock",
-          { stockId: updated.id }
-        );
+     emitAlert(
+   io,
+   restaurantId,
+   `🧂 Stock Low: ${updated.name} (${updated.quantity} ${updated.unit})`,
+   updated.id,
+   "stock",
+   { stockId: updated.id }
+ );
       }
 
       emitStockUpdate(io, id);

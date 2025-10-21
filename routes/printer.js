@@ -199,4 +199,36 @@ ${new Date().toLocaleString()}
   return router.handle({ ...req, url: "/print", method: "POST" }, res);
 });
 
+// 🔹 GET /api/printer-settings/:id (mock or DB fetch)
+router.get("/:id", async (req, res) => {
+  const { id } = req.params;
+
+  // Option 1: Static fallback layout if DB not yet implemented
+  const defaultLayout = {
+    fontSize: 14,
+    lineHeight: 1.3,
+    showLogo: true,
+    showQr: true,
+    showHeader: true,
+    showFooter: true,
+    headerText: "Beypro POS - HurryBey",
+    footerText: "Thank you for your order! / Teşekkürler!",
+    alignment: "left",
+    shopAddress: "Your Shop Address\n123 Street Name, İzmir",
+    extras: [
+      { label: "Instagram", value: "@yourshop" },
+      { label: "Tax No", value: "1234567890" },
+    ],
+    showPacketCustomerInfo: true,
+    receiptWidth: "58mm",
+    receiptHeight: "",
+  };
+
+  res.json({
+    id: Number(id),
+    name: "Default Printer",
+    layout: defaultLayout,
+  });
+});
+
 module.exports = router;

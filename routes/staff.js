@@ -3,7 +3,9 @@ const router = express.Router();
 const { pool } = require('../db');
 const { sendEmail, sendPushNotification } = require('../utils/notifications');
 const bcrypt = require("bcrypt");
+const authMiddleware = require("../middleware/authMiddleware");
 
+router.use(authMiddleware);
 // Helper function to log requests
 const logRequest = (route, method, data) => {
   console.log(`➡️ ${method} request to ${route}`);
@@ -56,11 +58,10 @@ router.post('/schedule', async (req, res) => {
 });
 
 
-// Fetch all staff members
+
 // ✅ Fetch all active staff for the current tenant
 router.get('/', async (req, res) => {
   const restaurantId = req.user.restaurant_id; // tenant scope from middleware
-
   try {
     const result = await pool.query(
       `SELECT id, name, role, phone, address, salary, email, created_at,
@@ -70,13 +71,13 @@ router.get('/', async (req, res) => {
        ORDER BY id`,
       [restaurantId]
     );
-
     res.json(result.rows);
   } catch (err) {
     console.error('❌ Error fetching staff:', err);
     res.status(500).json({ status: 'error', message: 'Server error' });
   }
 });
+
 
 
 
@@ -252,67 +253,38 @@ router.get('/attendance', async (req, res) => {
 });
 
 
-// PUT /api/staff/:id
+
+
+
+// ✅ Update an existing staff member (tenant-safe, partial update)
 router.put('/:id', async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
   const { id } = req.params;
-  const {
-    name,
-    role,
-    phone,
-    address,
-    salary,
-    email,
-    payment_type,
-    salary_model,
-    hourly_rate,
-    weekly_salary,
-    monthly_salary,
-    avatar //
-  } = req.body;
+  const body = req.body;
 
-  logRequest(`/api/staff/${id}`, 'PUT', req.body);
+  logRequest(`/api/staff/${id}`, 'PUT', body);
 
-  const fields = [];
-  const values = [];
-  let idx = 1;
+  const allowedFields = [
+    "name", "role", "phone", "address", "salary", "email",
+    "payment_type", "salary_model", "hourly_rate",
+    "weekly_salary", "monthly_salary", "avatar", "pin"
+  ];
 
-  const pushField = (key, value) => {
-    fields.push(`${key} = $${idx++}`);
-    values.push(value);
-  };
-
-  // Add fields only if provided
-  if (name !== undefined) pushField("name", name);
-  if (role !== undefined) pushField("role", role);
-  if (phone !== undefined) pushField("phone", phone);
-  if (address !== undefined) pushField("address", address);
-  if (email !== undefined) pushField("email", email);
-  if (payment_type !== undefined) pushField("payment_type", payment_type);
-  if (salary_model !== undefined) pushField("salary_model", salary_model);
-  if (salary !== undefined) pushField("salary", salary);
-  if (hourly_rate !== undefined) pushField("hourly_rate", hourly_rate);
-  if (weekly_salary !== undefined) pushField("weekly_salary", weekly_salary);
-  if (monthly_salary !== undefined) pushField("monthly_salary", monthly_salary);
-  if (avatar !== undefined) pushField("avatar", avatar); // ✅ add this line
-
-  // If nothing to update
-  if (fields.length === 0) {
+  const fieldsToUpdate = Object.keys(body).filter(key => allowedFields.includes(key));
+  if (fieldsToUpdate.length === 0) {
     return res.status(400).json({ status: 'error', message: 'No valid fields provided for update' });
   }
 
-  // Conditional validation (only when salary_model is supplied)
-  if (salary_model === 'hourly' && (hourly_rate === undefined || hourly_rate === "")) {
-    return res.status(400).json({ status: 'error', message: 'Hourly rate is required for hourly salary model' });
-  }
-
-  if (salary_model === 'fixed' && (salary === undefined || salary === "")) {
-    return res.status(400).json({ status: 'error', message: 'Salary is required for fixed salary model' });
-  }
+  const setClause = fieldsToUpdate.map((key, index) => `${key} = $${index + 3}`).join(', ');
+  const values = [restaurantId, id, ...fieldsToUpdate.map(key => body[key])];
 
   try {
     const result = await pool.query(
-      `UPDATE staff SET ${fields.join(', ')} WHERE restaurant_id = $1 AND id = $${idx} RETURNING *`,
-      [...values, id]
+      `UPDATE staff
+       SET ${setClause}
+       WHERE restaurant_id = $1 AND id = $2
+       RETURNING *`,
+      values
     );
 
     if (result.rowCount === 0) {
@@ -320,15 +292,16 @@ router.put('/:id', async (req, res) => {
     }
 
     console.log(`✅ Updated staff ID: ${id}`);
-    res.json({ status: 'success', message: 'Staff updated successfully', staff: result.rows[0] });
+    res.json({
+      status: 'success',
+      message: 'Staff updated successfully',
+      staff: result.rows[0]
+    });
   } catch (err) {
     console.error('❌ Error updating staff:', err);
     res.status(500).json({ status: 'error', message: 'Error updating staff' });
   }
 });
-
-
-
 
 // Delete (soft delete) Staff
 // ✅ Soft delete (archive) a staff member — tenant-safe
@@ -550,67 +523,6 @@ router.post('/', async (req, res) => {
   }
 });
 
-
-
-// Edit Staff
-// ✅ Update an existing staff member (tenant-safe, partial update)
-router.put('/:id', async (req, res) => {
-  const restaurantId = req.user.restaurant_id; // tenant scope
-  const { id } = req.params;
-  const body = req.body;
-
-  logRequest(`/api/staff/${id}`, 'PUT', body);
-
-  // ✅ Allowed fields
-  const allowedFields = [
-    "name", "role", "phone", "address", "salary", "email",
-    "payment_type", "salary_model", "hourly_rate",
-    "weekly_salary", "monthly_salary", "avatar", "pin"
-  ];
-
-  const fieldsToUpdate = Object.keys(body).filter(key => allowedFields.includes(key));
-
-  if (fieldsToUpdate.length === 0) {
-    return res.status(400).json({
-      status: 'error',
-      message: 'No valid fields provided for update'
-    });
-  }
-
-  // Build query dynamically
-  const setClause = fieldsToUpdate.map((key, index) => `${key} = $${index + 3}`).join(', ');
-  const values = [restaurantId, id, ...fieldsToUpdate.map(key => body[key])];
-
-  try {
-    const result = await pool.query(
-      `UPDATE staff
-       SET ${setClause}
-       WHERE restaurant_id = $1 AND id = $2
-       RETURNING *`,
-      values
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'Staff not found'
-      });
-    }
-
-    console.log(`✅ Updated staff ID: ${id}`);
-    res.json({
-      status: 'success',
-      message: 'Staff updated successfully',
-      staff: result.rows[0]
-    });
-  } catch (err) {
-    console.error('❌ Error updating staff:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Error updating staff'
-    });
-  }
-});
 
 
 
@@ -1352,28 +1264,40 @@ router.get('/drivers', async (req, res) => {
 
 
 // ✅ Update staff role
+// ✅ Update staff role (tenant-safe)
 router.put('/:id/role', async (req, res) => {
-  const { id } = req.params;
-  const { role } = req.body;
-
-  if (!role) {
-    return res.status(400).json({ status: 'error', message: 'Role is required' });
-  }
-
   try {
+    const { id } = req.params;
+    const { role } = req.body;
+    const restaurantId = req.user?.restaurant_id;
+
+    console.log("🧩 Update role request:", { id, role, restaurantId });
+
+    if (!restaurantId) {
+      return res.status(401).json({ status: 'error', message: 'Missing restaurant context' });
+    }
+    if (!role) {
+      return res.status(400).json({ status: 'error', message: 'Role is required' });
+    }
+
     const result = await pool.query(
-      `UPDATE staff SET role = $1 WHERE restaurant_id = $1 AND id = $2 RETURNING id, name, email, role`,
-      [role.toLowerCase(), id]
+      `UPDATE staff
+         SET role = $1
+       WHERE restaurant_id = $2
+         AND id = $3
+       RETURNING id, name, email, role, restaurant_id`,
+      [role.toLowerCase(), restaurantId, id]
     );
 
     if (result.rowCount === 0) {
+      console.warn(`⚠️ No staff found for ID ${id} in restaurant ${restaurantId}`);
       return res.status(404).json({ status: 'error', message: 'Staff not found' });
     }
 
-    console.log(`✅ Updated role for staff ID ${id} → ${role.toLowerCase()}`);
+    console.log(`✅ Role updated for staff ${id} → ${role.toLowerCase()} (tenant ${restaurantId})`);
     res.json({ status: 'success', staff: result.rows[0] });
   } catch (err) {
-    console.error('❌ Error updating staff role:', err);
+    console.error('🔥 Error updating staff role:', err.stack || err);
     res.status(500).json({ status: 'error', message: 'Failed to update staff role' });
   }
 });
@@ -1381,50 +1305,70 @@ router.put('/:id/role', async (req, res) => {
 
 
 // ----------------- LOGIN (Users + Staff) -----------------
-// ✅ Unified login for both users and staff (tenant-safe)
+// ✅ Unified login for both users (admin/manager) and staff (PIN-based)
 router.post('/login', async (req, res) => {
   const { email, password, pin } = req.body;
-  console.log('🔐 Login attempt:', { email, pin: !!pin });
+  console.log('🔑 Login Debug');
+  console.log(`➡️ Incoming email: ${email}`);
 
   try {
-    // ---------------------
-    // 🧩 1. Try user (admin/manager)
-    // ---------------------
+    // 1️⃣ Try ADMIN / USER (password login)
+    console.log('🛠️ Querying users table…');
     const userRes = await pool.query(
-      `
-      SELECT id, full_name, email, role, password_hash, restaurant_id
-      FROM users
-      WHERE email = $1
-      `,
+      `SELECT id, full_name, email, role, password_hash, restaurant_id
+       FROM users
+       WHERE email = $1`,
       [email]
     );
 
     const user = userRes.rows[0];
     if (user && await bcrypt.compare(password || '', user.password_hash)) {
-      console.log(`✅ User login success: ${user.full_name} (${user.role})`);
+      console.log(`✅ Admin login success: ${user.full_name}`);
+
+      // 🔐 Fetch permissions for admin role
+      const settingsRes = await pool.query(
+        `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'users'`,
+        [user.restaurant_id]
+      );
+
+      let permissions = [];
+      if (settingsRes.rows.length > 0) {
+        const config = settingsRes.rows[0].value;
+        permissions = config?.roles?.[user.role?.toLowerCase()] || [];
+      }
+
+      // 🧾 Sign JWT
+      const token = jwt.sign(
+        {
+          id: user.id,
+          role: user.role,
+          restaurant_id: user.restaurant_id,
+        },
+        process.env.JWT_SECRET || "beyprosecret",
+        { expiresIn: "7d" }
+      );
 
       return res.json({
         success: true,
+        type: "user",
         user: {
           id: user.id,
-          fullName: user.full_name,
+          name: user.full_name,
           email: user.email,
           role: user.role,
           restaurant_id: user.restaurant_id,
-          type: 'admin',
+          permissions, // ✅ include permissions
         },
+        token,
       });
     }
 
-    // ---------------------
-    // 🧩 2. Try staff (PIN or password)
-    // ---------------------
+    // 2️⃣ Try STAFF (PIN login)
+    console.log('🛠️ Querying staff table…');
     const staffRes = await pool.query(
-      `
-      SELECT id, name, email, role, pin, restaurant_id
-      FROM staff
-      WHERE email = $1
-      `,
+      `SELECT id, name, email, role, pin, restaurant_id
+       FROM staff
+       WHERE email = $1`,
       [email]
     );
 
@@ -1432,32 +1376,60 @@ router.post('/login', async (req, res) => {
     if (staff && (staff.pin === pin || staff.pin === password)) {
       console.log(`✅ Staff login success: ${staff.name} (${staff.role})`);
 
+      // 🧩 Fetch permissions for staff role
+      const settingsRes = await pool.query(
+        `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'users'`,
+        [staff.restaurant_id]
+      );
+
+      let permissions = [];
+      if (settingsRes.rows.length > 0) {
+        const config = settingsRes.rows[0].value;
+        permissions = config?.roles?.[staff.role?.toLowerCase()] || [];
+      }
+
+      // 🧾 Sign JWT
+      const token = jwt.sign(
+        {
+          id: staff.id,
+          role: staff.role,
+          restaurant_id: staff.restaurant_id,
+        },
+        process.env.JWT_SECRET || "beyprosecret",
+        { expiresIn: "7d" }
+      );
+
       return res.json({
         success: true,
+        type: "staff",
         staff: {
           id: staff.id,
           name: staff.name,
           email: staff.email,
           role: staff.role,
           restaurant_id: staff.restaurant_id,
-          type: 'staff',
+          permissions, // ✅ include permissions
         },
+        token,
       });
     }
 
-    // 🚫 No match found
-    res.status(401).json({
+    // 3️⃣ No match found
+    console.warn('❌ Invalid credentials');
+    return res.status(401).json({
       success: false,
       error: 'Invalid credentials',
     });
   } catch (err) {
-    console.error('❌ Login error:', err);
-    res.status(500).json({
+    console.error('🔥 Login error:', err.stack || err);
+    return res.status(500).json({
       success: false,
       error: 'Server error during login',
     });
   }
 });
+
+
 
 
 

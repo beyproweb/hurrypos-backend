@@ -1,11 +1,23 @@
+// routes/extras-groups.js
 const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
+const authMiddleware = require("../middleware/authMiddleware");
 
-// GET /api/extras-groups - fetch ALL groups with their items
+// ✅ All routes are now tenant-safe
+router.use(authMiddleware);
+
+/**
+ * GET /api/extras-groups
+ * Fetch all extras groups for the current tenant (restaurant)
+ */
 router.get("/", async (req, res) => {
+  const restaurant_id = req.user?.restaurant_id;
+  if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
+
   try {
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT
         g.id,
         g.group_name,
@@ -23,9 +35,13 @@ router.get("/", async (req, res) => {
         ) AS items
       FROM extras_groups g
       LEFT JOIN extras_group_items i ON i.group_id = g.id
+      WHERE g.restaurant_id = $1
       GROUP BY g.id, g.group_name
       ORDER BY g.id ASC
-    `);
+      `,
+      [restaurant_id]
+    );
+
     res.json(result.rows);
   } catch (err) {
     console.error("❌ Error fetching extras groups:", err.stack || err);
@@ -33,38 +49,78 @@ router.get("/", async (req, res) => {
   }
 });
 
-// (Optional) GET /api/extras-groups/:id - fetch single group
+/**
+ * GET /api/extras-groups/:id
+ * Fetch one group with all its items
+ */
 router.get("/:id", async (req, res) => {
+  const restaurant_id = req.user?.restaurant_id;
   const { id } = req.params;
+  if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
+
   try {
-    const result = await pool.query("SELECT * FROM extras_groups WHERE restaurant_id = $1 AND id = $1", [id]);
+    const result = await pool.query(
+      `
+      SELECT
+        g.id,
+        g.group_name,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id', i.id,
+              'name', i.ingredient_name,
+              'extraPrice', i.price,
+              'unit', i.unit,
+              'amount', i.amount
+            )
+          ) FILTER (WHERE i.id IS NOT NULL),
+          '[]'
+        ) AS items
+      FROM extras_groups g
+      LEFT JOIN extras_group_items i ON i.group_id = g.id
+      WHERE g.restaurant_id = $1 AND g.id = $2
+      GROUP BY g.id, g.group_name
+      `,
+      [restaurant_id, id]
+    );
+
     if (!result.rows.length) return res.status(404).json({ error: "Not found" });
     res.json(result.rows[0]);
   } catch (err) {
-    console.error("❌ Error fetching group by id:", err);
+    console.error("❌ Error fetching extras group by id:", err.stack || err);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-// POST /api/extras-groups - create new group with items
+/**
+ * POST /api/extras-groups
+ * Create a new extras group with its items
+ */
 router.post("/", async (req, res) => {
+  const restaurant_id = req.user?.restaurant_id;
   const { group_name, items } = req.body;
-  if (!group_name || !Array.isArray(items)) {
+
+  if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
+  if (!group_name || !Array.isArray(items))
     return res.status(400).json({ error: "Invalid payload" });
-  }
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
     const groupRes = await client.query(
-      "INSERT INTO extras_groups (group_name) VALUES ($1) RETURNING id, group_name",
-      [group_name]
+      `INSERT INTO extras_groups (restaurant_id, group_name)
+       VALUES ($1, $2)
+       RETURNING id, group_name`,
+      [restaurant_id, group_name]
     );
     const groupId = groupRes.rows[0].id;
 
     for (const item of items) {
       if (!item.name) continue;
       await client.query(
-        `INSERT INTO extras_group_items (group_id, ingredient_name, price, amount, unit)
+        `INSERT INTO extras_group_items
+         (group_id, ingredient_name, price, amount, unit)
          VALUES ($1, $2, $3, $4, $5)`,
         [
           groupId,
@@ -73,7 +129,7 @@ router.post("/", async (req, res) => {
           item.amount !== undefined && item.amount !== null && item.amount !== ""
             ? parseFloat(item.amount)
             : 1,
-          item.unit || ""
+          item.unit || "",
         ]
       );
     }
@@ -89,20 +145,28 @@ router.post("/", async (req, res) => {
   }
 });
 
-// PUT /api/extras-groups/:id - update group name and replace items
+/**
+ * PUT /api/extras-groups/:id
+ * Update an existing group and replace its items
+ */
 router.put("/:id", async (req, res) => {
+  const restaurant_id = req.user?.restaurant_id;
   const { id } = req.params;
   const { group_name, items } = req.body;
-  if (!group_name || !Array.isArray(items)) {
+
+  if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
+  if (!group_name || !Array.isArray(items))
     return res.status(400).json({ error: "Invalid payload" });
-  }
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
     await client.query(
-      "UPDATE extras_groups SET group_name = $1 WHERE restaurant_id = $1 AND id = $2",
-      [group_name, id]
+      `UPDATE extras_groups
+       SET group_name = $1
+       WHERE restaurant_id = $2 AND id = $3`,
+      [group_name, restaurant_id, id]
     );
 
     await client.query("DELETE FROM extras_group_items WHERE group_id = $1", [id]);
@@ -119,7 +183,7 @@ router.put("/:id", async (req, res) => {
           item.amount !== undefined && item.amount !== null && item.amount !== ""
             ? parseFloat(item.amount)
             : 1,
-          item.unit || ""
+          item.unit || "",
         ]
       );
     }
@@ -135,15 +199,24 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-// DELETE /api/extras-groups/:id - Delete an extras group and its items
+/**
+ * DELETE /api/extras-groups/:id
+ * Delete a group and its items
+ */
 router.delete("/:id", async (req, res) => {
+  const restaurant_id = req.user?.restaurant_id;
   const { id } = req.params;
+  if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
+
   try {
     await pool.query("DELETE FROM extras_group_items WHERE group_id = $1", [id]);
-    await pool.query("DELETE FROM extras_groups WHERE restaurant_id = $1 AND id = $1", [id]);
+    await pool.query(
+      "DELETE FROM extras_groups WHERE restaurant_id = $1 AND id = $2",
+      [restaurant_id, id]
+    );
     res.json({ success: true });
   } catch (err) {
-    console.error("❌ Error deleting group:", err.stack || err);
+    console.error("❌ Error deleting extras group:", err.stack || err);
     res.status(500).json({ error: "Database error" });
   }
 });
