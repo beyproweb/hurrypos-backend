@@ -4,15 +4,28 @@ const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 
-// ✅ All routes are now tenant-safe
-router.use(authMiddleware);
+async function resolveRestaurantId(req) {
+  const identifier = req.query.identifier;
+  let restaurant_id = req.user?.restaurant_id;
+
+  if (identifier) {
+    if (/^\d+$/.test(identifier)) {
+      restaurant_id = Number(identifier);
+    } else {
+      const result = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [identifier]);
+      restaurant_id = result.rows[0]?.id;
+    }
+  }
+
+  return restaurant_id;
+}
 
 /**
  * GET /api/extras-groups
  * Fetch all extras groups for the current tenant (restaurant)
  */
 router.get("/", async (req, res) => {
-  const restaurant_id = req.user?.restaurant_id;
+  const restaurant_id = await resolveRestaurantId(req);
   if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
 
   try {
@@ -54,7 +67,7 @@ router.get("/", async (req, res) => {
  * Fetch one group with all its items
  */
 router.get("/:id", async (req, res) => {
-  const restaurant_id = req.user?.restaurant_id;
+  const restaurant_id = await resolveRestaurantId(req);
   const { id } = req.params;
   if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
 
@@ -91,6 +104,9 @@ router.get("/:id", async (req, res) => {
     res.status(500).json({ error: "Database error" });
   }
 });
+
+// Require auth for mutations and non-public endpoints
+router.use(authMiddleware);
 
 /**
  * POST /api/extras-groups

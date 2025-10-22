@@ -5,11 +5,60 @@ const { pool } = require("../db");   // ✅ destructure pool
 
 const authMiddleware = require("../middleware/authMiddleware");
 
-router.use(authMiddleware);
+async function resolveRestaurantId(req) {
+  const identifier = req.query.identifier;
+  let restaurantId = req.user?.restaurant_id;
+
+  if (identifier) {
+    if (/^\d+$/.test(identifier)) {
+      restaurantId = Number(identifier);
+    } else {
+      const result = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [identifier]);
+      restaurantId = result.rows[0]?.id;
+    }
+  }
+
+  return restaurantId;
+}
 // optional: uncomment if you have a global logger
 // const { logRequest } = require("../utils/logger");
+// simple safe logger fallback
+const log = (path, method, data) =>
+  console.log(`🧾 ${method} ${path}`, data ? JSON.stringify(data) : "");
+
+router.get("/", async (req, res) => {
+  try {
+    const restaurantId = await resolveRestaurantId(req);
+    if (!restaurantId) {
+      return res.status(400).json({ error: "Invalid restaurant" });
+    }
+
+    log("/api/products", "GET", { restaurantId });
+
+    const result = await pool.query(
+      `
+      SELECT id, name, category, price, preparation_time, description,
+             discount_type, discount_value, visible, tags, allergens,
+             promo_start, promo_end, image, image_url, ingredients, extras,
+             selected_extras_group, created_at
+      FROM products
+      WHERE restaurant_id = $1
+      ORDER BY id DESC
+      `,
+      [restaurantId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Fetch products error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch products" });
+  }
+});
+
+router.use(authMiddleware);
 // Tenant guard middleware
 router.use((req, res, next) => {
+  if (req.query?.identifier) return next();
   if (!req.user || !req.user.restaurant_id) {
     return res.status(401).json({
       status: "error",
@@ -18,9 +67,6 @@ router.use((req, res, next) => {
   }
   next();
 });
-// simple safe logger fallback
-const log = (path, method, data) =>
-  console.log(`🧾 ${method} ${path}`, data ? JSON.stringify(data) : "");
 
 // ----------------- PRODUCTS -----------------
 
@@ -496,29 +542,6 @@ router.get("/:id", async (req, res) => {
 });
 
 // ✅ Fetch all products (tenant-safe)
-router.get("/", async (req, res) => {
-  const restaurantId = req.user.restaurant_id;
-  log("/api/products", "GET", { restaurantId });
-
-  try {
-    const result = await pool.query(
-      `
-      SELECT id, name, category, price, preparation_time, description,
-             discount_type, discount_value, visible, tags, allergens,
-             promo_start, promo_end, image, image_url, ingredients, extras,
-             selected_extras_group, created_at
-      FROM products
-      WHERE restaurant_id = $1
-      ORDER BY id DESC
-      `,
-      [restaurantId]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error("❌ Fetch products error:", err);
-    res.status(500).json({ status: "error", message: "Failed to fetch products" });
-  }
-});
 
 // ----------------- CATEGORIES -----------------
 
