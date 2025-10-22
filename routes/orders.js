@@ -10,6 +10,31 @@ const dlog = (...args) =>
   console.log(new Date().toISOString(), "[orders]", ...args);
 const authMiddleware = require("../middleware/authMiddleware");
 
+async function resolveRestaurantId(req) {
+  const identifier = req.query.identifier;
+  let restaurant_id = req.user?.restaurant_id;
+
+  if (identifier) {
+    if (/^\d+$/.test(identifier)) {
+      restaurant_id = Number(identifier);
+    } else {
+      const result = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [identifier]);
+      restaurant_id = result.rows[0]?.id;
+    }
+  }
+
+  return restaurant_id;
+}
+
+async function requireRestaurantId(req, res) {
+  const restaurantId = await resolveRestaurantId(req);
+  if (!restaurantId) {
+    res.status(400).json({ error: "Invalid restaurant" });
+    return null;
+  }
+  return restaurantId;
+}
+
 router.use(authMiddleware);
 
 // Track the last write/update time per order id to spot read-after-write timing
@@ -111,8 +136,8 @@ async function buildFullOrderPayload(orderId, restaurantId) {
 // Supports: ?status=open_phone to return ONLY non-closed phone/packet orders
 router.get("/", async (req, res) => {
   try {
-    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-    const restaurantId = req.user.restaurant_id;
+    const restaurantId = await requireRestaurantId(req, res);
+    if (!restaurantId) return;
     const { status, table_number, type } = req.query;
 
     // 🔐 Special mode: always and only open phone/packet
@@ -185,6 +210,9 @@ router.post("/", async (req, res) => {
   }
   // --- END REGISTER CHECK ---
 
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
   const client = await pool.connect();
   try {
     const {
@@ -231,7 +259,7 @@ const orderInsertQuery = hasCreatedByColumn
 
 const orderInsertParams = hasCreatedByColumn
   ? [
-      req.user.restaurant_id,
+      restaurantId,
       table_number || null,
       initialStatus,
       total,
@@ -243,7 +271,7 @@ const orderInsertParams = hasCreatedByColumn
       req.user?.id || null,
     ]
   : [
-      req.user.restaurant_id,
+      restaurantId,
       table_number || null,
       initialStatus,
       total,
@@ -257,7 +285,6 @@ const orderInsertParams = hasCreatedByColumn
 const orderResult = await client.query(orderInsertQuery, orderInsertParams);
 
 const order = orderResult.rows[0];
-const restaurantId = req.user.restaurant_id;
 
 // ✅ Immediately persist customer + address (so it shows on frontend top bar)
 if (customer_phone && customer_address) {
@@ -490,7 +517,8 @@ res.json({
 router.put("/:id/status", async (req, res) => {
   const { id } = req.params;
   const { status, total, payment_method } = req.body;
-  const restaurantId = req.user.restaurant_id;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
   const client = await pool.connect();
 
   try {
@@ -599,6 +627,8 @@ router.get("/driver-report", async (req, res) => {
 // POST order items (with upsert for existing items)
 router.post("/order-items", async (req, res) => {
   const { order_id, items, receipt_id } = req.body;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
 
   const preparedItems = items.map((item, idx) => {
 
@@ -611,24 +641,21 @@ router.post("/order-items", async (req, res) => {
 
   try {
     await saveOrderItems(order_id, preparedItems);
-    await updateStockForOrder(preparedItems, req.user.restaurant_id);
+    await updateStockForOrder(preparedItems, restaurantId);
      // --- ADD THIS BLOCK:
 const orderRes = await pool.query(
   "SELECT status FROM orders WHERE restaurant_id = $1 AND id = $2",
-  [req.user.restaurant_id, order_id]
+  [restaurantId, order_id]
 );
 if (["closed", "occupied"].includes(orderRes.rows[0]?.status)) {
   await pool.query(
     "UPDATE orders SET status = 'confirmed' WHERE restaurant_id = $1 AND id = $2",
-    [req.user.restaurant_id, order_id]
+    [restaurantId, order_id]
   );
 }
 
 // --- Ensure all items and stock updates are fully written before any emit ---
 await new Promise(resolve => setTimeout(resolve, 250)); // short wait ensures DB visibility
-
-// 🔒 Tenant-safe emit to this restaurant only
-const restaurantId = req.user.restaurant_id;
 
 // ✅ Build payload after all commits — full and fresh
 try {
@@ -1161,6 +1188,8 @@ async function updateStockForOrder(orderItems, restaurantId) {
 // GET order items by order ID
 router.get("/:id/items", async (req, res) => {
   const { id } = req.params;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
   try {
     const result = await pool.query(
   `SELECT
@@ -1184,8 +1213,9 @@ router.get("/:id/items", async (req, res) => {
      p.name AS product_name
    FROM order_items oi
    LEFT JOIN products p ON oi.product_id = p.id
-   WHERE oi.order_id = $1`,
-  [id]
+   JOIN orders o ON o.id = oi.order_id
+   WHERE oi.order_id = $1 AND o.restaurant_id = $2`,
+  [id, restaurantId]
 );
 
     const items = result.rows.map(item => ({
@@ -2025,6 +2055,8 @@ router.get("/:raw", async (req, res) => {
   console.log(`🧪 [orders] GET /api/orders/${raw} — resolver start`);
 
   try {
+    const restaurantId = await requireRestaurantId(req, res);
+    if (!restaurantId) return;
     // Only allow numeric ID now (order_number column removed/not used)
     if (!/^\d+$/.test(raw)) {
       return res.status(400).json({ error: "Order id must be numeric", raw });
@@ -2035,7 +2067,7 @@ router.get("/:raw", async (req, res) => {
     const { rows: orderRows } = await pool.query(
       `SELECT id, status, table_number, order_type, total, created_at
        FROM orders WHERE restaurant_id = $1 AND id = $2`,
-[req.user.restaurant_id, internalId]
+[restaurantId, internalId]
 
     );
     if (!orderRows.length) {

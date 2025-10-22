@@ -9,6 +9,22 @@ const streamifier = require("streamifier");
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
+async function resolveRestaurantId(req) {
+  const identifier = req.query.identifier;
+  let restaurant_id = req.user?.restaurant_id;
+
+  if (identifier) {
+    if (/^\d+$/.test(identifier)) {
+      restaurant_id = Number(identifier);
+    } else {
+      const result = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [identifier]);
+      restaurant_id = result.rows[0]?.id;
+    }
+  }
+
+  return restaurant_id;
+}
+
 // Upload category image
 router.post("/", upload.single("image"), async (req, res) => {
   try {
@@ -51,6 +67,9 @@ router.post("/", upload.single("image"), async (req, res) => {
 // Fetch category image(s)
 router.get("/", async (req, res) => {
   try {
+    const restaurant_id = await resolveRestaurantId(req);
+    if (!restaurant_id) return res.status(400).json({ error: "Invalid restaurant" });
+
     let { category } = req.query;
 
     let query, params;
