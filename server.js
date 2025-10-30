@@ -8,24 +8,27 @@ const pool = require("./db");
 const cors = require("cors");
 
 const allowedOrigins = [
-  "http://localhost:5173", // dev
+  "http://localhost:5173",
   "https://pos.beypro.com",
   "https://www.pos.beypro.com",
-  "https://hurrypos-frontend.onrender.com", // production
+  "https://hurrypos-frontend.onrender.com",
 ];
+
 const allowedOriginsNormalized = allowedOrigins.map((o) => o.toLowerCase());
 
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin) return callback(null, true); // allow REST clients/curl
+      if (!origin) return callback(null, true); // allow REST clients / curl
       const normalized = origin.toLowerCase();
-      if (allowedOriginsNormalized.includes(normalized)) {
+      if (
+        allowedOrigins.some((o) => normalized === o.toLowerCase()) ||
+        /\.vercel\.app$/.test(normalized)
+      ) {
         return callback(null, true);
-      } else {
-        console.warn("❌ Blocked by CORS:", origin);
-        return callback(new Error("Not allowed by CORS"));
       }
+      console.warn("❌ Blocked by CORS:", origin);
+      return callback(new Error("Not allowed by CORS"));
     },
     methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
     credentials: true,
