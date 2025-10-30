@@ -54,6 +54,8 @@
     "nodemon": "^3.1.10",
     "pkg": "^5.8.1"
   },
+  "engines": { "node": "20.x" },
+
   "pkg": {
     "assets": [
       "node_modules/serialport/**/*",
