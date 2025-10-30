@@ -3,8 +3,10 @@ const router = express.Router();
 const { pool } = require("../db");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const authMiddleware = require("../middleware/authMiddleware");
 
-// ----------------- REGISTER -----------------
+
+/* ----------------------------- REGISTER ----------------------------- */
 router.post("/register", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -22,46 +24,53 @@ router.post("/register", async (req, res) => {
     const password_hash = await bcrypt.hash(password, 10);
     await client.query("BEGIN");
 
-    // 1️⃣ Create the user (role: admin)
+    // Create user
     const userRes = await client.query(
-      `
-      INSERT INTO users (email, full_name, password_hash, business_name, subscription_plan, role)
-      VALUES ($1, $2, $3, $4, $5, 'admin')
-      RETURNING id
-      `,
+      `INSERT INTO users (email, full_name, password_hash, business_name, subscription_plan, role)
+       VALUES ($1,$2,$3,$4,$5,'admin')
+       RETURNING id`,
       [email, full_name, password_hash, business_name, subscription_plan || "free"]
     );
     const userId = userRes.rows[0].id;
 
-    // 2️⃣ Create the restaurant
-    const restaurantRes = await client.query(
-      `
-      INSERT INTO restaurants (name, plan, billing_cycle, owner_id)
-      VALUES ($1, $2, 'monthly', $3)
-      RETURNING id
-      `,
+    // Create restaurant
+    const restRes = await client.query(
+      `INSERT INTO restaurants (name, plan, billing_cycle, owner_id)
+       VALUES ($1,$2,'monthly',$3)
+       RETURNING id`,
       [business_name, subscription_plan || "free", userId]
     );
-    const restaurantId = restaurantRes.rows[0].id;
+    const restaurantId = restRes.rows[0].id;
 
-    // 3️⃣ Link the user to their restaurant
+    // Link user → restaurant
+    await client.query(`UPDATE users SET restaurant_id=$1 WHERE id=$2`, [restaurantId, userId]);
+
+    // Default settings
     await client.query(
-      `UPDATE users SET restaurant_id = $1 WHERE id = $2`,
-      [restaurantId, userId]
+      `INSERT INTO settings (restaurant_id, key, value)
+       VALUES ($1,'users','{}'::jsonb)
+       ON CONFLICT (restaurant_id, key) DO NOTHING`,
+      [restaurantId]
     );
 
-    // 4️⃣ Optional: create default settings safely
+    // Optional: create subscription details row
     await client.query(
-      `
-      INSERT INTO settings (restaurant_id, users, notifications, appearance, key, value)
-      VALUES ($1, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 'global', '{}'::jsonb)
-      ON CONFLICT (restaurant_id, key) DO NOTHING
-      `,
+      `CREATE TABLE IF NOT EXISTS subscriptions (
+         restaurant_id INTEGER PRIMARY KEY REFERENCES restaurants(id) ON DELETE CASCADE,
+         card_number TEXT,
+         expiry TEXT,
+         cvv TEXT,
+         billing_cycle TEXT DEFAULT 'monthly'
+       )`
+    );
+    await client.query(
+      `INSERT INTO subscriptions (restaurant_id, billing_cycle)
+       VALUES ($1, 'monthly')
+       ON CONFLICT (restaurant_id) DO NOTHING`,
       [restaurantId]
     );
 
     await client.query("COMMIT");
-
     res.json({ success: true, message: "Registration successful", restaurant_id: restaurantId });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -72,56 +81,31 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// ----------------- LOGIN -----------------
-// ----------------- LOGIN -----------------
+/* ----------------------------- LOGIN ----------------------------- */
 router.post("/login", async (req, res) => {
-  console.log("🟢 /api/login hit:", req.body);
-
   const { email, password } = req.body;
   try {
-    const userRes = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    const userRes = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
     const user = userRes.rows[0];
-
     if (!user) return res.status(401).json({ success: false, error: "User not found" });
 
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) return res.status(401).json({ success: false, error: "Wrong password" });
 
-    // ✅ Safe fetch of settings (won't crash if missing)
-    const settingsRes = await pool.query(
-      `SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1`,
-      [user.restaurant_id]
-    );
+const token = jwt.sign(
+  {
+    id: user.id,
+    name: user.full_name || user.name,
+    role: user.role || "admin",
+    restaurant_id: user.restaurant_id,  // ✅ required for middleware
+  },
+  process.env.JWT_SECRET || "beypro_secret_2025",
+  { expiresIn: "7d" }
+);
 
-    let rolesJson = {};
-    if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
-      rolesJson = settingsRes.rows[0].users;
-    }
 
-    // ✅ Normalize role to lowercase
-    const roleKey = (user.role || "admin").toLowerCase();
 
-    // ✅ Resolve permissions
-    let permissions = rolesJson.roles?.[roleKey] || [];
 
-    // ✅ Ensure admin is always superuser
-    if (roleKey === "admin") {
-      permissions = ["all"];
-    }
-
-    // ✅ Generate JWT (include tenant)
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        role: roleKey,
-        restaurant_id: user.restaurant_id,
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    // ✅ Always return normalized role + guaranteed permissions
     res.json({
       success: true,
       token,
@@ -129,10 +113,9 @@ router.post("/login", async (req, res) => {
         id: user.id,
         fullName: user.full_name,
         email: user.email,
-        role: roleKey,
+        role: user.role,
         restaurant_id: user.restaurant_id,
         business_name: user.business_name,
-        permissions,
       },
     });
   } catch (err) {
@@ -141,61 +124,212 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// ----------------- ME (verify token) -----------------
-// ----------------- ME (verify token) -----------------
-router.get("/me", async (req, res) => {
+/* ----------------------------- GET /me ----------------------------- */
+router.get("/me", authMiddleware, async (req, res) => {
   try {
-    const token = req.headers.authorization?.split(" ")[1];
-    if (!token) {
-      return res.status(401).json({ success: false, error: "Unauthorized" });
-    }
+    const userId = req.user.id;
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    // Fetch user record
-    const userRes = await pool.query(
-      `SELECT id, full_name, email, role, restaurant_id, business_name
-       FROM users
-       WHERE id = $1`,
-      [decoded.id]
+    const result = await pool.query(
+      `SELECT
+          u.id,
+          u.full_name,
+          u.email,
+          u.business_name,
+          u.subscription_plan AS active_plan,
+          u.phone,
+          r.id AS restaurant_id,
+          r.name AS restaurant_name,
+          r.plan,
+          r.billing_cycle,
+          r.pos_location,
+          r.usage_type,
+          s.card_number,
+          s.expiry,
+          s.cvv,
+          s.billing_cycle AS sub_billing_cycle,
+          s.efatura,
+          s.invoice_title,
+          s.tax_office,
+          s.invoice_type
+       FROM users u
+       LEFT JOIN restaurants r ON r.id = u.restaurant_id
+       LEFT JOIN subscriptions s ON s.restaurant_id = r.id
+       WHERE u.id = $1`,
+      [userId]
     );
 
-    if (userRes.rowCount === 0) {
-      return res.status(404).json({ success: false, error: "User not found" });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
     }
 
-    const user = userRes.rows[0];
-    const roleKey = (user.role || "admin").toLowerCase();
-
-    // Fetch roles/permissions config from settings
-    let rolesJson = {};
-    const settingsRes = await pool.query(
-      `SELECT users FROM settings WHERE restaurant_id = $1 LIMIT 1`,
-      [user.restaurant_id]
-    );
-    if (settingsRes.rowCount > 0 && settingsRes.rows[0].users) {
-      rolesJson = settingsRes.rows[0].users;
-    }
-
-    // Resolve permissions
-    let permissions = rolesJson.roles?.[roleKey] || [];
-
-    // ✅ Ensure admin is always superuser
-    if (roleKey === "admin") {
-      permissions = ["all"];
-    }
+    const user = result.rows[0];
 
     res.json({
-      success: true,
       user: {
-        ...user,
-        role: roleKey,
-        permissions,
+        id: user.id,
+        full_name: user.full_name,
+        email: user.email,
+        business_name: user.business_name,
+        active_plan: user.active_plan,
+        phone: user.phone || "",
+        pos_location: user.pos_location || "",
+        usage_type: user.usage_type || "",
+        card_number: user.card_number || "",
+        expiry: user.expiry || "",
+        cvv: user.cvv || "",
+        billing_cycle: user.sub_billing_cycle || user.billing_cycle || "monthly",
+        efatura: user.efatura || false,
+        invoice_title: user.invoice_title || "",
+        tax_office: user.tax_office || "",
+        invoice_type: user.invoice_type || "",
       },
     });
   } catch (err) {
-    console.error("❌ /me route error:", err);
-    res.status(401).json({ success: false, error: "Invalid token" });
+    console.error("❌ GET /me error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+/* ----------------------------- PUT /me ----------------------------- */
+router.put("/me", authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+  const {
+    fullName,
+    email,
+    businessName,
+    billingCycle,
+    activePlan,
+    password,
+    cardNumber,
+    expiry,
+    cvv,
+    phone,
+    posLocation,
+    usageType,
+    efatura,
+    invoiceTitle,
+    taxOffice,
+    invoiceType,
+  } = req.body;
+
+  try {
+    const userRes = await pool.query("SELECT * FROM users WHERE id=$1", [userId]);
+    if (userRes.rowCount === 0)
+      return res.status(404).json({ success: false, error: "User not found" });
+
+    const existing = userRes.rows[0];
+    let passwordHash = existing.password_hash;
+    if (password && password.trim().length > 0) {
+      const salt = await bcrypt.genSalt(10);
+      passwordHash = await bcrypt.hash(password, salt);
+    }
+
+    // ✅ Ensure subscriptions table has new columns
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        restaurant_id INTEGER PRIMARY KEY REFERENCES restaurants(id) ON DELETE CASCADE,
+        card_number TEXT,
+        expiry TEXT,
+        cvv TEXT,
+        billing_cycle TEXT DEFAULT 'monthly',
+        efatura BOOLEAN DEFAULT false,
+        invoice_title TEXT,
+        tax_office TEXT,
+        invoice_type TEXT
+      );
+    `);
+
+    // ✅ Update USERS table (phone, name, password, plan)
+    await pool.query(
+      `UPDATE users
+       SET full_name=$1,
+           email=$2,
+           password_hash=$3,
+           business_name=$4,
+           subscription_plan=$5,
+           phone=$6
+       WHERE id=$7`,
+      [
+        fullName || existing.full_name,
+        email || existing.email,
+        passwordHash,
+        businessName || existing.business_name,
+        activePlan || existing.subscription_plan,
+        phone || existing.phone,
+        userId,
+      ]
+    );
+
+    // ✅ Update RESTAURANT table (pos_location, usage_type, billing_cycle, plan)
+    await pool.query(
+      `UPDATE restaurants
+         SET name=$1,
+             billing_cycle=$2,
+             plan=$3,
+             pos_location=$4,
+             usage_type=$5
+       WHERE id=$6`,
+      [
+        businessName || existing.business_name,
+        billingCycle || "monthly",
+        activePlan || existing.subscription_plan,
+        posLocation || null,
+        usageType || null,
+        existing.restaurant_id,
+      ]
+    );
+
+    // ✅ Upsert into SUBSCRIPTIONS table (card + eFatura)
+    await pool.query(
+      `INSERT INTO subscriptions (
+         restaurant_id, card_number, expiry, cvv, billing_cycle,
+         efatura, invoice_title, tax_office, invoice_type
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (restaurant_id)
+       DO UPDATE SET
+         card_number=EXCLUDED.card_number,
+         expiry=EXCLUDED.expiry,
+         cvv=EXCLUDED.cvv,
+         billing_cycle=EXCLUDED.billing_cycle,
+         efatura=EXCLUDED.efatura,
+         invoice_title=EXCLUDED.invoice_title,
+         tax_office=EXCLUDED.tax_office,
+         invoice_type=EXCLUDED.invoice_type`,
+      [
+        existing.restaurant_id,
+        cardNumber || null,
+        expiry || null,
+        cvv || null,
+        billingCycle || "monthly",
+        efatura || false,
+        invoiceTitle || null,
+        taxOffice || null,
+        invoiceType || null,
+      ]
+    );
+
+    const updated = await pool.query(
+      `SELECT u.id, u.full_name, u.email, u.business_name, u.phone,
+              r.name AS restaurant_name, r.billing_cycle, r.plan,
+              r.pos_location, r.usage_type,
+              s.efatura, s.invoice_title, s.tax_office, s.invoice_type
+       FROM users u
+       LEFT JOIN restaurants r ON r.id=u.restaurant_id
+       LEFT JOIN subscriptions s ON s.restaurant_id=r.id
+       WHERE u.id=$1`,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      message: "Profile updated",
+      user: updated.rows[0],
+    });
+  } catch (err) {
+    console.error("PUT /me error:", err);
+    res.status(500).json({ success: false, error: "Internal server error" });
   }
 });
 

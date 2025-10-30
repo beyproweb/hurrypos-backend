@@ -44,80 +44,84 @@ router.post("/export/csv", async (req, res) => {
 
 
 
-// GET /reports/summary - Returns gross sales, net sales, expenses today, and profit
-// reports.js
+// ✅ FIXED: Tenant-safe and consistent /reports/summary
 router.get("/summary", async (req, res) => {
   try {
     const client = await pool.connect();
-
     const { from, to } = req.query;
     const today = new Date().toISOString().slice(0, 10);
-
-    // default range = today
     const startDate = from || today;
-    const endDate   = to   || today;
+    const endDate = to || today;
+    const restaurantId = req.user.restaurant_id;
 
-    // Daily sales (range-aware)
+    // 🔹 1️⃣ Daily Sales (receipt_methods)
     const dailySalesRes = await client.query(`
-      SELECT COALESCE(SUM(amount), 0) AS daily_sales
-      FROM receipt_methods
-      WHERE created_at >= $1::date
-        AND created_at < ($2::date + INTERVAL '1 day')
-    `, [startDate, endDate]);
+      SELECT COALESCE(SUM(rm.amount), 0) AS daily_sales
+      FROM receipt_methods rm
+      JOIN orders o ON rm.receipt_id = o.receipt_id
+      WHERE o.restaurant_id = $1
+        AND rm.created_at >= $2::date
+        AND rm.created_at < ($3::date + INTERVAL '1 day')
+    `, [restaurantId, startDate, endDate]);
     const dailySales = parseFloat(dailySalesRes.rows[0].daily_sales);
 
-    // Gross & Net sales within range
+    // 🔹 2️⃣ Gross Sales (orders)
     const grossSalesRes = await client.query(`
       SELECT COALESCE(SUM(total), 0) AS gross_sales
       FROM orders
-      WHERE is_paid = true
-        AND created_at >= $1::date
-        AND created_at < ($2::date + INTERVAL '1 day')
-    `, [startDate, endDate]);
+      WHERE restaurant_id = $1
+        AND is_paid = true
+        AND created_at >= $2::date
+        AND created_at < ($3::date + INTERVAL '1 day')
+    `, [restaurantId, startDate, endDate]);
     const grossSales = parseFloat(grossSalesRes.rows[0].gross_sales);
 
-   const netSalesRes = await client.query(`
-  SELECT COALESCE(SUM(o.total - p.discount_value), 0) AS net_sales
-  FROM orders o
-  JOIN order_items oi ON o.id = oi.order_id
-  JOIN products p ON oi.product_id = p.id
-  WHERE o.restaurant_id = $1
-    AND o.status IN ('paid', 'closed')
-    AND o.created_at >= $2::date
-    AND o.created_at < ($3::date + INTERVAL '1 day')
-`, [req.user.restaurant_id, startDate, endDate]);
-
+    // 🔹 3️⃣ Net Sales (after discount)
+    const netSalesRes = await client.query(`
+      SELECT COALESCE(SUM(o.total - p.discount_value), 0) AS net_sales
+      FROM orders o
+      JOIN order_items oi ON o.id = oi.order_id
+      JOIN products p ON oi.product_id = p.id
+      WHERE o.restaurant_id = $1
+        AND o.status IN ('paid', 'closed')
+        AND o.created_at >= $2::date
+        AND o.created_at < ($3::date + INTERVAL '1 day')
+    `, [restaurantId, startDate, endDate]);
     const netSales = parseFloat(netSalesRes.rows[0].net_sales);
 
-    // Expenses
+    // 🔹 4️⃣ Expenses (supplier + staff)
     const [supplierRes, staffRes] = await Promise.all([
       client.query(`
         SELECT COALESCE(SUM(amount_paid), 0) AS total
         FROM transactions
-        WHERE ingredient = 'Payment'
-          AND delivery_date >= $1::date
-          AND delivery_date < ($2::date + INTERVAL '1 day')
-      `, [startDate, endDate]),
+        WHERE restaurant_id = $1
+          AND ingredient = 'Payment'
+          AND delivery_date >= $2::date
+          AND delivery_date < ($3::date + INTERVAL '1 day')
+      `, [restaurantId, startDate, endDate]),
       client.query(`
         SELECT COALESCE(SUM(amount), 0) AS total
         FROM staff_payments
-        WHERE created_at >= $1::date
-          AND created_at < ($2::date + INTERVAL '1 day')
-      `, [startDate, endDate])
+        WHERE restaurant_id = $1
+          AND created_at >= $2::date
+          AND created_at < ($3::date + INTERVAL '1 day')
+      `, [restaurantId, startDate, endDate])
     ]);
     const expensesToday =
       parseFloat(supplierRes.rows[0].total) + parseFloat(staffRes.rows[0].total);
 
+    // 🔹 5️⃣ Profit
     const profit = netSales - expensesToday;
 
-    // Average Order Value (range-aware)
+    // 🔹 6️⃣ Average Order Value
     const avgRes = await client.query(`
       SELECT COUNT(*) AS order_count, COALESCE(SUM(total), 0) AS total_sum
       FROM orders
-      WHERE status IN ('paid', 'closed')
-        AND created_at >= $1::date
-        AND created_at < ($2::date + INTERVAL '1 day')
-    `, [startDate, endDate]);
+      WHERE restaurant_id = $1
+        AND status IN ('paid', 'closed')
+        AND created_at >= $2::date
+        AND created_at < ($3::date + INTERVAL '1 day')
+    `, [restaurantId, startDate, endDate]);
 
     const orderCount = parseInt(avgRes.rows[0].order_count, 10);
     const totalSum = parseFloat(avgRes.rows[0].total_sum);
@@ -138,6 +142,7 @@ router.get("/summary", async (req, res) => {
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
+
 
 
 

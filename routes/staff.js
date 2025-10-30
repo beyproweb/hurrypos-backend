@@ -1338,15 +1338,12 @@ router.post('/login', async (req, res) => {
       }
 
       // 🧾 Sign JWT
-      const token = jwt.sign(
-        {
-          id: user.id,
-          role: user.role,
-          restaurant_id: user.restaurant_id,
-        },
-        process.env.JWT_SECRET || "beyprosecret",
-        { expiresIn: "7d" }
-      );
+     const token = jwt.sign(
+  { id: user.id, role: user.role, restaurant_id: user.restaurant_id },
+  process.env.JWT_SECRET || "beypro_secret_2025",
+  { expiresIn: "7d" }
+);
+
 
       return res.json({
         success: true,
@@ -1389,15 +1386,12 @@ router.post('/login', async (req, res) => {
       }
 
       // 🧾 Sign JWT
-      const token = jwt.sign(
-        {
-          id: staff.id,
-          role: staff.role,
-          restaurant_id: staff.restaurant_id,
-        },
-        process.env.JWT_SECRET || "beyprosecret",
-        { expiresIn: "7d" }
-      );
+ const token = jwt.sign(
+  { id: staff.id, role: staff.role, restaurant_id: staff.restaurant_id },
+  process.env.JWT_SECRET || "beypro_secret_2025",
+  { expiresIn: "7d" }
+);
+
 
       return res.json({
         success: true,

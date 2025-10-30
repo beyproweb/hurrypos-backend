@@ -1,14 +1,28 @@
-  module.exports = function(io) {
-  const express = require('express');
+module.exports = function(io) {
+  const express = require("express");
   const router = express.Router();
+
   const { pool } = require("../db");
   const { getIO } = require("../utils/socket");
   const { v4: uuidv4 } = require("uuid");
-  // --- DEBUG INSTRUMENTATION (ADD THIS BLOCK) ---
-const { performance } = require("perf_hooks");
-const dlog = (...args) =>
-  console.log(new Date().toISOString(), "[orders]", ...args);
-const authMiddleware = require("../middleware/authMiddleware");
+  const { performance } = require("perf_hooks");
+  const dlog = (...args) =>
+    console.log(new Date().toISOString(), "[orders]", ...args);
+  const authMiddleware = require("../middleware/authMiddleware");
+
+  const PUBLIC_GET_PATTERNS = [/^\/$/, /^\/\d+$/, /^\/\d+\/items$/];
+  router.use((req, res, next) => {
+    if (req.method === "GET") {
+      const identifier = typeof req.query.identifier === "string"
+        ? req.query.identifier.trim()
+        : String(req.query.identifier || "").trim();
+      if (identifier && PUBLIC_GET_PATTERNS.some((re) => re.test(req.path))) {
+        return next();
+      }
+    }
+    return authMiddleware(req, res, next);
+  });
+
 
 async function resolveRestaurantId(req) {
   const identifier = req.query.identifier;
@@ -34,8 +48,6 @@ async function requireRestaurantId(req, res) {
   }
   return restaurantId;
 }
-
-router.use(authMiddleware);
 
 // Track the last write/update time per order id to spot read-after-write timing
 const ORDER_TOUCH = new Map(); // id:number -> { when:number(ms), source:string }
@@ -184,7 +196,6 @@ router.get("/", async (req, res) => {
 
 
 
-
 // POST /orders - Create new order (table or phone), status 'occupied'
 router.post("/", async (req, res) => {
   console.log("💬 /orders payload:", req.body);
@@ -257,6 +268,14 @@ const orderInsertQuery = hasCreatedByColumn
     RETURNING *
   `;
 
+const staffCreator = hasCreatedByColumn && req.user?.id
+  ? await pool.query(
+      `SELECT id FROM staff WHERE restaurant_id = $1 AND id = $2 LIMIT 1`,
+      [restaurantId, req.user.id]
+    )
+  : { rowCount: 0 };
+const createdBy = staffCreator.rowCount ? req.user.id : null;
+
 const orderInsertParams = hasCreatedByColumn
   ? [
       restaurantId,
@@ -268,7 +287,7 @@ const orderInsertParams = hasCreatedByColumn
       customer_phone || null,
       customer_address || null,
       payment_method || null,
-      req.user?.id || null,
+      createdBy,
     ]
   : [
       restaurantId,
@@ -512,11 +531,9 @@ res.json({
 
 
 
-// ✅ PUT /orders/:id/status
-// ✅ PUT /orders/:id/status (schema-safe)
 router.put("/:id/status", async (req, res) => {
   const { id } = req.params;
-  const { status, total, payment_method } = req.body;
+  const { status, total, payment_method, payment_status } = req.body; // ✅ added payment_status
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
   const client = await pool.connect();
@@ -527,17 +544,18 @@ router.put("/:id/status", async (req, res) => {
     const result = await client.query(
       `UPDATE orders
        SET
-         status = $1,
+         status = COALESCE($1, status),
          total = COALESCE($2, total),
          payment_method = COALESCE($3, payment_method),
+         payment_status = COALESCE($4, payment_status),       -- ✅ added this
          is_paid = CASE
-                     WHEN $1 = 'paid' THEN true
+                     WHEN $1 = 'paid' OR $4 = 'paid' THEN true  -- ✅ support both status or payment_status
                      WHEN $1 IN ('confirmed', 'occupied') THEN false
                      ELSE is_paid
                    END
-       WHERE id = $4 AND restaurant_id = $5
+       WHERE id = $5 AND restaurant_id = $6
        RETURNING *`,
-      [status, total, payment_method, id, restaurantId]
+      [status, total, payment_method, payment_status, id, restaurantId]
     );
 
     if (result.rowCount === 0) {
@@ -545,12 +563,10 @@ router.put("/:id/status", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
-   await client.query("COMMIT");
+    await client.query("COMMIT");
 
-// 🔒 Tenant-safe emit only to this restaurant
-io.to(`restaurant_${restaurantId}`).emit("orders_updated");
-res.json(result.rows[0]);
-
+    io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+    res.json(result.rows[0]);
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Failed to update order status:", err);
@@ -559,6 +575,7 @@ res.json(result.rows[0]);
     client.release();
   }
 });
+
 
 
 // GET /api/driver-report?driver_id=1&date=YYYY-MM-DD
@@ -1057,9 +1074,9 @@ async function updateStockForOrder(orderItems, restaurantId) {
       const res = await pool.query(
         `UPDATE stock
          SET quantity = quantity - $1
-         WHERE restaurant_id = $2 AND LOWER(name) = LOWER($3) AND LOWER(unit) = LOWER($4)
+         WHERE restaurant_id = $2 AND LOWER(name) = LOWER($3)
          RETURNING *`,
-        [amountPerUnit, restaurantId, ing.ingredient || ing.name, ingUnit]
+        [amountPerUnit, restaurantId, ing.ingredient || ing.name]
       );
 
       if (res.rowCount > 0) {
@@ -1147,13 +1164,14 @@ async function updateStockForOrder(orderItems, restaurantId) {
 
       console.log(`🔻 Deducting Extra: ${extraName} -${usedQty} ${extraUnit}`);
 
-      const res = await pool.query(
-        `UPDATE stock
-         SET quantity = quantity - $1
-         WHERE restaurant_id = $2 AND LOWER(name) = LOWER($3) AND LOWER(unit) = LOWER($4)
-         RETURNING *`,
-        [usedQty, restaurantId, extraName, extraUnit]
-      );
+     const res = await pool.query(
+  `UPDATE stock
+   SET quantity = quantity - $1
+   WHERE restaurant_id = $2 AND LOWER(name) = LOWER($3)
+   RETURNING *`,
+  [usedQty, restaurantId, extraName]   // ✅ only 3 params now
+);
+
 
       if (res.rowCount > 0) {
         const updatedStock = res.rows[0];
@@ -1183,6 +1201,48 @@ async function updateStockForOrder(orderItems, restaurantId) {
 
 
 
+ // ✅ Public route for QR Menu order view
+// ✅ Safe for both authenticated POS users AND public QR menu views
+router.get("/:id", async (req, res) => {
+  const { id } = req.params;
+  const identifier = req.query.identifier;
+  let restaurant_id = req.user?.restaurant_id || null;
+
+  try {
+    // Allow public QR menu with ?identifier=
+    if (!restaurant_id && identifier) {
+      if (/^\d+$/.test(identifier)) {
+        restaurant_id = Number(identifier);
+      } else {
+        const r = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [identifier]);
+        restaurant_id = r.rows[0]?.id || null;
+      }
+    }
+
+    if (!restaurant_id) {
+      return res.status(400).json({ error: "Missing restaurant ID" });
+    }
+
+    const order = await pool.query(
+      `
+      SELECT *
+      FROM orders
+      WHERE id = $1 AND restaurant_id = $2
+      LIMIT 1
+      `,
+      [id, restaurant_id]
+    );
+
+    if (order.rows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    res.json(order.rows[0]);
+  } catch (err) {
+    console.error("❌ Error fetching order by id:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 
 // GET order items by order ID
@@ -2113,7 +2173,6 @@ router.get("/:raw", async (req, res) => {
     return res.status(500).json({ error: "Failed to fetch order" });
   }
 });
-
 
 return router;
 };

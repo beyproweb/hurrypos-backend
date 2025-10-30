@@ -1,8 +1,6 @@
 const express = require("express");
 const router = express.Router();
-// routes/products.js
-const { pool } = require("../db");   // ✅ destructure pool
-
+const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 
 async function resolveRestaurantId(req) {
@@ -26,8 +24,62 @@ async function resolveRestaurantId(req) {
 const log = (path, method, data) =>
   console.log(`🧾 ${method} ${path}`, data ? JSON.stringify(data) : "");
 
+async function ensureCategoriesTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS categories (
+      id SERIAL PRIMARY KEY,
+      restaurant_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (restaurant_id, name)
+    );
+  `);
+}
+
+router.use((req, res, next) => {
+  if (req.method === "GET" && req.query.identifier) {
+    return next();
+  }
+  return authMiddleware(req, res, () => {
+    if (!req.user || !req.user.restaurant_id) {
+      return res.status(401).json({
+        status: "error",
+        message: "Unauthorized: tenant not identified",
+      });
+    }
+    next();
+  });
+});
+
+// ✅ Get all products for current restaurant
+
 router.get("/", async (req, res) => {
   try {
+    const identifier = (req.query.identifier || "").toString().trim();
+
+    // ✅ Public path for QR menu requests (identifier present)
+    if (identifier) {
+      let restaurantId;
+      if (/^\d+$/.test(identifier)) {
+        restaurantId = Number(identifier);
+      } else {
+        const { rows } = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [identifier]);
+        restaurantId = rows[0]?.id;
+      }
+      if (!restaurantId) return res.status(400).json({ error: "Invalid restaurant" });
+
+      const { rows } = await pool.query(
+        `SELECT *
+           FROM products
+          WHERE restaurant_id = $1
+            AND visible = true
+          ORDER BY id ASC`,
+        [restaurantId]
+      );
+      return res.json(rows);
+    }
+
+    // ✅ Authenticated dashboard path (no identifier → rely on JWT)
     const restaurantId = await resolveRestaurantId(req);
     if (!restaurantId) {
       return res.status(400).json({ error: "Invalid restaurant" });
@@ -41,9 +93,9 @@ router.get("/", async (req, res) => {
              discount_type, discount_value, visible, tags, allergens,
              promo_start, promo_end, image, image_url, ingredients, extras,
              selected_extras_group, created_at
-      FROM products
-      WHERE restaurant_id = $1
-      ORDER BY id DESC
+        FROM products
+       WHERE restaurant_id = $1
+       ORDER BY id DESC
       `,
       [restaurantId]
     );
@@ -53,19 +105,6 @@ router.get("/", async (req, res) => {
     console.error("❌ Fetch products error:", err);
     res.status(500).json({ status: "error", message: "Failed to fetch products" });
   }
-});
-
-router.use(authMiddleware);
-// Tenant guard middleware
-router.use((req, res, next) => {
-  if (req.query?.identifier) return next();
-  if (!req.user || !req.user.restaurant_id) {
-    return res.status(401).json({
-      status: "error",
-      message: "Unauthorized: tenant not identified",
-    });
-  }
-  next();
 });
 
 // ----------------- PRODUCTS -----------------
@@ -518,6 +557,68 @@ router.delete("/extras-group/:id", async (req, res) => {
 });
 
 
+// ✅ Get categories
+router.get("/categories", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  if (!restaurantId) {
+    return res
+      .status(400)
+      .json({ status: "error", message: "Invalid restaurant" });
+  }
+
+  try {
+    await ensureCategoriesTable();
+    const restaurantIdAsText = restaurantId.toString();
+    const { rows } = await pool.query(
+      `
+      SELECT name
+      FROM (
+        SELECT DISTINCT category AS name
+        FROM products
+        WHERE restaurant_id::text = $1
+          AND category IS NOT NULL
+          AND TRIM(category) <> ''
+        UNION
+        SELECT DISTINCT name
+        FROM categories
+        WHERE restaurant_id = $1
+      ) AS combined
+      ORDER BY name
+      `,
+      [restaurantIdAsText]
+    );
+    res.json(rows.map((r) => r.name));
+  } catch (err) {
+    console.error("❌ Fetch categories error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch categories" });
+  }
+});
+
+// ✅ Add category
+router.post("/categories", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { category } = req.body;
+  if (!category || !category.trim())
+    return res.status(400).json({ status: "error", message: "Category required" });
+
+  try {
+    await ensureCategoriesTable();
+    const normalizedCategory = category.trim();
+    await pool.query(
+      `
+      INSERT INTO categories (restaurant_id,name)
+      VALUES ($1,$2)
+      ON CONFLICT (restaurant_id,name) DO NOTHING
+      `,
+      [restaurantId.toString(), normalizedCategory]
+    );
+    res.json({ status: "success", message: `Category "${normalizedCategory}" added` });
+  } catch (err) {
+    console.error("❌ Add category error:", err);
+    res.status(500).json({ status: "error", message: "Failed to add category" });
+  }
+});
+
 router.get("/:id", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   const { id } = req.params;
@@ -541,51 +642,5 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-// ✅ Fetch all products (tenant-safe)
-
-// ----------------- CATEGORIES -----------------
-
-// ✅ Get categories
-router.get("/categories", async (req, res) => {
-  const restaurantId = req.user.restaurant_id;
-  try {
-    const result = await pool.query(
-      `
-      SELECT DISTINCT category
-      FROM products
-      WHERE restaurant_id=$1 AND category IS NOT NULL AND TRIM(category)<>''
-      ORDER BY category
-      `,
-      [restaurantId]
-    );
-    res.json(result.rows.map((r) => r.category));
-  } catch (err) {
-    console.error("❌ Fetch categories error:", err);
-    res.status(500).json({ status: "error", message: "Failed to fetch categories" });
-  }
-});
-
-// ✅ Add category
-router.post("/categories", async (req, res) => {
-  const restaurantId = req.user.restaurant_id;
-  const { category } = req.body;
-  if (!category || !category.trim())
-    return res.status(400).json({ status: "error", message: "Category required" });
-
-  try {
-    await pool.query(
-      `
-      INSERT INTO categories (restaurant_id,name)
-      VALUES ($1,$2)
-      ON CONFLICT (restaurant_id,name) DO NOTHING
-      `,
-      [restaurantId, category.trim()]
-    );
-    res.json({ status: "success", message: `Category "${category}" added` });
-  } catch (err) {
-    console.error("❌ Add category error:", err);
-    res.status(500).json({ status: "error", message: "Failed to add category" });
-  }
-});
-
+// ✅ Protected routes below
 module.exports = router;

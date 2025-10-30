@@ -1,12 +1,14 @@
 // server/routes/campaigns.js
+
 const express = require("express");
 const router = express.Router();
-
-/* =========================================================
+const authMiddleware = require("../middleware/authMiddleware");
+const { sendCloudMessage } = require("../utils/whatsappCloud");/* =========================================================
    In-memory fallbacks so the UI still works if DB writes fail
    ========================================================= */
 const recentEvents = new Map();        // Map<cid, {sent:Set, opens:Set, clicks:Set, last:Date}>
 const recentCampaignMeta = new Map();  // Map<cid, {subject, message, sent_at:Date}>
+router.use(authMiddleware);
 
 function rememberCampaignMeta(cid, subject, message, sentAt = new Date()) {
   if (!cid) return;
@@ -67,6 +69,7 @@ async function ensureTables() {
   try {
     await qStrict(`CREATE TABLE IF NOT EXISTS campaigns (
       id BIGSERIAL PRIMARY KEY,
+      restaurant_id BIGINT REFERENCES restaurants(id) ON DELETE CASCADE,
       name TEXT,
       subject TEXT,
       html TEXT,
@@ -74,6 +77,17 @@ async function ensureTables() {
       sent_count INTEGER DEFAULT 0,
       sent_at TIMESTAMP NULL
     )`);
+
+    // 🔄 Legacy compatibility: add tenant column/index if old schema was missing it
+    await qStrict(
+      `ALTER TABLE campaigns
+         ADD COLUMN IF NOT EXISTS restaurant_id BIGINT`
+    );
+    await qStrict(
+      `CREATE INDEX IF NOT EXISTS idx_campaigns_restaurant_id
+         ON campaigns(restaurant_id)`
+    );
+
     await qStrict(`CREATE TABLE IF NOT EXISTS campaign_events (
       id BIGSERIAL PRIMARY KEY,
       campaign_id TEXT,
@@ -82,10 +96,12 @@ async function ensureTables() {
       event_time TIMESTAMP DEFAULT NOW()
     )`);
     return true;
-  } catch {
+  } catch (err) {
+    console.error("❌ ensureTables failed:", err);
     return false;
   }
 }
+
 
 /* =========================================================
    Soft deps + config
@@ -145,6 +161,133 @@ function autoLink(text) {
     .replace(/\r?\n/g, "<br/>")}</p>`;
 }
 
+function styleContentBlocks(html = "") {
+  return String(html || "")
+    .replace(/<p>/gi, '<p style="margin:0 0 16px;">')
+    .replace(
+      /<ul>/gi,
+      '<ul style="margin:0 0 16px;padding-left:20px;">'
+    )
+    .replace(
+      /<ol>/gi,
+      '<ol style="margin:0 0 16px;padding-left:20px;">'
+    )
+    .replace(/<li>/gi, '<li style="margin:0 0 8px;">');
+}
+
+function buildEmailTemplate({
+  subject,
+  contentHtml,
+  primaryUrl,
+  brandName,
+  ctaText,
+} = {}) {
+  const safeBrand = escapeHtml(
+    truthyStr(brandName) || "Beypro Marketing"
+  );
+  const safeSubject = escapeHtml(truthyStr(subject) || "Campaign Update");
+  const styled = styleContentBlocks(contentHtml || "");
+  const safeCta = escapeHtml(truthyStr(ctaText) || "View Offer");
+  const qualifiedUrl =
+    truthyStr(primaryUrl) && /^https?:\/\//i.test(primaryUrl)
+      ? primaryUrl.trim()
+      : "";
+  const button =
+    qualifiedUrl
+      ? `
+      <tr>
+        <td align="center" style="padding:0 30px 40px;">
+          <a href="${escapeHtml(qualifiedUrl)}"
+             style="display:inline-block;padding:14px 26px;border-radius:999px;background:#ef4444;color:#ffffff;font-weight:600;text-decoration:none;font-family: 'Inter', Arial, sans-serif;">
+            ${safeCta}
+          </a>
+        </td>
+      </tr>`
+      : "";
+
+  const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>${safeSubject}</title>
+</head>
+<body style="margin:0;background-color:#f8fafc;font-family:'Inter',Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;padding:32px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#ffffff;border-radius:24px;box-shadow:0 20px 60px rgba(15,23,42,0.08);overflow:hidden;">
+          <tr>
+            <td style="background:linear-gradient(135deg,#f97316,#ef4444);padding:40px 32px;color:#ffffff;">
+              <div style="font-size:14px;letter-spacing:0.1em;text-transform:uppercase;opacity:0.9;margin-bottom:8px;">${safeBrand}</div>
+              <div style="font-size:28px;font-weight:800;line-height:1.2;">${safeSubject}</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px 32px 10px;color:#111827;font-size:16px;line-height:1.65;">
+              <div>${styled}</div>
+            </td>
+          </tr>
+          ${button}
+          <tr>
+            <td style="padding:0 32px 34px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f1f5f9;border-radius:18px;padding:18px 22px;">
+                <tr>
+                  <td style="font-size:13px;color:#475569;line-height:1.6;">
+                    You're receiving this update because you’re part of our ${safeBrand} community.
+                    <br/>We love helping you drive repeat visits and stronger loyalty.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:0 20px 28px;font-size:12px;color:#94a3b8;">
+              © ${new Date().getUTCFullYear()} ${safeBrand}. All rights reserved.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+
+  let plain = stripHtml(contentHtml || "");
+  if (qualifiedUrl) {
+    plain = `${plain ? `${plain}\n\n` : ""}CTA: ${qualifiedUrl}`;
+  }
+
+  return { html, text: plain.trim() };
+}
+
+function buildWhatsAppTemplate({ subject, message, primaryUrl, brandName } = {}) {
+  const lines = [];
+  if (truthyStr(subject)) lines.push(`*${subject.trim()}*`);
+  if (truthyStr(brandName)) lines.push(`${brandName.trim()} presents:`);
+
+  const body = String(message || "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  if (body) {
+    body.split(/\n{2,}/).forEach((paragraph) => {
+      const clean = paragraph.replace(/\n+/g, " ").trim();
+      if (clean) lines.push(clean);
+    });
+  }
+
+  if (truthyStr(primaryUrl) && /^https?:\/\//i.test(primaryUrl)) {
+    lines.push(`👉 ${primaryUrl.trim()}`);
+  }
+
+  if (truthyStr(brandName)) {
+    lines.push("");
+    lines.push(`— ${brandName.trim()}`);
+  }
+
+  return lines.filter(Boolean).join("\n");
+}
+
 function buildCtaBlock(url, text = "Open") {
   return `
   <div style="text-align:center;margin:24px 0">
@@ -172,6 +315,29 @@ function truthyStr(s) {
   return typeof s === "string" && s.trim().length > 0 ? s.trim() : "";
 }
 
+function normalizeRestaurantId(value) {
+  if (value === undefined || value === null) {
+    return { num: null, text: null };
+  }
+  const num = Number(value);
+  if (Number.isFinite(num)) {
+    return { num, text: String(num) };
+  }
+  const text = String(value).trim();
+  return { num: null, text: text || null };
+}
+
+function buildRestaurantCondition(column, paramIndex, restaurantIdValue) {
+  const { num, text } = normalizeRestaurantId(restaurantIdValue);
+  if (num !== null) {
+    return { clause: `${column} = $${paramIndex}`, param: num };
+  }
+  if (text) {
+    return { clause: `CAST(${column} AS TEXT) = $${paramIndex}`, param: text };
+  }
+  return null;
+}
+
 /* =========================================================
    Transporter (never crashes; JSON transport fallback)
    ========================================================= */
@@ -184,23 +350,63 @@ function buildTransporter() {
     SMTP_PASS,
     SMTP_SECURE = "false",
     SMTP_STRATEGY,
+    SMTP_SERVICE,
+    SMTP_URL,
   } = process.env;
 
+  const strategy = String(SMTP_STRATEGY || "").toLowerCase();
+
   // Explicit debug mode
-  if (String(SMTP_STRATEGY || "").toLowerCase() === "json") {
+  if (strategy === "json") {
+    console.warn("📬 Email campaigns using jsonTransport (SMTP_STRATEGY=json)");
     return nodemailer.createTransport({ jsonTransport: true });
   }
 
-  // If SMTP creds are missing, fallback to JSON transport so you can test end-to-end without 500
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+  const url = truthyStr(SMTP_URL);
+  const user = truthyStr(SMTP_USER);
+  const pass = truthyStr(SMTP_PASS);
+
+  if (url) {
+    console.log("📬 Email campaigns using SMTP_URL transport");
+    return nodemailer.createTransport(url);
+  }
+
+  if (truthyStr(SMTP_SERVICE) && user && pass) {
+    console.log(`📬 Email campaigns using nodemailer service=${truthyStr(SMTP_SERVICE)}`);
+    return nodemailer.createTransport({
+      service: truthyStr(SMTP_SERVICE),
+      auth: { user, pass },
+    });
+  }
+
+  let host = truthyStr(SMTP_HOST);
+  let port = Number(SMTP_PORT) || 587;
+  let secure = String(SMTP_SECURE || "").toLowerCase() === "true";
+
+  if (!host && user) {
+    if (/gmail\.com$/i.test(user)) {
+      host = "smtp.gmail.com";
+      if (!SMTP_PORT) port = 465;
+      secure = true;
+    } else if (/@(outlook|hotmail|live)\./i.test(user)) {
+      host = "smtp-mail.outlook.com";
+      if (!SMTP_PORT) port = 587;
+      if (SMTP_SECURE === undefined) secure = false;
+    }
+  }
+
+  if (!host || !user || !pass) {
+    console.warn(
+      "⚠️ Email campaigns falling back to jsonTransport because SMTP_HOST/USER/PASS are not fully configured."
+    );
     return nodemailer.createTransport({ jsonTransport: true });
   }
 
   return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT),
-    secure: String(SMTP_SECURE).toLowerCase() === "true",
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
+    host,
+    port,
+    secure,
+    auth: { user, pass },
   });
 }
 
@@ -254,19 +460,95 @@ function rewritePerRecipient(html, origin, cid, email) {
 /* =========================================================
    Recipients from DB (various schemas)
    ========================================================= */
-async function fetchAllRecipientEmails() {
-  const candidates = [
-    "SELECT DISTINCT email AS e FROM customers WHERE email IS NOT NULL AND email <> ''",
-    "SELECT DISTINCT email_address AS e FROM customers WHERE email_address IS NOT NULL AND email_address <> ''",
-    "SELECT DISTINCT mail AS e FROM customers WHERE mail IS NOT NULL AND mail <> ''",
+async function fetchAllRecipientEmails(restaurantId) {
+  const condition = buildRestaurantCondition("restaurant_id", 1, restaurantId);
+  if (!condition) return [];
+
+  const seen = new Map(); // Map<lowercase, original casing>
+  const addRows = (rows = []) => {
+    for (const row of rows) {
+      const raw = row?.e;
+      if (!raw) continue;
+      const trimmed = String(raw).trim();
+      if (
+        !trimmed ||
+        !trimmed.includes("@") ||
+        /^null$/i.test(trimmed) ||
+        /^undefined$/i.test(trimmed)
+      ) {
+        continue;
+      }
+      const key = trimmed.toLowerCase();
+      if (!seen.has(key)) {
+        seen.set(key, trimmed);
+      }
+    }
+  };
+
+  const columns = [
+    "email",
+    "email_address",
+    "mail",
+    "customer_email",
+    "contact_email",
   ];
-  for (const sql of candidates) {
-    try {
-      const r = await q(sql);
-      if (r?.rows?.length) return r.rows.map((x) => String(x.e).trim());
-    } catch {}
+
+  async function queryCustomers(includeRestaurantFilter) {
+    for (const column of columns) {
+      const sql = includeRestaurantFilter
+        ? `
+          SELECT DISTINCT ${column} AS e
+          FROM customers
+          WHERE ${condition.clause}
+            AND ${column} IS NOT NULL
+            AND ${column} <> ''
+        `
+        : `
+          SELECT DISTINCT ${column} AS e
+          FROM customers
+          WHERE ${column} IS NOT NULL
+            AND ${column} <> ''
+        `;
+      try {
+        const res = includeRestaurantFilter
+          ? await q(sql, [condition.param])
+          : await q(sql);
+        if (res?.rows?.length) addRows(res.rows);
+      } catch {
+        // Column may not exist on every install — skip silently
+      }
+    }
   }
-  return [];
+
+  if (condition) {
+    await queryCustomers(true);
+  }
+  if (seen.size === 0) {
+    await queryCustomers(false);
+  }
+
+  if (seen.size === 0) {
+    // Legacy fallback: some installs only store emails on orders table
+    try {
+      const params = [];
+      let sql = `
+        SELECT DISTINCT customer_email AS e
+        FROM orders
+        WHERE customer_email IS NOT NULL
+          AND customer_email <> ''
+      `;
+      if (condition) {
+        sql += ` AND ${condition.clause.replace("$1", `$${params.length + 1}`)}`;
+        params.push(condition.param);
+      }
+      const res = await q(sql, params);
+      if (res?.rows?.length) addRows(res.rows);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return Array.from(seen.values());
 }
 
 /* =========================================================
@@ -276,8 +558,21 @@ async function fetchAllRecipientEmails() {
    - tracking pixel + per-recipient click rewrites
    - in-memory meta saved so subject/message show immediately
    ========================================================= */
+// =========================================================
+// POST /api/campaigns/email  (tenant-safe)
+// =========================================================
 router.post("/email", async (req, res) => {
   try {
+    const restaurantIdRaw = req.user?.restaurant_id;
+    if (restaurantIdRaw === undefined || restaurantIdRaw === null) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+    const { num: restaurantIdNum, text: restaurantIdStr } = normalizeRestaurantId(restaurantIdRaw);
+    if (!restaurantIdStr) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+    const restaurantIdParam = restaurantIdNum ?? restaurantIdStr;
+
     let {
       subject,
       body,
@@ -296,79 +591,117 @@ router.post("/email", async (req, res) => {
       return res.status(400).json({ ok: false, error: "subject is required" });
     }
 
-    // Build HTML from body if needed
-    if (!html && body) {
+    const brandName =
+      truthyStr(req.user?.restaurant_name) ||
+      truthyStr(req.user?.name) ||
+      "";
+    const primaryUrl =
+      truthyStr(primary_url) && /^https?:\/\//i.test(primary_url)
+        ? primary_url.trim()
+        : "";
+
+    let contentHtml = "";
+    let hasFullDocument = false;
+
+    if (typeof html === "string" && html.trim()) {
+      const trimmed = html.trim();
+      if (/<!doctype/i.test(trimmed) || /<html[\s>]/i.test(trimmed)) {
+        hasFullDocument = true;
+      }
+      contentHtml = trimmed;
+    }
+
+    if (!contentHtml && body) {
       const looksHtml = body_is_html === true || isProbablyHtml(body);
       if (looksHtml) {
-        html = /^<!doctype|^<html/i.test(String(body).trim())
-          ? body
-          : wrapDoc(body);
-        text = text || stripHtml(html);
+        const trimmedBody = String(body).trim();
+        if (/<!doctype/i.test(trimmedBody) || /<html[\s>]/i.test(trimmedBody)) {
+          hasFullDocument = true;
+        }
+        contentHtml = trimmedBody;
+        text = text || stripHtml(trimmedBody);
       } else {
-        const inner = autoLink(body);
-        html = wrapDoc(inner);
+        contentHtml = autoLink(body);
         text = text || body;
       }
     }
-    if (!html) {
+
+    if (!contentHtml) {
       return res
         .status(400)
         .json({ ok: false, error: "html or body is required" });
     }
 
-    // Guaranteed CTA when primary_url is provided
-    if (primary_url && /^https?:\/\//i.test(primary_url)) {
-      html = appendBeforeBodyEnd(
-        html,
-        buildCtaBlock(primary_url, cta_text || "Open")
-      );
+    let finalHtml = contentHtml;
+    let plainMessage = truthyStr(text) ? String(text) : stripHtml(contentHtml);
+    let usedTemplate = false;
+
+    if (!hasFullDocument) {
+      const templated = buildEmailTemplate({
+        subject,
+        contentHtml,
+        primaryUrl,
+        brandName,
+        ctaText: cta_text,
+      });
+      finalHtml = templated.html;
+      plainMessage = templated.text || plainMessage;
+      if (!truthyStr(text)) text = templated.text;
+      usedTemplate = true;
     }
 
-    // Recipients
+    if (!usedTemplate && primaryUrl) {
+      finalHtml = appendBeforeBodyEnd(
+        finalHtml,
+        buildCtaBlock(primaryUrl, cta_text || "Open")
+      );
+      plainMessage = `${plainMessage ? `${plainMessage}\n\n` : ""}CTA: ${primaryUrl}`;
+    }
+
+    html = finalHtml;
+    const finalText = truthyStr(text) ? String(text) : plainMessage;
+    text = finalText;
+
     if (!Array.isArray(recipients) || recipients.length === 0) {
-      recipients = await fetchAllRecipientEmails();
+      recipients = await fetchAllRecipientEmails(restaurantIdParam);
       if (recipients.length === 0) {
-        return res.status(400).json({ ok: false, error: "no recipients" });
+        return res.status(400).json({
+          ok: false,
+          error: "no recipients",
+          message: "No customer email addresses were found. Add emails under Customers to send a campaign.",
+        });
       }
     }
-    // De-dupe
+
     const seen = new Set();
     const rcpts = recipients
       .map((r) => String(r || "").trim())
       .filter((r) => r && !seen.has(r) && (seen.add(r) || true));
 
-    // Transporter
     const transporter = buildTransporter();
     if (!transporter) {
       return res
         .status(400)
         .json({ ok: false, error: "nodemailer not installed (npm i nodemailer)" });
     }
-    try {
-      await transporter.verify();
-    } catch {
-      // ignore (json transport or lenient SMTP)
-    }
+    try { await transporter.verify(); } catch {}
 
-    // Ensure tables (best effort; and report status)
     const tablesOk = await ensureTables();
 
-    // Plain text message for meta
-    const plainMessage = text || stripHtml(html);
-
-    // Insert campaign row (stamp sent_at so it shows in /list immediately)
     let campaignId = Date.now().toString();
     let dbInsertOk = false;
     let insertedSentAt = new Date();
+
     try {
       const ins = await q(
-        `INSERT INTO campaigns (name, subject, html, text, sent_count, sent_at)
-         VALUES ($1,$2,$3,$4,0,NOW()) RETURNING id, sent_at`,
+        `INSERT INTO campaigns (restaurant_id, name, subject, html, text, sent_count, sent_at)
+         VALUES ($1,$2,$3,$4,$5,0,NOW()) RETURNING id, sent_at`,
         [
+          restaurantIdParam,
           name || `Campaign ${new Date().toISOString().slice(0, 10)}`,
           subject,
           html,
-          text || null,
+          finalText || null,
         ]
       );
       if (ins?.rows?.[0]?.id) {
@@ -376,12 +709,12 @@ router.post("/email", async (req, res) => {
         dbInsertOk = true;
         if (ins.rows[0].sent_at) insertedSentAt = ins.rows[0].sent_at;
       }
-    } catch {}
+    } catch (err) {
+      console.error("❌ DB insert failed (campaign):", err);
+    }
 
-    // Save meta immediately for UI fallback
     rememberCampaignMeta(campaignId, subject, plainMessage, insertedSentAt);
 
-    // Send per recipient
     const origin = getSafeOrigin(req);
     const senderEmail =
       fromEmail ||
@@ -390,18 +723,16 @@ router.post("/email", async (req, res) => {
       "no-reply@example.com";
     const from = fromName ? `"${fromName}" <${senderEmail}>` : senderEmail;
 
+    console.log(
+      `📣 Email campaign triggered — restaurant=${restaurantIdStr}, subject="${subject}", recipients=${rcpts.length}`
+    );
+
     let sent = 0;
     const failures = [];
 
     for (const rcpt of rcpts) {
       try {
-        const htmlTracked = rewritePerRecipient(
-          html,
-          origin,
-          campaignId,
-          rcpt
-        );
-
+        const htmlTracked = rewritePerRecipient(html, origin, campaignId, rcpt);
         await transporter.sendMail({
           from,
           to: rcpt,
@@ -409,25 +740,19 @@ router.post("/email", async (req, res) => {
           html: htmlTracked,
           text: text || stripHtml(htmlTracked),
         });
-
-        // DB: log 'sent'
-        try {
-          await q(
-            `INSERT INTO campaign_events (campaign_id, customer_email, event_type)
-             VALUES ($1,$2,'sent')`,
-            [String(campaignId), String(rcpt)]
-          );
-        } catch {}
-
-        // Memory denominator
+        await q(
+          `INSERT INTO campaign_events (campaign_id, customer_email, event_type)
+           VALUES ($1,$2,'sent')`,
+          [String(campaignId), String(rcpt)]
+        );
         rememberEvent(campaignId, "sent", rcpt);
         sent += 1;
       } catch (e) {
         failures.push({ email: rcpt, error: e?.message || String(e) });
+        console.warn(`⚠️ Email send failed for ${rcpt}:`, e?.message || e);
       }
     }
 
-    // Update counters (best effort)
     try {
       if (sent > 0) {
         await q(
@@ -435,7 +760,13 @@ router.post("/email", async (req, res) => {
           [sent, campaignId]
         );
       }
-    } catch {}
+    } catch (err) {
+      console.error("⚠️ Failed to update sent_count:", err);
+    }
+
+    console.log(
+      `📬 Email campaign ${campaignId} finished: sent=${sent}, failed=${failures.length}`
+    );
 
     return res.json({
       ok: true,
@@ -443,9 +774,10 @@ router.post("/email", async (req, res) => {
       sent,
       failed: failures.length,
       failures,
-      db: { tablesOk, dbInsertOk }, // quick signal if DB persisted
+      db: { tablesOk, dbInsertOk },
     });
   } catch (err) {
+    console.error("🔥 Campaign email route error:", err);
     return res.status(400).json({
       ok: false,
       error: "bad_request",
@@ -454,22 +786,27 @@ router.post("/email", async (req, res) => {
   }
 });
 
+
 /* =========================================================
    Stats: last campaign (by sent_at or by any event)
    (merges memory fallback for subject/message)
    ========================================================= */
-router.get("/stats/last", async (_req, res) => {
+router.get("/stats/last", async (req, res) => {
+  const restCondition = buildRestaurantCondition("restaurant_id", 1, req.user?.restaurant_id);
+  if (!restCondition)
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+
   try {
     await ensureTables();
 
-    // newest by sent_at
     let camp = null;
     const r1 = await q(
       `SELECT id::text id, name, subject, html, text, sent_count, sent_at
        FROM campaigns
-       WHERE sent_at IS NOT NULL
+       WHERE sent_at IS NOT NULL AND ${restCondition.clause}
        ORDER BY sent_at DESC
-       LIMIT 1`
+       LIMIT 1`,
+      [restCondition.param]
     );
     if (r1?.rows?.length) camp = r1.rows[0];
 
@@ -589,7 +926,8 @@ router.get("/stats/last", async (_req, res) => {
       clickRate,
       sent_at: camp.sent_at,
     });
-  } catch {
+   } catch (err) {
+    console.error("❌ stats/last error:", err);
     return res.json({
       ok: true,
       subject: "",
@@ -605,6 +943,10 @@ router.get("/stats/last", async (_req, res) => {
    Stats: by exact campaign id (with memory meta fallback)
    ========================================================= */
 router.get("/stats/by/:campaignId", async (req, res) => {
+  const restCondition = buildRestaurantCondition("restaurant_id", 2, req.user?.restaurant_id);
+  if (!restCondition)
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+
   const id = String(req.params.campaignId || "");
   try {
     await ensureTables();
@@ -613,8 +955,10 @@ router.get("/stats/by/:campaignId", async (req, res) => {
   try {
     const r = await q(
       `SELECT id::text AS id, name, subject, html, text, sent_count, sent_at
-       FROM campaigns WHERE id::text=$1 LIMIT 1`,
-      [id]
+       FROM campaigns
+       WHERE id::text=$1 AND ${restCondition.clause}
+       LIMIT 1`,
+      [id, restCondition.param]
     );
     const camp =
       r?.rows?.[0] || {
@@ -697,11 +1041,14 @@ router.get("/stats/by/:campaignId", async (req, res) => {
     });
   }
 });
-
-/* =========================================================
-   Recent list: last 20 (merge DB + memory meta, robust subject/message)
-   ========================================================= */
+// =========================================================
+// GET /api/campaigns/list  — Tenant-safe recent campaigns
+// =========================================================
 router.get("/list", async (req, res) => {
+  const restCondition = buildRestaurantCondition("c.restaurant_id", 1, req.user?.restaurant_id);
+  if (!restCondition)
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+
   try {
     await ensureTables();
   } catch {}
@@ -728,111 +1075,121 @@ router.get("/list", async (req, res) => {
          (SELECT COUNT(DISTINCT ce.customer_email)
             FROM campaign_events ce
             WHERE ce.campaign_id::text = c.id::text AND ce.event_type='click') AS u_click,
-         (SELECT MAX(event_time)
-            FROM campaign_events ce
-            WHERE ce.campaign_id::text = c.id::text) AS last_event
+       (SELECT MAX(event_time)
+           FROM campaign_events ce
+           WHERE ce.campaign_id::text = c.id::text) AS last_event
        FROM campaigns c
+       WHERE ${restCondition.clause}
        ORDER BY
-         COALESCE(c.sent_at, (SELECT MAX(event_time) FROM campaign_events ce WHERE ce.campaign_id::text = c.id::text)) DESC NULLS LAST,
+         COALESCE(c.sent_at,
+           (SELECT MAX(event_time)
+              FROM campaign_events ce
+              WHERE ce.campaign_id::text = c.id::text)) DESC NULLS LAST,
          c.id DESC
-       LIMIT 20`
+       LIMIT 20`,
+      [restCondition.param]
     );
     rows = r?.rows || [];
-  } catch {
-    rows = [];
+  } catch (err) {
+    console.error("⚠️ campaigns/list DB query failed:", err);
   }
 
-  const fromDb = rows.map((c) => {
-    const idStr = String(c.id);
-    const mem = getRecentCounts(idStr);
-    const meta = recentCampaignMeta.get(idStr) || {};
-
-    const sent = Number(c.sent_denom || 0);
-    const opens = Math.max(Number(c.u_open || 0), Number(mem.opens || 0));
-    const clicks = Math.max(Number(c.u_click || 0), Number(mem.clicks || 0));
-    const openRate = sent ? Math.round((opens / sent) * 1000) / 10 : 0;
-    const clickRate = sent ? Math.round((clicks / sent) * 1000) / 10 : 0;
-
-    // Robust subject/message fallbacks (DB → memory → name/html)
-    const subject =
-      truthyStr(c.subject) ||
-      truthyStr(meta.subject) ||
-      truthyStr(c.name) ||
-      "";
-
-    const msgFromDb = truthyStr(c.text) || truthyStr(stripHtml(c.html || ""));
-    const message =
-      msgFromDb ||
-      truthyStr(meta.message) ||
-      "";
-
-    return {
-      id: idStr,
-      subject,
-      message,
-      sent_at: c.sent_at || meta.sent_at || null,
-      sent_count: Number(c.sent_count || 0),
-      openRate,
-      clickRate,
-    };
-  });
-
-  // Merge memory-only campaigns if DB didn’t persist yet (include meta)
-  const known = new Set(fromDb.map((c) => c.id));
-  const memOnly = [];
-  for (const [id, rec] of recentEvents.entries()) {
-    if (!known.has(id)) {
-      const meta = recentCampaignMeta.get(String(id)) || {};
-      const sent = rec.sent.size;
-      const openRate = sent
-        ? Math.round((rec.opens.size / sent) * 1000) / 10
-        : 0;
-      const clickRate = sent
-        ? Math.round((rec.clicks.size / sent) * 1000) / 10
-        : 0;
-      memOnly.push({
-        id: String(id),
-        subject: truthyStr(meta.subject),
-        message: truthyStr(meta.message),
-        sent_at: meta.sent_at || rec.last,
-        sent_count: sent,
-        openRate,
-        clickRate,
-        _memory: true,
-      });
-    }
+  // 🔹 Merge in-memory fallback campaigns
+  const memRows = [];
+  for (const [cid, meta] of recentCampaignMeta.entries()) {
+    const ev = recentEvents.get(cid);
+    if (!ev) continue;
+    memRows.push({
+      id: cid,
+      name: "",
+      subject: meta.subject || "",
+      text: meta.message || "",
+      html: "",
+      sent_count: ev.sent.size,
+      sent_at: meta.sent_at || ev.last,
+      u_open: ev.opens.size,
+      u_click: ev.clicks.size,
+    });
   }
 
-  // Compose result (newest first by date)
-  const campaigns = [...fromDb, ...memOnly].sort(
-    (a, b) => new Date(b.sent_at || 0) - new Date(a.sent_at || 0)
-  );
+  // 🔹 Combine DB + memory (avoid duplicates)
+  const map = new Map();
+  for (const c of [...rows, ...memRows]) map.set(String(c.id), c);
+  const detectChannel = (entry) => {
+    if (truthyStr(entry.html)) return "Email";
+    if (truthyStr(entry.text)) return "WhatsApp";
+    if (truthyStr(entry.subject) || truthyStr(entry.name)) return "Email";
+    return "Email";
+  };
+  const merged = Array.from(map.values())
+    .sort((a, b) => new Date(b.sent_at || 0) - new Date(a.sent_at || 0))
+    .slice(0, 20)
+    .map((c) => ({
+      id: String(c.id),
+      subject: c.subject || "",
+      message: c.text || "",
+      sent_at: c.sent_at,
+      channel: detectChannel(c),
+      openRate: c.sent_denom
+        ? Math.round(((c.u_open || 0) / c.sent_denom) * 1000) / 10
+        : 0,
+      clickRate: c.sent_denom
+        ? Math.round(((c.u_click || 0) / c.sent_denom) * 1000) / 10
+        : 0,
+    }));
 
-  return res.json({ ok: true, campaigns });
+  return res.json({ ok: true, campaigns: merged });
 });
 
-/* =========================================================
-   Recent events (debug)
-   ========================================================= */
-router.get("/events/recent", async (_req, res) => {
+
+// =========================================================
+// GET /api/campaigns/events/recent  — Tenant-safe
+// =========================================================
+router.get("/events/recent", async (req, res) => {
+  const restCondition = buildRestaurantCondition("c.restaurant_id", 1, req.user?.restaurant_id);
+  if (!restCondition)
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+
   try {
+    // ✅ Fetch only campaigns belonging to this restaurant
     const r = await q(
-      `SELECT campaign_id, customer_email, event_type, event_time
-       FROM campaign_events
-       ORDER BY event_time DESC, id DESC
-       LIMIT 25`
+      `SELECT ce.campaign_id, ce.customer_email, ce.event_type, ce.event_time
+       FROM campaign_events ce
+       INNER JOIN campaigns c ON c.id::text = ce.campaign_id::text
+       WHERE ${restCondition.clause}
+       ORDER BY ce.event_time DESC, ce.id DESC
+       LIMIT 25`,
+      [restCondition.param]
     );
-    const mem = [...recentEvents.entries()].map(([id, rec]) => ({
-      campaign_id: id,
-      opens: rec.opens.size,
-      clicks: rec.clicks.size,
-      last: rec.last,
-    }));
+
+    // ✅ Filter in-memory events (recentEvents) for this restaurant
+    const mem = [];
+    for (const [id, rec] of recentEvents.entries()) {
+      try {
+        const c = await q(
+          `SELECT 1 FROM campaigns WHERE id::text=$1 AND ${restCondition.clause.replace("$1", "$2")} LIMIT 1`,
+          [id, restCondition.param]
+        );
+        if (c?.rows?.length) {
+          mem.push({
+            campaign_id: id,
+            opens: rec.opens.size,
+            clicks: rec.clicks.size,
+            last: rec.last,
+          });
+        }
+      } catch {
+        // ignore if db unavailable
+      }
+    }
+
     res.json({ ok: true, db: r?.rows || [], memory: mem });
   } catch (e) {
-    res.json({ ok: true, db: [], memory: [...recentEvents.keys()] });
+    console.error("❌ events/recent error:", e);
+    res.json({ ok: true, db: [], memory: [] });
   }
 });
+
 
 /* =========================================================
    Tracking (single, canonical implementations)
@@ -946,6 +1303,194 @@ router.post("/debug/roundtrip", async (_req, res) => {
     return res.json({ ok: true, inserted: ins.rows[0], fetched: got.rows[0] });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// =========================================================
+// 🟢 TENANT-SAFE WHATSApp CAMPAIGNS (DB-PERSISTENT)
+// =========================================================
+router.post("/whatsapp", authMiddleware, async (req, res) => {
+  try {
+    const { num: restaurantIdNum, text: restaurantIdStr } = normalizeRestaurantId(req.user?.restaurant_id);
+    if (!restaurantIdStr)
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    const restaurantIdParam = restaurantIdNum ?? restaurantIdStr;
+
+    const { body, phones, name, subject, primary_url: waPrimaryUrl } = req.body || {};
+    if (!body || !phones?.length) {
+      return res.status(400).json({ ok: false, error: "Missing message or phones" });
+    }
+
+    await ensureTables();
+
+    const brandName =
+      truthyStr(req.user?.restaurant_name) ||
+      truthyStr(req.user?.name) ||
+      "";
+    const campaignSubject =
+      truthyStr(subject) || "WhatsApp Campaign";
+    const primaryUrl =
+      truthyStr(waPrimaryUrl) && /^https?:\/\//i.test(waPrimaryUrl)
+        ? waPrimaryUrl.trim()
+        : "";
+    const marketingBody = buildWhatsAppTemplate({
+      subject: campaignSubject,
+      message: body,
+      primaryUrl,
+      brandName,
+    });
+
+    // 🔹 Insert WhatsApp campaign record
+    let campaignId = Date.now().toString();
+    let insertedAt = new Date();
+    try {
+      const ins = await q(
+        `INSERT INTO campaigns (restaurant_id, name, subject, text, sent_count, sent_at)
+         VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id, sent_at`,
+        [
+          restaurantIdParam,
+          name || "WhatsApp Campaign",
+          campaignSubject,
+          marketingBody,
+          0
+        ]
+      );
+      if (ins?.rows?.[0]?.id) {
+        campaignId = String(ins.rows[0].id);
+        insertedAt = ins.rows[0].sent_at || insertedAt;
+      }
+    } catch (err) {
+      console.error("❌ Failed to insert WhatsApp campaign:", err);
+    }
+
+    rememberCampaignMeta(campaignId, campaignSubject, marketingBody, insertedAt);
+
+    // 🔹 Send messages via WhatsApp Cloud
+    const results = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (const phone of phones) {
+      const normalized = phone.replace(/\D/g, "");
+      try {
+        const r = await sendCloudMessage(normalized, marketingBody);
+        results.push({ phone: normalized, status: r.status || "ok" });
+        successCount += 1;
+
+        // Save send event per recipient
+        try {
+          await q(
+            `INSERT INTO campaign_events (campaign_id, customer_email, event_type)
+             VALUES ($1,$2,'sent')`,
+            [campaignId, normalized]
+          );
+          rememberEvent(campaignId, "sent", normalized);
+        } catch (err) {
+          console.warn("⚠️ Failed to insert campaign_event for", normalized, err);
+        }
+      } catch (err) {
+        failureCount += 1;
+        const errMsg = err?.response?.data?.error?.message || err?.message || String(err);
+        console.warn(`⚠️ WhatsApp send failed for ${normalized}:`, errMsg);
+        results.push({ phone: normalized, status: "failed", error: errMsg });
+      }
+    }
+
+    // Update sent_count only with successful deliveries
+    try {
+      if (successCount > 0) {
+        await q(
+          `UPDATE campaigns SET sent_count=$1, sent_at=NOW() WHERE id=$2`,
+          [successCount, campaignId]
+        );
+      }
+    } catch (err) {
+      console.warn("⚠️ Failed to update WhatsApp campaign sent_count:", err);
+    }
+
+    const ok = failureCount === 0;
+    return res.status(ok ? 200 : 207).json({
+      ok,
+      campaignId,
+      sent: successCount,
+      failed: failureCount,
+      results,
+    });
+  } catch (err) {
+    console.error("❌ WhatsApp campaign send error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
+// 📱 Get QR for tenant's WhatsApp client
+router.get("/whatsapp/qr", authMiddleware, async (req, res) => {
+  const { text: restaurantIdStr } = normalizeRestaurantId(req.user?.restaurant_id);
+  if (!restaurantIdStr) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  try {
+    const { getWhatsAppClient } = require("../utils/whatsappClient");
+   const client = await getWhatsAppClient(restaurantIdStr);
+
+    if (!client) return res.status(404).json({ ok: false, error: "Client not found" });
+    if (client.isReady) return res.json({ ok: true, status: "ready" });
+
+    // When QR event fires, cache it temporarily
+    if (!client._lastQr) {
+      client.on("qr", qr => {
+        client._lastQr = qr;
+      });
+    }
+
+    // If QR already cached, return it
+    if (client._lastQr) {
+      return res.json({ ok: true, qr: client._lastQr });
+    } else {
+      return res.json({ ok: true, status: "waiting" });
+    }
+  } catch (err) {
+    console.error("❌ QR fetch error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
+/* =========================================================
+   DELETE /api/campaigns/clear-all — tenant-safe clear route
+   ========================================================= */
+router.delete("/clear-all", authMiddleware, async (req, res) => {
+  const restCondition = buildRestaurantCondition("restaurant_id", 1, req.user?.restaurant_id);
+  if (!restCondition)
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  try {
+    await ensureTables();
+
+    // Delete campaign events first (FK-safe)
+    await q(`DELETE FROM campaign_events WHERE campaign_id IN (
+      SELECT id::text FROM campaigns WHERE ${restCondition.clause}
+    )`, [restCondition.param]);
+
+    // Delete campaigns for this restaurant
+    const del = await q(
+      `DELETE FROM campaigns WHERE ${restCondition.clause} RETURNING id`,
+      [restCondition.param]
+    );
+
+    // Clear in-memory cache for this tenant
+    for (const id of (del?.rows || []).map(r => String(r.id))) {
+      recentEvents.delete(id);
+      recentCampaignMeta.delete(id);
+    }
+
+    return res.json({
+      ok: true,
+      deleted: del?.rows?.length || 0,
+      message: "All campaigns cleared successfully.",
+    });
+  } catch (err) {
+    console.error("❌ Failed to clear campaigns:", err);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 

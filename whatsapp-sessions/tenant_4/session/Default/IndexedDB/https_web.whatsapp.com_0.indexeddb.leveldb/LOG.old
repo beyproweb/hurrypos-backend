@@ -1,0 +1,28 @@
+2025/10/27-14:15:28.820 2573e92 Reusing MANIFEST /Users/nurikord/PycharmProjects/hurrypos-backend/whatsapp-sessions/tenant_4/session/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2025/10/27-14:15:28.820 2573e92 Recovering log #320
+2025/10/27-14:15:28.820 2573e92 Reusing old log /Users/nurikord/PycharmProjects/hurrypos-backend/whatsapp-sessions/tenant_4/session/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/000320.log 
+2025/10/27-14:15:28.822 2573e92 Delete type=2 #319
+2025/10/27-14:15:28.871 2573ea4 Level-0 table #325: started
+2025/10/27-14:15:28.873 2573ea4 Level-0 table #325: 0 bytes OK
+2025/10/27-14:15:28.903 2573ea4 Delete type=0 #320
+2025/10/27-14:15:28.904 2573e92 Manual compaction at level-0 from '\x00V\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00W\x00\x00\x00' @ 0 : 0; will stop at (end)
+2025/10/27-14:15:28.905 2573e92 Level-0 table #327: started
+2025/10/27-14:15:28.925 2573e92 Level-0 table #327: 249 bytes OK
+2025/10/27-14:15:28.959 2573e92 Delete type=0 #324
+2025/10/27-14:15:28.960 2573e92 Manual compaction at level-0 from '\x00W\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00X\x00\x00\x00' @ 0 : 0; will stop at '\x00W\x00\x00\x05' @ 925565 : 0
+2025/10/27-14:15:28.961 2573e92 Compacting 1@0 + 1@1 files
+2025/10/27-14:15:28.978 2573e92 Generated table #328@0: 227 keys, 2373 bytes
+2025/10/27-14:15:28.979 2573e92 Compacted 1@0 + 1@1 files => 2373 bytes
+2025/10/27-14:15:29.006 2573e92 compacted to: files[ 0 1 1 0 0 0 0 ]
+2025/10/27-14:15:29.007 2573e92 Delete type=2 #327
+2025/10/27-14:15:29.009 2573e92 Manual compaction at level-0 from '\x00W\x00\x00\x05' @ 925565 : 0 .. '\x00X\x00\x00\x00' @ 0 : 0; will stop at (end)
+2025/10/27-14:15:29.010 2573e92 Level-0 table #330: started
+2025/10/27-14:15:29.027 2573e92 Level-0 table #330: 249 bytes OK
+2025/10/27-14:15:29.064 2573e92 Delete type=0 #326
+2025/10/27-14:15:29.065 2573e92 Delete type=2 #322
+2025/10/27-14:15:29.071 2573e9f Manual compaction at level-0 from '\x00X\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00Y\x00\x00\x00' @ 0 : 0; will stop at '\x00X\x00\x00\x05' @ 925571 : 0
+2025/10/27-14:15:29.071 2573e9f Compacting 1@0 + 1@1 files
+2025/10/27-14:15:29.090 2573e9f Generated table #331@0: 225 keys, 2309 bytes
+2025/10/27-14:15:29.090 2573e9f Compacted 1@0 + 1@1 files => 2309 bytes
+2025/10/27-14:15:29.121 2573e9f compacted to: files[ 0 1 1 0 0 0 0 ]
+2025/10/27-14:15:29.122 2573e9f Manual compaction at level-0 from '\x00X\x00\x00\x05' @ 925571 : 0 .. '\x00Y\x00\x00\x00' @ 0 : 0; will stop at (end)

@@ -47,7 +47,7 @@ router.get("/", async (req, res) => {
           '[]'
         ) AS items
       FROM extras_groups g
-      LEFT JOIN extras_group_items i ON i.group_id = g.id
+      LEFT JOIN extras_group_items i ON i.group_id = g.id AND i.restaurant_id = g.restaurant_id
       WHERE g.restaurant_id = $1
       GROUP BY g.id, g.group_name
       ORDER BY g.id ASC
@@ -90,7 +90,7 @@ router.get("/:id", async (req, res) => {
           '[]'
         ) AS items
       FROM extras_groups g
-      LEFT JOIN extras_group_items i ON i.group_id = g.id
+      LEFT JOIN extras_group_items i ON i.group_id = g.id AND i.restaurant_id = g.restaurant_id
       WHERE g.restaurant_id = $1 AND g.id = $2
       GROUP BY g.id, g.group_name
       `,
