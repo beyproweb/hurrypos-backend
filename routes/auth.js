@@ -89,7 +89,7 @@ router.post("/login", async (req, res) => {
         role: user.role || "staff",
         restaurant_id: user.restaurant_id,
       },
-      process.env.JWT_SECRET || "beyprosecret",
+      process.env.JWT_SECRET || "beypro_secret_2025",
       { expiresIn: "7d" }
     );
 
