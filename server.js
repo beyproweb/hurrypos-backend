@@ -1,21 +1,26 @@
 // server.js
-const express = require("express");
 require("dotenv").config();
+console.log("🔐 JWT_SECRET loaded =", process.env.JWT_SECRET ? "✅ OK" : "❌ MISSING");
+
+const express = require("express");
 const app = express();
 const pool = require("./db");
 const cors = require("cors");
 
 const allowedOrigins = [
-  "http://localhost:5173",     // dev
+  "http://localhost:5173", // dev
   "https://pos.beypro.com",
-  "https://hurrypos-frontend.onrender.com" // production
+  "https://www.pos.beypro.com",
+  "https://hurrypos-frontend.onrender.com", // production
 ];
+const allowedOriginsNormalized = allowedOrigins.map((o) => o.toLowerCase());
 
 app.use(
   cors({
     origin: function (origin, callback) {
       if (!origin) return callback(null, true); // allow REST clients/curl
-      if (allowedOrigins.includes(origin)) {
+      const normalized = origin.toLowerCase();
+      if (allowedOriginsNormalized.includes(normalized)) {
         return callback(null, true);
       } else {
         console.warn("❌ Blocked by CORS:", origin);
@@ -64,7 +69,7 @@ app.use(
     cacheControl: false,
   })
 );
-
+const whatsappWebhook = require("./routes/whatsappWebhook");
 // Beypro Bridge binaries (no-cache)
 app.use(
   "/bridge",
@@ -134,7 +139,7 @@ app.use("/api/reports", require("./routes/reports"));
 app.use("/api/production", require("./routes/production"));
 app.use("/api/notifications", require("./routes/notifications"));
 app.use("/api", require("./routes/expenses"));
-
+app.use("/api/maintenance", require("./routes/maintenance"));
 // Iyzico (conditionally)
 if (process.env.IYZI_API_KEY && process.env.IYZI_SECRET) {
   app.use("/api", require("./routes/iyzico"));
@@ -158,8 +163,8 @@ app.use("/api", require("./routes/subscription"));
 // ========== ORDER & KITCHEN ORDER MATTERS ==========
 const kitchenRoutes = require("./routes/kitchen");
 
-// ✅ Mount ORDERS (tenant-safe) FIRST — includes PUT /api/orders/order-items/kitchen-status
-app.use("/api/orders", authMiddleware, require("./routes/orders")(io));
+// ✅ Mount ORDERS (tenant-aware) FIRST — includes PUT /api/orders/order-items/kitchen-status
+app.use("/api/orders", require("./routes/orders")(io));
 
 // Other feature routes (public or internal-auth)
 app.use("/api/drinks", authMiddleware, require("./routes/drinks")(io));
@@ -172,12 +177,12 @@ app.use("/api/phoneorders", require("./routes/phoneorders"));
 app.use("/api/customerAddresses", require("./routes/customerAddresses"));
 app.use("/api/customers", require("./routes/customers"));
 app.use("/api/campaigns", require("./routes/campaigns"));
-
+app.use("/webhook", whatsappWebhook);
 // ✅ Mount KITCHEN router AFTER orders, with auth
 app.use("/api", kitchenRoutes);
 
 // ========== PROTECTED ROUTES ==========
-app.use("/api/products", authMiddleware, require("./routes/products"));
+app.use("/api/products", require("./routes/products"));
 app.use("/api/stock", authMiddleware, require("./routes/stock")(io));
 // ❌ REMOVE the duplicate orders mount that was here
 app.use("/api/drivers", authMiddleware, require("./routes/drivers")(io));
@@ -204,6 +209,33 @@ const safeParseExtras = (extras) => {
     return [];
   }
 };
+
+// Slug redirect → public QR link
+const RESERVED_SLUGS = new Set([
+  "api",
+  "uploads",
+  "sounds",
+  "bridge",
+  "favicon.ico",
+]);
+
+app.get("/:slug", async (req, res, next) => {
+  const { slug } = req.params;
+  if (!slug || RESERVED_SLUGS.has(slug) || slug.includes(".")) {
+    return next();
+  }
+
+  try {
+    const { rows } = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [slug]);
+    if (rows.length) {
+      return res.redirect(302, `https://pos.beypro.com/qr-menu/${slug}`);
+    }
+    return res.status(404).send("Restaurant not found");
+  } catch (err) {
+    console.error("❌ Slug redirect failed:", err);
+    return next(err);
+  }
+});
 
 // Error catcher
 app.use((err, req, res, next) => {

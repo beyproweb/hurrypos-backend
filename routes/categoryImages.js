@@ -5,9 +5,12 @@ const multer = require("multer");
 const { pool } = require("../db");
 const cloudinary = require("../utils/cloudinary");
 const streamifier = require("streamifier");
+const authMiddleware = require("../middleware/authMiddleware");
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
+// Authenticated routes below
+router.use(authMiddleware);
 
 async function resolveRestaurantId(req) {
   const identifier = req.query.identifier;
@@ -25,9 +28,47 @@ async function resolveRestaurantId(req) {
   return restaurant_id;
 }
 
+// Fetch category image(s) (public)
+router.get("/", async (req, res) => {
+  try {
+    const restaurant_id = await resolveRestaurantId(req);
+    if (!restaurant_id) return res.status(400).json({ error: "Invalid restaurant" });
+
+    let { category } = req.query;
+
+    let query, params;
+    if (category) {
+      query = `
+        SELECT category, image
+        FROM category_images
+        WHERE restaurant_id = $1 AND category = $2
+      `;
+      params = [restaurant_id, category.trim().toLowerCase()];
+    } else {
+      query = `
+        SELECT category, image
+        FROM category_images
+        WHERE restaurant_id = $1
+      `;
+      params = [restaurant_id];
+    }
+
+    const { rows } = await pool.query(query, params);
+    res.json(rows); // each row has full Cloudinary URL now
+  } catch (e) {
+    console.error("❌ Category image fetch failed:", e);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
 // Upload category image
 router.post("/", upload.single("image"), async (req, res) => {
   try {
+    const restaurant_id = await resolveRestaurantId(req);
+    if (!restaurant_id) return res.status(400).json({ error: "Invalid restaurant" });
+
     let { category } = req.body;
     if (!category || !req.file) {
       return res.status(400).json({ error: "Category and image required" });
@@ -47,10 +88,10 @@ router.post("/", upload.single("image"), async (req, res) => {
 
         // Save URL in DB (with category in lowercase)
         await pool.query(
-          `INSERT INTO category_images (category, image)
-           VALUES ($1, $2)
-           ON CONFLICT (category) DO UPDATE SET image = EXCLUDED.image`,
-          [category, result.secure_url]
+          `INSERT INTO category_images (restaurant_id, category, image)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (restaurant_id, category) DO UPDATE SET image = EXCLUDED.image`,
+          [restaurant_id, category, result.secure_url]
         );
 
         res.json({ success: true, image: result.secure_url });
@@ -60,31 +101,6 @@ router.post("/", upload.single("image"), async (req, res) => {
     streamifier.createReadStream(req.file.buffer).pipe(uploadStream);
   } catch (e) {
     console.error("❌ Category upload failed:", e);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// Fetch category image(s)
-router.get("/", async (req, res) => {
-  try {
-    const restaurant_id = await resolveRestaurantId(req);
-    if (!restaurant_id) return res.status(400).json({ error: "Invalid restaurant" });
-
-    let { category } = req.query;
-
-    let query, params;
-    if (category) {
-      query = "SELECT category, image FROM category_images WHERE category = $1";
-      params = [category.trim().toLowerCase()];
-    } else {
-      query = "SELECT category, image FROM category_images";
-      params = [];
-    }
-
-    const { rows } = await pool.query(query, params);
-    res.json(rows); // each row has full Cloudinary URL now
-  } catch (e) {
-    console.error("❌ Category image fetch failed:", e);
     res.status(500).json({ error: "Internal server error" });
   }
 });

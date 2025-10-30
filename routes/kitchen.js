@@ -278,19 +278,44 @@ router.get("/kitchen/compile-settings", async (req, res) => {
 router.post("/kitchen/compile-settings", async (req, res) => {
   const { excludedIngredients = [], excludedCategories = [], excludedItems = [] } = req.body;
   try {
-    await pool.query(
+    const restaurantId = req.user?.restaurant_id;
+    if (!restaurantId) {
+      return res.status(401).json({ error: "Unauthorized: missing restaurant" });
+    }
+
+    const updateResult = await pool.query(
       `UPDATE kitchen_compile_settings
-       SET excluded_ingredients = $1,
-           excluded_categories = $2,
-           excluded_items = $3,
-           updated_at = NOW()
-       WHERE restaurant_id = $1 AND id = 1`,
+         SET excluded_ingredients = $2,
+             excluded_categories = $3,
+             excluded_items = $4,
+             updated_at = NOW()
+       WHERE restaurant_id = $1`,
       [
+        restaurantId,
         JSON.stringify(excludedIngredients),
         JSON.stringify(excludedCategories),
         JSON.stringify(excludedItems)
       ]
     );
+
+    if (updateResult.rowCount === 0) {
+      await pool.query(
+        `INSERT INTO kitchen_compile_settings (
+           restaurant_id,
+           excluded_ingredients,
+           excluded_categories,
+           excluded_items,
+           updated_at
+         )
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [
+          restaurantId,
+          JSON.stringify(excludedIngredients),
+          JSON.stringify(excludedCategories),
+          JSON.stringify(excludedItems)
+        ]
+      );
+    }
     res.json({ success: true });
   } catch (err) {
     console.error("❌ Failed to update compile settings:", err);

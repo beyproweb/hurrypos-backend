@@ -5,36 +5,60 @@ const authMiddleware = require("../middleware/authMiddleware");
 
 router.use(authMiddleware);
 
-// POST /api/customers - Create new customer (tenant safe)
+// ✅ POST /api/customers - Create or return existing (tenant safe)
 router.post("/", async (req, res) => {
   const { name, phone, birthday, email } = req.body;
   const restaurantId = req.user.restaurant_id;
-  if (!name || !phone) return res.status(400).json({ error: "Name and phone required" });
+
+  if (!name || !phone) {
+    return res.status(400).json({ error: "Name and phone required" });
+  }
 
   try {
+    // 1️⃣ Check if customer already exists for this restaurant
+    const existing = await pool.query(
+      `SELECT * FROM customers WHERE restaurant_id = $1 AND phone = $2 LIMIT 1`,
+      [restaurantId, phone]
+    );
+
+    if (existing.rows.length > 0) {
+      // Return existing instead of trying to insert again
+      return res.json(existing.rows[0]);
+    }
+
+    // 2️⃣ Create new one if not found
     const result = await pool.query(
       `INSERT INTO customers (restaurant_id, name, phone, birthday, email)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
       [restaurantId, name, phone, birthday || null, email || null]
     );
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error("❌ Error creating customer:", err);
-    res.status(500).json({ error: "Failed to create customer" });
+    res.status(500).json({ error: "Failed to create or find customer" });
   }
 });
 
+
+// PATCH /api/customers/:id - Update (tenant safe)
 // PATCH /api/customers/:id - Update (tenant safe)
 router.patch("/:id", async (req, res) => {
   const { id } = req.params;
   const restaurantId = req.user.restaurant_id;
+
+  // Normalize/clean inputs
+  const payload = { ...req.body };
+  if (payload.birthday === "") payload.birthday = null; // prevent invalid date ""
+  // allow empty string for address to overwrite legacy value if needed
+
   const fields = [];
   const values = [];
   let idx = 1;
 
-  for (const [key, value] of Object.entries(req.body)) {
-    if (["name", "phone", "birthday", "email"].includes(key)) {
+  for (const [key, value] of Object.entries(payload)) {
+    if (["name", "phone", "birthday", "email", "address"].includes(key)) {
       fields.push(`${key} = $${idx++}`);
       values.push(value);
     }
@@ -43,6 +67,7 @@ router.patch("/:id", async (req, res) => {
 
   values.push(restaurantId);
   values.push(id);
+
   const sql = `UPDATE customers SET ${fields.join(", ")}
                WHERE restaurant_id = $${idx++} AND id = $${idx}
                RETURNING *`;
@@ -56,6 +81,7 @@ router.patch("/:id", async (req, res) => {
     res.status(500).json({ error: "Failed to update customer" });
   }
 });
+
 
 // GET /api/customers?search=...
 router.get("/", async (req, res) => {
@@ -134,6 +160,28 @@ router.get("/birthdays", async (req, res) => {
   } catch (err) {
     console.error("❌ Error fetching birthdays:", err);
     res.status(500).json({ error: "Failed to fetch birthdays" });
+  }
+});
+
+// DELETE /api/customers/:id - Delete a customer (tenant safe)
+router.delete("/:id", async (req, res) => {
+  const { id } = req.params;
+  const restaurantId = req.user.restaurant_id;
+
+  try {
+    const result = await pool.query(
+      "DELETE FROM customers WHERE id = $1 AND restaurant_id = $2 RETURNING id",
+      [id, restaurantId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Customer not found or not authorized" });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Error deleting customer:", err);
+    res.status(500).json({ error: "Failed to delete customer" });
   }
 });
 
