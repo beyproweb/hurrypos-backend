@@ -318,6 +318,10 @@ router.delete("/", async (req, res) => {
 
 router.get("/costs", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
+  if (!restaurantId) {
+    return res.status(401).json({ error: "Unauthorized: restaurant_id missing" });
+  }
+
   try {
     const result = await pool.query(
       `
@@ -328,7 +332,7 @@ router.get("/costs", async (req, res) => {
         p.price,
         COALESCE((
           SELECT SUM(
-            (ing->>'quantity')::numeric *
+            COALESCE(NULLIF(TRIM(ing->>'quantity'), '')::numeric, 0) *
             COALESCE((
               SELECT t.price_per_unit
               FROM transactions t
@@ -341,32 +345,15 @@ router.get("/costs", async (req, res) => {
                 )
               ORDER BY t.delivery_date DESC
               LIMIT 1
-            ), (
-              -- fallback: any latest price for ingredient (ignore unit mismatch)
-              SELECT t2.price_per_unit
-              FROM transactions t2
-              WHERE t2.restaurant_id = p.restaurant_id
-                AND LOWER(TRIM(t2.ingredient)) = LOWER(TRIM(ing->>'ingredient'))
-              ORDER BY t2.delivery_date DESC
-              LIMIT 1
             ), 0)
           )
-          FROM jsonb_array_elements(p.ingredients) AS ing
-        ), 0) AS ingredient_cost,
-        COALESCE((
-          SELECT SUM(
-            (ing->>'quantity')::numeric *
-            COALESCE((
-              SELECT t.price_per_unit
-              FROM transactions t
-              WHERE t.restaurant_id = p.restaurant_id
-                AND LOWER(TRIM(t.ingredient)) = LOWER(TRIM(ing->>'ingredient'))
-              ORDER BY t.delivery_date DESC
-              LIMIT 1
-            ), 0)
-          )
-          FROM jsonb_array_elements(p.ingredients) AS ing
-        ), 0) AS cost
+          FROM jsonb_array_elements(
+            CASE
+              WHEN jsonb_typeof(p.ingredients) = 'array' THEN p.ingredients
+              ELSE '[]'::jsonb
+            END
+          ) AS ing
+        ), 0) AS ingredient_cost
       FROM products p
       WHERE p.restaurant_id = $1
       ORDER BY p.category, p.name
@@ -377,11 +364,10 @@ router.get("/costs", async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error("❌ Fetch cost error:", err);
-    res
-      .status(500)
-      .json({ status: "error", message: "Failed to fetch cost data" });
+    res.status(500).json({ status: "error", message: "Failed to fetch cost data" });
   }
 });
+
 
 
 
