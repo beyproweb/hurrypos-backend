@@ -19,4 +19,8 @@ pool.on("error", (err) => {
   console.error("❌ Unexpected PG pool error:", err);
 });
 
+// 🧩 Optional: log which DB this backend is connected to
+const safeUrl = (process.env.DATABASE_URL || "").replace(/:\/\/(.*:.*)@/, "://****:****@");
+console.log("🗄️  Connected to PostgreSQL:", safeUrl);
+
 module.exports = { pool };
