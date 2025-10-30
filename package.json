@@ -54,7 +54,10 @@
     "nodemon": "^3.1.10",
     "pkg": "^5.8.1"
   },
-  "engines": { "node": "20.x" },
+
+"optionalDependencies": {
+  "venom-bot": "^5.0.0"
+},
 
   "pkg": {
     "assets": [
