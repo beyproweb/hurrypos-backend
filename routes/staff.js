@@ -954,30 +954,25 @@ router.get('/:staffId/attendance', async (req, res) => {
 
 
 // ----------------- PAYROLL (Current Week) -----------------
-// ✅ Detailed payroll for a specific staff member (tenant-safe)
 router.get('/:staffId/payroll', async (req, res) => {
-  const restaurantId = req.user.restaurant_id; // tenant isolation
+  const restaurantId = req.user.restaurant_id;
   const { staffId } = req.params;
   let { startDate, endDate } = req.query;
 
-  // 🔹 Utility: get ISO week number
-  function getWeekNumber(date) {
-    const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-    const dayNum = d.getUTCDay() || 7;
-    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-    return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-  }
-
   try {
-    // 🕓 Default to current week if not provided
+    const normalizeDate = (value) => {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return null;
+      return date.toISOString().split('T')[0];
+    };
+
     if (!startDate || !endDate) {
       const now = new Date();
       const day = now.getDay();
       const diffToMonday = day === 0 ? -6 : 1 - day;
       const monday = new Date(now);
-      monday.setDate(now.getDate() + diffToMonday);
       monday.setHours(0, 0, 0, 0);
+      monday.setDate(now.getDate() + diffToMonday);
 
       const sunday = new Date(monday);
       sunday.setDate(monday.getDate() + 6);
@@ -985,69 +980,307 @@ router.get('/:staffId/payroll', async (req, res) => {
 
       startDate = monday.toISOString().split('T')[0];
       endDate = sunday.toISOString().split('T')[0];
+    } else {
+      startDate = normalizeDate(startDate);
+      endDate = normalizeDate(endDate);
     }
 
-    // ✅ Fetch staff salary info (tenant-safe)
     const staffRes = await pool.query(
-      `
-      SELECT
-        salary, hourly_rate, salary_model, payment_type,
-        weekly_salary, monthly_salary
-      FROM staff
-      WHERE restaurant_id = $1 AND id = $2
-      `,
+      `SELECT salary, hourly_rate, salary_model, payment_type, weekly_salary, monthly_salary
+       FROM staff
+       WHERE restaurant_id = $1 AND id = $2`,
       [restaurantId, staffId]
     );
-
-    if (staffRes.rowCount === 0) {
-      return res.status(404).json({ status: 'error', message: 'Staff not found' });
-    }
+    if (staffRes.rowCount === 0) return res.status(404).json({ error: "Staff not found" });
     const staff = staffRes.rows[0];
 
-    // ✅ Parallel queries for schedule, attendance, and payments
     const [scheduleResult, attendanceResult, paymentsResult] = await Promise.all([
-      pool.query(`
-        SELECT shift_start, shift_end, shift_date
-        FROM staff_schedule
-        WHERE restaurant_id = $1 AND staff_id = $2
-          AND shift_date BETWEEN $3 AND $4
-      `, [restaurantId, staffId, startDate, endDate]),
-      pool.query(`
-        SELECT check_in_time, check_out_time, duration_minutes
-        FROM attendance
-        WHERE restaurant_id = $1 AND staff_id = $2
-          AND check_in_time::date BETWEEN $3 AND $4
-      `, [restaurantId, staffId, startDate, endDate]),
-      pool.query(`
-        SELECT COALESCE(SUM(amount), 0) AS total_paid
-        FROM staff_payments
-        WHERE restaurant_id = $1 AND staff_id = $2
-      `, [restaurantId, staffId])
+      pool.query(
+        `SELECT shift_start, shift_end, shift_date
+         FROM staff_schedule
+         WHERE restaurant_id = $1 AND staff_id = $2
+           AND shift_date BETWEEN $3 AND $4
+         ORDER BY shift_date ASC`,
+        [restaurantId, staffId, startDate, endDate]
+      ),
+      pool.query(
+        `SELECT check_in_time, check_out_time, duration_minutes
+         FROM attendance
+         WHERE restaurant_id = $1 AND staff_id = $2
+           AND check_in_time::date BETWEEN $3 AND $4`,
+        [restaurantId, staffId, startDate, endDate]
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(amount),0)::numeric AS total_paid
+         FROM staff_payments
+         WHERE restaurant_id=$1 AND staff_id=$2`,
+        [restaurantId, staffId]
+      )
     ]);
 
-    // The rest of your payroll logic below remains exactly the same —
-    // all calculations (early checkout, lateness, absence, total salary, etc.)
-    // can stay as-is since they don’t affect SQL tenant scope.
+    const scheduleRows = scheduleResult.rows;
+    const attendanceRows = attendanceResult.rows;
+    const totalPaid = Number(paymentsResult.rows[0].total_paid || 0);
 
-    const scheduleRes = scheduleResult.rows;
-    const attendanceRes = attendanceResult.rows;
-    const salaryPaid = parseFloat(paymentsResult.rows[0].total_paid || 0);
+    const toDateKey = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      return d.toISOString().split('T')[0];
+    };
 
-    // ... ⬇️ continue with your same logic for computing hours, lateness, etc.
-    // (nothing changes beyond this point — only SQL safety was fixed)
+    const shiftMinutes = (dateKey, startStr, endStr) => {
+      if (!dateKey || !startStr || !endStr) return 0;
+      const start = new Date(`${dateKey}T${startStr}`);
+      const end = new Date(`${dateKey}T${endStr}`);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 0;
+      let diff = Math.round((end - start) / 60000);
+      if (diff <= 0) diff += 1440;
+      return Math.max(diff, 0);
+    };
 
-    // ⚡ (You can paste your full computation block from your message here)
-    // just ensure the first three queries above use the tenant-safe ones I gave.
+    const scheduleByDate = {};
+    let totalScheduledMinutes = 0;
+    scheduleRows.forEach((shift) => {
+      const dateKey = toDateKey(shift.shift_date);
+      if (!dateKey) return;
+      const minutes = shiftMinutes(
+        dateKey,
+        String(shift.shift_start || "").slice(0, 8),
+        String(shift.shift_end || "").slice(0, 8)
+      );
+      totalScheduledMinutes += minutes;
+      if (!scheduleByDate[dateKey]) {
+        scheduleByDate[dateKey] = { shifts: [], minutes: 0 };
+      }
+      scheduleByDate[dateKey].shifts.push(shift);
+      scheduleByDate[dateKey].minutes += minutes;
+    });
 
+    const baseEntry = (dateKey) => {
+      const dateObj = new Date(dateKey);
+      return {
+        day: Number.isNaN(dateObj.getTime())
+          ? dateKey
+          : dateObj.toLocaleDateString('en-US', { weekday: 'long' }),
+        date: dateKey,
+        schedule: null,
+        sessions: [],
+        totalMinutes: 0,
+        latency: [],
+        earlyCheckout: [],
+      };
+    };
+
+    const weeklyCheckMap = {};
+    let totalActualMinutes = 0;
+    let lateCheckinMinutes = 0;
+    let totalEarlyCheckoutMinutes = 0;
+
+    attendanceRows.forEach((row) => {
+      const dateKey = toDateKey(row.check_in_time);
+      if (!dateKey) return;
+      if (!weeklyCheckMap[dateKey]) {
+        weeklyCheckMap[dateKey] = baseEntry(dateKey);
+      }
+      const entry = weeklyCheckMap[dateKey];
+      entry.sessions.push(row);
+
+      let duration = Number(row.duration_minutes);
+      if (!Number.isFinite(duration) && row.check_in_time && row.check_out_time) {
+        const start = new Date(row.check_in_time);
+        const end = new Date(row.check_out_time);
+        if (!Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())) {
+          duration = Math.max(Math.round((end - start) / 60000), 0);
+        }
+      }
+      if (Number.isFinite(duration)) {
+        entry.totalMinutes += duration;
+        totalActualMinutes += duration;
+      }
+
+      const scheduleForDay = scheduleByDate[dateKey];
+      if (scheduleForDay && scheduleForDay.shifts.length > 0) {
+        const shift = scheduleForDay.shifts[0];
+        const startStr = String(shift.shift_start || '').slice(0, 8) || '00:00:00';
+        const endStr = String(shift.shift_end || '').slice(0, 8) || '00:00:00';
+        const scheduledStart = new Date(`${dateKey}T${startStr}`);
+        const scheduledEnd = new Date(`${dateKey}T${endStr}`);
+        const actualStart = new Date(row.check_in_time);
+        const actualEnd = row.check_out_time ? new Date(row.check_out_time) : null;
+
+        if (!Number.isNaN(scheduledStart.getTime()) && !Number.isNaN(actualStart.getTime())) {
+          const diff = Math.floor((actualStart - scheduledStart) / 60000);
+          if (diff > 0) {
+            lateCheckinMinutes += diff;
+            entry.latency.push(`${Math.floor(diff / 60)}h ${diff % 60}min late`);
+          } else if (diff < 0) {
+            const early = Math.abs(diff);
+            entry.latency.push(`${Math.floor(early / 60)}h ${early % 60}min early`);
+          } else {
+            entry.latency.push('On time');
+          }
+        } else {
+          entry.latency.push('No schedule');
+        }
+
+        if (
+          actualEnd &&
+          !Number.isNaN(scheduledEnd.getTime()) &&
+          !Number.isNaN(actualEnd.getTime())
+        ) {
+          const earlyMinutes = Math.floor((scheduledEnd - actualEnd) / 60000);
+          if (earlyMinutes > 0) {
+            totalEarlyCheckoutMinutes += earlyMinutes;
+            entry.earlyCheckout.push(`${earlyMinutes} min early leave`);
+          } else {
+            entry.earlyCheckout.push(null);
+          }
+        } else {
+          entry.earlyCheckout.push(null);
+        }
+      } else {
+        entry.latency.push('No schedule');
+        entry.earlyCheckout.push(null);
+      }
+    });
+
+    const todayKey = new Date().toISOString().split('T')[0];
+    let absentMinutes = 0;
+    Object.entries(scheduleByDate).forEach(([dateKey, data]) => {
+      if (!weeklyCheckMap[dateKey]) {
+        weeklyCheckMap[dateKey] = baseEntry(dateKey);
+      }
+      const entry = weeklyCheckMap[dateKey];
+      const scheduleLabel = data.shifts
+        .map((shift) => {
+          const start = String(shift.shift_start || '').slice(0, 5);
+          const end = String(shift.shift_end || '').slice(0, 5);
+          if (!start || !end) return null;
+          return `${start}-${end}`;
+        })
+        .filter(Boolean)
+        .join(', ');
+      entry.schedule = scheduleLabel || entry.schedule || 'No schedule';
+      if (entry.sessions.length === 0) {
+        if (dateKey <= todayKey) {
+          entry.latency = ['Absent'];
+          absentMinutes += data.minutes;
+        } else {
+          entry.latency = ['Scheduled'];
+        }
+      }
+      if (entry.earlyCheckout.length === 0) {
+        entry.earlyCheckout.push(null);
+      }
+    });
+
+    const getDateRange = (startStr, endStr) => {
+      const result = [];
+      const start = new Date(startStr);
+      const end = new Date(endStr);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return result;
+      let cursor = new Date(start);
+      while (cursor <= end) {
+        result.push(new Date(cursor));
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      return result;
+    };
+
+    const formatDuration = (minutes) => {
+      const safeMinutes = Math.max(Math.round(Number(minutes) || 0), 0);
+      const hours = Math.floor(safeMinutes / 60);
+      const mins = safeMinutes % 60;
+      return `${hours}h ${mins}min`;
+    };
+
+    const weeklyCheck = getDateRange(startDate, endDate).map((dateObj) => {
+      const dateKey = dateObj.toISOString().split('T')[0];
+      const entry = weeklyCheckMap[dateKey];
+      if (!entry) {
+        return {
+          day: dateObj.toLocaleDateString('en-US', { weekday: 'long' }),
+          date: dateKey,
+          totalTime: '0h 0min',
+          schedule: 'No schedule',
+          sessions: [],
+          latency: ['No schedule'],
+          earlyCheckout: [null],
+        };
+      }
+      return {
+        day: entry.day,
+        date: entry.date,
+        totalTime: formatDuration(entry.totalMinutes),
+        schedule: entry.schedule || 'No schedule',
+        sessions: entry.sessions,
+        latency: entry.latency.length > 0 ? entry.latency : ['No schedule'],
+        earlyCheckout: entry.earlyCheckout.length > 0 ? entry.earlyCheckout : [null],
+      };
+    });
+
+    const weeklyHours = totalScheduledMinutes / 60;
+    const totalHours = totalActualMinutes / 60;
+    const timeDifferenceMinutes = Math.round(totalActualMinutes - totalScheduledMinutes);
+    const formatDifference = (value) => {
+      if (!value) return '0h 0min';
+      const abs = Math.abs(value);
+      const hours = Math.floor(abs / 60);
+      const mins = abs % 60;
+      const prefix = value > 0 ? '+' : '-';
+      return `${prefix}${hours}h ${mins}min`;
+    };
+
+    // ✅ Determine salary based on model
+    let totalSalaryDue = 0;
+    if (staff.salary_model === "hourly") {
+      totalSalaryDue = (staff.hourly_rate || 0) * totalHours;
+    } else if (staff.payment_type === "daily") {
+      // 8 hours per day baseline
+      totalSalaryDue = (staff.salary || 0) * (totalHours / 8);
+    } else if (staff.payment_type === "weekly") {
+      totalSalaryDue = staff.weekly_salary || staff.salary || 0;
+    } else if (staff.payment_type === "monthly") {
+      totalSalaryDue = staff.monthly_salary || staff.salary || 0;
+    }
+
+    const salaryDifference = Number(totalSalaryDue) - totalPaid;
+    const salaryDue = salaryDifference > 0 ? salaryDifference : 0;
+    const latencySummary = {
+      checkinLateMinutes: lateCheckinMinutes,
+      absentMinutes,
+      earlyCheckout: totalEarlyCheckoutMinutes,
+      totalMinutes: lateCheckinMinutes + absentMinutes + totalEarlyCheckoutMinutes,
+    };
+
+    res.json({
+      payroll: {
+        totalHours: totalHours.toFixed(2),
+        totalMinutes: totalActualMinutes,
+        totalMinutesThisWeek: totalActualMinutes,
+        salaryPaid: totalPaid,
+        totalSalaryDue: Number(totalSalaryDue.toFixed(2)),
+        salaryDue: Number(salaryDue.toFixed(2)),
+        attendanceCount: attendanceRows.length,
+        weeklyHours: Number(weeklyHours.toFixed(2)),
+        earlyCheckoutMinutes: totalEarlyCheckoutMinutes,
+        timeDifferenceMinutes,
+        timeDifferenceFormatted: formatDifference(timeDifferenceMinutes),
+        overtimePendingApproval: timeDifferenceMinutes > 0,
+        weeklyCheck,
+        latency: latencySummary,
+      },
+    });
   } catch (err) {
-    console.error('❌ Payroll error:', err);
-    res.status(500).json({ status: 'error', message: 'Payroll fetch failed' });
+    console.error("❌ Payroll error:", err);
+    res.status(500).json({ error: "Failed to fetch payroll" });
   }
 });
 
 
 // ----------------- PAYMENTS -----------------
-// ✅ Fetch all payment history for a specific staff (tenant-safe)
+// staff.js
 router.get('/:staffId/payments', async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   const { staffId } = req.params;
@@ -1059,11 +1292,15 @@ router.get('/:staffId/payments', async (req, res) => {
         payment_date,
         amount,
         note,
-        payment_method
+        payment_method,
+        auto,
+        scheduled_date,
+        repeat_type,
+        repeat_time
       FROM staff_payments
       WHERE restaurant_id = $1
         AND staff_id = $2
-      ORDER BY payment_date DESC
+      ORDER BY COALESCE(payment_date, scheduled_date) DESC, created_at DESC
       `,
       [restaurantId, staffId]
     );
@@ -1074,6 +1311,7 @@ router.get('/:staffId/payments', async (req, res) => {
     res.status(500).json({ status: 'error', message: 'Failed to fetch payment history' });
   }
 });
+
 
 // ✅ Weekly payment summary for a specific staff (tenant-safe)
 router.get('/:staffId/payments/weekly', async (req, res) => {
@@ -1114,30 +1352,47 @@ router.post('/:staffId/payments', async (req, res) => {
   let {
     amount,
     date,
-    note = '',
-    payment_method = 'cash',
+    note = "",
+    payment_method = "cash",
     auto = false,
     scheduled_date,
-    repeat_type = 'none',
-    repeat_time
+    repeat_type = "none",
+    repeat_time,
   } = req.body;
 
-  console.log('📥 Payment request payload:', req.body);
-
-  // Normalize repeat fields
-  if (!auto || repeat_type === 'none') {
-    repeat_type = null;
-    repeat_time = null;
-  }
-
-  // Validate amount
-  amount = parseFloat(amount);
-  if ((amount === undefined || isNaN(amount)) || (amount === 0 && !auto)) {
-    return res.status(400).json({ status: 'error', message: 'Invalid or missing amount' });
-  }
+  console.log("📥 Payment request payload:", req.body);
 
   try {
-    // 💾 Insert payment (tenant-safe)
+    // 🚫 Step 1: Check for active auto schedule (tenant-safe)
+    const autoCheck = await pool.query(
+      `SELECT active, repeat_type, repeat_time
+       FROM scheduled_staff_payroll
+       WHERE restaurant_id = $1 AND staff_id = $2 AND active = true
+       LIMIT 1`,
+      [restaurantId, staffId]
+    );
+
+    if (autoCheck.rowCount > 0 && !auto) {
+      // ⚠️ There is already an active auto payroll for this staff
+      console.warn(`⚠️ Manual payment blocked — active auto schedule for staff ${staffId}`);
+      return res.status(409).json({
+        status: "error",
+        message: "Manual payment blocked: Auto payroll schedule already active for this staff.",
+      });
+    }
+
+    // ✅ Step 2: Normalize fields
+    if (!auto || repeat_type === "none") {
+      repeat_type = null;
+      repeat_time = null;
+    }
+
+    amount = parseFloat(amount);
+    if ((amount === undefined || isNaN(amount)) || (amount === 0 && !auto)) {
+      return res.status(400).json({ status: "error", message: "Invalid or missing amount" });
+    }
+
+    // ✅ Step 3: Insert payment
     await pool.query(
       `
       INSERT INTO staff_payments (
@@ -1157,13 +1412,13 @@ router.post('/:staffId/payments', async (req, res) => {
         scheduled_date || null,
         auto ? scheduled_date || null : date || new Date().toISOString().slice(0, 10),
         repeat_type,
-        repeat_time
+        repeat_time,
       ]
     );
 
     console.log(`✅ Payment saved for staff ${staffId}: ₺${amount} (${payment_method})`);
 
-    // 🔁 Save auto payroll plan if enabled
+    // 🔁 Step 4: Create or update auto payroll if applicable
     if (auto && repeat_type && repeat_time) {
       await pool.query(
         `
@@ -1180,13 +1435,9 @@ router.post('/:staffId/payments', async (req, res) => {
       console.log(`📅 Auto payroll scheduled for staff ${staffId} (${repeat_type} @ ${repeat_time})`);
     }
 
-    // 📧 Fetch staff details for receipt
+    // 📧 Step 5: Send email only if manual and no auto
     const staffRes = await pool.query(
-      `
-      SELECT name, email, role
-      FROM staff
-      WHERE restaurant_id = $1 AND id = $2
-      `,
+      `SELECT name, email, role FROM staff WHERE restaurant_id = $1 AND id = $2`,
       [restaurantId, staffId]
     );
 
@@ -1202,26 +1453,222 @@ router.post('/:staffId/payments', async (req, res) => {
           <p><strong>Amount Paid:</strong> ₺${amount.toFixed(2)}</p>
           <p><strong>Method:</strong> ${payment_method}</p>
           <p><strong>Date:</strong> ${date || new Date().toISOString().slice(0, 10)}</p>
-          ${note ? `<p><strong>Note:</strong> ${note}</p>` : ''}
+          ${note ? `<p><strong>Note:</strong> ${note}</p>` : ""}
           <p style="margin-top:2em;">Thank you for your dedication!<br><strong>Beypro</strong></p>
         `;
         await sendEmail(email, subject, html, true);
         console.log(`📧 Payroll email sent to ${email}`);
-      } else {
-        console.warn(`⚠️ No email found for staff ${staffId}`);
+      } else if (auto) {
+        console.log(`ℹ️ Auto payment for staff ${staffId} — email skipped intentionally`);
       }
     }
 
-    res.json({ status: 'success', message: 'Payment saved successfully' });
+    res.json({ status: "success", message: "Payment saved successfully" });
   } catch (err) {
-    console.error('❌ Payment insert error:', err.stack || err);
-    res.status(500).json({ status: 'error', message: 'Failed to save payment' });
+    console.error("❌ Payment insert error:", err.stack || err);
+    res.status(500).json({ status: "error", message: "Failed to save payment" });
+  }
+});
+// ✅ Disable or toggle auto payroll (tenant-safe)
+router.put('/:staffId/payments/auto/toggle', async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { staffId } = req.params;
+  const { active } = req.body; // expected true/false
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE scheduled_staff_payroll
+      SET active = $3, updated_at = NOW()
+      WHERE restaurant_id = $1 AND staff_id = $2
+      RETURNING *
+      `,
+      [restaurantId, staffId, active]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "No active auto payroll found for this staff",
+      });
+    }
+
+    console.log(
+      `⚙️ Auto payroll for staff ${staffId} toggled → ${active ? "active" : "inactive"}`
+    );
+    res.json({
+      status: "success",
+      message: `Auto payroll ${active ? "activated" : "disabled"} successfully`,
+      schedule: result.rows[0],
+    });
+  } catch (err) {
+    console.error("❌ Toggle auto payroll error:", err);
+    res
+      .status(500)
+      .json({ status: "error", message: "Failed to toggle auto payroll" });
+  }
+});
+
+router.delete('/:staffId/payments', async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { staffId } = req.params;
+  const { startDate, endDate } = req.body || {};
+
+  const staffIdNumber = Number(staffId);
+  if (!Number.isInteger(staffIdNumber)) {
+    return res
+      .status(400)
+      .json({ status: 'error', message: 'Invalid staff identifier' });
+  }
+  if (
+    startDate &&
+    endDate &&
+    new Date(startDate).getTime() > new Date(endDate).getTime()
+  ) {
+    return res
+      .status(400)
+      .json({ status: 'error', message: 'Start date must precede end date' });
+  }
+
+  try {
+    const clauses = ['restaurant_id = $1', 'staff_id = $2'];
+    const params = [restaurantId, staffIdNumber];
+    let index = 3;
+    const rangeExpr = 'COALESCE(payment_date, scheduled_date, created_at)::date';
+
+    if (startDate) {
+      clauses.push(`${rangeExpr} >= $${index}`);
+      params.push(startDate);
+      index += 1;
+    }
+    if (endDate) {
+      clauses.push(`${rangeExpr} <= $${index}`);
+      params.push(endDate);
+      index += 1;
+    }
+
+    const result = await pool.query(
+      `
+      DELETE FROM staff_payments
+      WHERE ${clauses.join(' AND ')}
+      RETURNING id
+      `,
+      params
+    );
+
+    res.json({
+      status: 'success',
+      deleted: result.rowCount,
+    });
+  } catch (err) {
+    console.error('❌ Clear payment history error:', err);
+    res
+      .status(500)
+      .json({ status: 'error', message: 'Failed to clear payment history' });
   }
 });
 
 
 
 
+// ✅ Fetch auto payment schedule (tenant-safe)
+router.get('/:staffId/payments/auto', async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { staffId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        ssp.repeat_type,
+        ssp.repeat_time,
+        ssp.active,
+        ssp.created_at,
+        ssp.updated_at,
+        latest.amount,
+        latest.payment_date,
+        latest.scheduled_date,
+        latest.payment_method,
+        latest.note
+      FROM scheduled_staff_payroll ssp
+      LEFT JOIN LATERAL (
+        SELECT
+          amount,
+          payment_date,
+          scheduled_date,
+          payment_method,
+          note
+        FROM staff_payments
+        WHERE restaurant_id = $1
+          AND staff_id = $2
+          AND auto = true
+        ORDER BY COALESCE(payment_date, scheduled_date) DESC NULLS LAST
+        LIMIT 1
+      ) AS latest ON TRUE
+      WHERE ssp.restaurant_id = $1 AND ssp.staff_id = $2
+      `,
+      [restaurantId, staffId]
+    );
+
+    if (result.rowCount > 0) {
+      const row = result.rows[0];
+      return res.json({
+        repeat_type: row.repeat_type,
+        repeat_time: row.repeat_time,
+        active: row.active,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        amount: row.amount,
+        scheduled_date: row.scheduled_date,
+        last_payment_date: row.payment_date,
+        payment_method: row.payment_method,
+        note: row.note,
+      });
+    }
+
+    // Fallback: no schedule row yet, but return latest auto payment if exists
+    const latestOnly = await pool.query(
+      `
+      SELECT
+        amount,
+        payment_date,
+        scheduled_date,
+        payment_method,
+        note
+      FROM staff_payments
+      WHERE restaurant_id = $1
+        AND staff_id = $2
+        AND auto = true
+      ORDER BY COALESCE(payment_date, scheduled_date) DESC NULLS LAST
+      LIMIT 1
+      `,
+      [restaurantId, staffId]
+    );
+
+    if (latestOnly.rowCount === 0) {
+      return res.json({
+        active: false,
+        repeat_type: null,
+        repeat_time: null,
+      });
+    }
+
+    const latest = latestOnly.rows[0];
+    res.json({
+      active: false,
+      repeat_type: null,
+      repeat_time: null,
+      amount: latest.amount,
+      scheduled_date: latest.scheduled_date,
+      last_payment_date: latest.payment_date,
+      payment_method: latest.payment_method,
+      note: latest.note,
+    });
+  } catch (err) {
+    console.error("❌ Auto payment fetch error:", err);
+    res.status(500).json({ status: "error", message: "Failed to fetch auto payment" });
+  }
+});
 
 
 // Get all drivers

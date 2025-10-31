@@ -271,25 +271,7 @@ router.put("/:id", async (req, res) => {
 
 
 
-// ✅ Delete product
-router.delete("/:id", async (req, res) => {
-  const restaurantId = req.user.restaurant_id;
-  const { id } = req.params;
 
-  try {
-    const result = await pool.query(
-      `DELETE FROM products WHERE restaurant_id=$1 AND id=$2 RETURNING id, group_name AS name`,
-      [restaurantId, id]
-    );
-    if (result.rowCount === 0)
-      return res.status(404).json({ status: "error", message: "Product not found" });
-
-    res.json({ status: "success", message: "Product deleted", product: result.rows[0] });
-  } catch (err) {
-    console.error("❌ Delete product error:", err);
-    res.status(500).json({ status: "error", message: "Failed to delete product" });
-  }
-});
 
 // ✅ Bulk delete
 router.delete("/", async (req, res) => {
@@ -543,67 +525,146 @@ router.delete("/extras-group/:id", async (req, res) => {
 });
 
 
-// ✅ Get categories
-router.get("/categories", async (req, res) => {
+// =============================
+// 🔧 CATEGORY ROUTES (safe version)
+// =============================
+router.get("/categories", authMiddleware, async (req, res) => {
   const restaurantId = req.user.restaurant_id;
-  if (!restaurantId) {
-    return res
-      .status(400)
-      .json({ status: "error", message: "Invalid restaurant" });
-  }
+  const idText = restaurantId?.toString();
 
   try {
     await ensureCategoriesTable();
-    const restaurantIdAsText = restaurantId.toString();
+
+    // fetch all categories for this tenant
     const { rows } = await pool.query(
-      `
-      SELECT name
-      FROM (
-        SELECT DISTINCT category AS name
-        FROM products
-        WHERE restaurant_id::text = $1
-          AND category IS NOT NULL
-          AND TRIM(category) <> ''
-        UNION
-        SELECT DISTINCT name
-        FROM categories
-        WHERE restaurant_id = $1
-      ) AS combined
-      ORDER BY name
-      `,
-      [restaurantIdAsText]
+      `SELECT name FROM categories WHERE restaurant_id = $1 ORDER BY name`,
+      [idText]
     );
-    res.json(rows.map((r) => r.name));
+    const names = rows.map((r) => r.name);
+    res.json(names);
   } catch (err) {
     console.error("❌ Fetch categories error:", err);
-    res.status(500).json({ status: "error", message: "Failed to fetch categories" });
+    res.status(500).json({ error: "Failed to fetch categories" });
   }
 });
 
-// ✅ Add category
-router.post("/categories", async (req, res) => {
-  const restaurantId = req.user.restaurant_id;
+router.post("/categories", authMiddleware, async (req, res) => {
+  const restaurantId = req.user?.restaurant_id;
   const { category } = req.body;
-  if (!category || !category.trim())
-    return res.status(400).json({ status: "error", message: "Category required" });
+
+  console.log("📥 [POST /categories] Incoming body:", req.body);
+  console.log("🏷️ restaurant_id from token:", restaurantId);
+
+  if (!restaurantId) {
+    return res.status(400).json({ error: "Missing restaurant_id in token" });
+  }
+
+  if (!category || !category.trim()) {
+    return res.status(400).json({ error: "Category name required" });
+  }
 
   try {
     await ensureCategoriesTable();
-    const normalizedCategory = category.trim();
-    await pool.query(
-      `
-      INSERT INTO categories (restaurant_id,name)
-      VALUES ($1,$2)
-      ON CONFLICT (restaurant_id,name) DO NOTHING
-      `,
-      [restaurantId.toString(), normalizedCategory]
+
+    const result = await pool.query(
+      `INSERT INTO categories (restaurant_id, name)
+       VALUES ($1, $2)
+       ON CONFLICT (restaurant_id, name) DO NOTHING
+       RETURNING *`,
+      [restaurantId.toString(), category.trim()]
     );
-    res.json({ status: "success", message: `Category "${normalizedCategory}" added` });
+
+    console.log("✅ Insert result:", result.rows);
+
+    res.json({
+      success: true,
+      inserted: result.rows,
+      category: category.trim(),
+    });
   } catch (err) {
     console.error("❌ Add category error:", err);
-    res.status(500).json({ status: "error", message: "Failed to add category" });
+    res.status(500).json({ error: "Failed to add category" });
   }
 });
+
+// ✏️ RENAME CATEGORY
+router.put("/categories", authMiddleware, async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const idText = restaurantId?.toString();
+  const { oldName, newName } = req.body;
+
+  if (!oldName || !newName) {
+    console.warn("⚠️ Rename category missing payload", req.body);
+    return res.status(400).json({ error: "Missing oldName or newName" });
+  }
+
+  try {
+    const client = await pool.connect();
+    await client.query("BEGIN");
+
+    // rename in categories table
+    await client.query(
+      `UPDATE categories
+       SET name = $1
+       WHERE restaurant_id = $2 AND name = $3`,
+      [newName.trim(), idText, oldName.trim()]
+    );
+
+    // rename in products table for this tenant
+    await client.query(
+      `UPDATE products
+       SET category = $1
+       WHERE restaurant_id = $2 AND category = $3`,
+      [newName.trim(), restaurantId, oldName.trim()]
+    );
+
+    await client.query("COMMIT");
+    client.release();
+
+    res.json({ success: true, oldName, newName });
+  } catch (err) {
+    console.error("❌ Rename category error:", err);
+    res.status(500).json({ error: "Failed to rename category" });
+  }
+});
+
+// 🗑 DELETE CATEGORY
+router.delete("/categories", authMiddleware, async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const idText = restaurantId?.toString();
+  const { category } = req.body;
+
+  if (!category) {
+    return res.status(400).json({ error: "Missing category name" });
+  }
+
+  try {
+    const client = await pool.connect();
+    await client.query("BEGIN");
+
+    // remove from categories
+    await client.query(
+      `DELETE FROM categories WHERE restaurant_id = $1 AND name = $2`,
+      [idText, category.trim()]
+    );
+
+    // remove category label from products but keep product
+    await client.query(
+      `UPDATE products SET category = NULL
+       WHERE restaurant_id = $1 AND category = $2`,
+      [restaurantId, category.trim()]
+    );
+
+    await client.query("COMMIT");
+    client.release();
+
+    res.json({ success: true, deleted: category });
+  } catch (err) {
+    console.error("❌ Delete category error:", err);
+    res.status(500).json({ error: "Failed to delete category" });
+  }
+});
+
 
 router.get("/:id", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
@@ -628,5 +689,24 @@ router.get("/:id", async (req, res) => {
   }
 });
 
+// ✅ Delete product
+router.delete("/:id", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      `DELETE FROM products WHERE restaurant_id=$1 AND id=$2 RETURNING id, group_name AS name`,
+      [restaurantId, id]
+    );
+    if (result.rowCount === 0)
+      return res.status(404).json({ status: "error", message: "Product not found" });
+
+    res.json({ status: "success", message: "Product deleted", product: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Delete product error:", err);
+    res.status(500).json({ status: "error", message: "Failed to delete product" });
+  }
+});
 // ✅ Protected routes below
 module.exports = router;
