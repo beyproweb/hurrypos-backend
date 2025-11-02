@@ -4,7 +4,7 @@ console.log("🔐 JWT_SECRET loaded =", process.env.JWT_SECRET ? "✅ OK" : "❌
 
 const express = require("express");
 const app = express();
-const pool = require("./db");
+const { pool } = require('./db');
 const cors = require("cors");
 
 const allowedOrigins = [
