@@ -33,6 +33,15 @@ const emitOrderReady = (io, restaurantId, orderId) => {
   io.to(`restaurant_${restaurantId}`).emit("order_ready", { orderId });
 };
 
+const emitDriverAssigned = (io, restaurantId, orderId, driverInfo = {}) => {
+  console.log(`📡 Emitting driver_assigned for order ${orderId}, restaurant: ${restaurantId}`);
+  io.to(`restaurant_${restaurantId}`).emit("driver_assigned", {
+    orderId,
+    driverId: driverInfo.driverId ?? driverInfo.driver_id ?? null,
+    driverName: driverInfo.driverName ?? driverInfo.driver_name ?? null,
+  });
+};
+
 // Emits when an order is delivered
 const emitOrderDelivered = (io, restaurantId, orderId) => {
   console.log(`📡 Emitting order_delivered for order ${orderId}, restaurant: ${restaurantId}`);
@@ -118,6 +127,7 @@ module.exports = {
   emitOrderConfirmed,
   emitOrderPreparing,
   emitOrderReady,
+  emitDriverAssigned,
   emitOrderDelivered,
   emitPaymentMade,
   emitStockCritical,

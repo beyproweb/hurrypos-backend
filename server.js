@@ -63,6 +63,10 @@ const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const { sendEmail } = require("./utils/notifications");
 
 app.use("/uploads", express.static(path.join(__dirname, "public", "uploads")));
+app.use(
+  "/uploads/receipts",
+  express.static(path.join(__dirname, "uploads", "receipts"))
+);
 
 // ✅ Serve notification sound files
 app.use(

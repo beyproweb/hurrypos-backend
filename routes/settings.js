@@ -541,16 +541,17 @@ const result = await pool.query(
         eventSounds: {
           new_order: "new_order.mp3",
           order_preparing: "pop",
-          order_ready: "chime",
-          order_delivered: "success",
-          payment_made: "cash",
-          stock_low: "warning",
-          stock_restocked: "ding",
-          order_delayed: "alarm",
-          driver_arrived: "horn",
-        },
-      }
-    };
+        order_ready: "chime",
+        order_delivered: "success",
+        payment_made: "cash",
+        stock_low: "warning",
+        stock_restocked: "ding",
+        driver_assigned: "horn",
+        order_delayed: "alarm",
+        driver_arrived: "horn",
+      },
+    }
+  };
 
     const merged = section === "notifications"
       ? {
@@ -597,6 +598,7 @@ router.post("/:section", async (req, res) => {
         payment_made: "cash.mp3",
         stock_low: "warning.mp3",
         stock_restocked: "ding.mp3",
+        driver_assigned: "horn.mp3",
         order_delayed: "alarm.mp3",
         driver_arrived: "horn.mp3",
       },
