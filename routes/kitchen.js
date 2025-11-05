@@ -57,18 +57,22 @@ router.get("/kitchen-orders", async (req, res) => {
         o.customer_phone,
         o.customer_address,
         o.id AS order_id,
+        o.driver_id,
+        s.name AS driver_name,
         p.ingredients AS p_ingredients,
         p.extras AS p_extras,
         p.category AS product_category
       FROM order_items oi
       JOIN orders o ON oi.order_id = o.id
       LEFT JOIN products p ON oi.product_id = p.id
+      LEFT JOIN staff s ON s.id = o.driver_id
       WHERE oi.confirmed = true
         AND oi.kitchen_status IN ('new', 'preparing', 'ready')
         AND o.status IN ('occupied', 'confirmed', 'paid')
         AND (o.order_type = 'phone' OR o.order_type = 'packet' OR o.order_type = 'table')
-      ORDER BY o.created_at ASC
+      ORDER BY o.created_at ASC;
     `);
+
 
     const settings = await pool.query(
       `SELECT excluded_categories, excluded_items FROM kitchen_compile_settings ORDER BY id LIMIT 1`
@@ -112,6 +116,8 @@ router.get("/kitchen-orders", async (req, res) => {
           customer_phone: row.customer_phone,
           customer_address: row.customer_address,
           order_id: row.order_id,
+          driver_id: row.driver_id,
+    driver_name: row.driver_name,
         };
       });
 

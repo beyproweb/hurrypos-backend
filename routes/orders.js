@@ -64,7 +64,7 @@ function since(id) {
 }
 
 
-const { emitAlert, emitStockUpdate, emitOrderUpdate, emitOrderConfirmed, emitOrderDelivered, emitPaymentMade } = require('../utils/realtime');
+const { emitAlert, emitStockUpdate, emitOrderUpdate, emitOrderConfirmed, emitOrderDelivered, emitPaymentMade, emitOrderPreparing, emitDriverAssigned } = require('../utils/realtime');
 
 let ordersHasCreatedByColumn = null;
 async function hasOrdersCreatedByColumn() {
@@ -811,12 +811,14 @@ router.put("/:id", async (req, res) => {
   try {
     // 1️⃣ Get current payment_method for change log
     let old_method;
-    if (payment_method !== undefined) {
+    let old_driver_id;
+    if (payment_method !== undefined || driver_id !== undefined) {
       const oldOrder = await pool.query(
-        "SELECT payment_method FROM orders WHERE restaurant_id = $1 AND id = $2",
+        "SELECT payment_method, driver_id FROM orders WHERE restaurant_id = $1 AND id = $2",
         [req.user.restaurant_id, id]
       );
       old_method = oldOrder.rows[0]?.payment_method;
+      old_driver_id = oldOrder.rows[0]?.driver_id;
     }
 
     // 2️⃣ Build SET clause dynamically
@@ -869,6 +871,8 @@ const result = await pool.query(
       return res.status(404).json({ error: "Order not found" });
     }
 
+    const updatedOrder = result.rows[0];
+
     // 5️⃣ Log payment change (optional)
     if (
       _payment_method !== undefined &&
@@ -884,6 +888,34 @@ const result = await pool.query(
 
     // 6️⃣ Emit update to frontend
     setTimeout(() => emitOrderUpdate(req.app.get("io")), 250);
+
+    if (
+      driver_id !== undefined &&
+      Number(old_driver_id || 0) !== Number(updatedOrder.driver_id || 0) &&
+      updatedOrder.driver_id
+    ) {
+      let driverName = null;
+      try {
+        const driverRes = await pool.query(
+          "SELECT name, full_name, fullName FROM staff WHERE id = $1",
+          [updatedOrder.driver_id]
+        );
+        const row = driverRes.rows[0];
+        driverName =
+          row?.name || row?.full_name || row?.fullname || row?.fullName || null;
+      } catch (err) {
+        console.warn("⚠️ Failed to fetch driver name for notification:", err);
+      }
+
+      const ioRef = req.app.get("io");
+      if (ioRef) {
+        const payload = {
+          driverId: updatedOrder.driver_id,
+          driverName,
+        };
+        emitDriverAssigned(ioRef, req.user.restaurant_id, updatedOrder.id, payload);
+      }
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -1752,14 +1784,21 @@ await client.query("COMMIT");
 const io = getIO();
 io.to(`restaurant_${req.user.restaurant_id}`).emit("orders_updated");
 
-if (status === "ready") {
+if (status === "preparing" && orderIds.length) {
+  orderIds.forEach((orderId) =>
+    emitOrderPreparing(io, req.user.restaurant_id, orderId)
+  );
+}
+
+if (status === "ready" && orderIds.length) {
   io.to(`restaurant_${req.user.restaurant_id}`).emit("order_ready", { orderIds });
 }
 
-
-    if (status === "delivered" && deliveredOrderIds.length) {
-      emitOrderDelivered(io, deliveredOrderIds);
-    }
+if (status === "delivered" && deliveredOrderIds.length) {
+  deliveredOrderIds.forEach((orderId) =>
+    emitOrderDelivered(io, req.user.restaurant_id, orderId)
+  );
+}
 
     res.json({ updated: ids.length });
   } catch (err) {
