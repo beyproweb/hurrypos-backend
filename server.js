@@ -12,7 +12,10 @@ const allowedOrigins = [
   "https://pos.beypro.com",
   "https://www.pos.beypro.com",
   "https://hurrypos-frontend.onrender.com",
+  "https://beypro.com",
+  "https://www.beypro.com",
 ];
+
 
 const allowedOriginsNormalized = allowedOrigins.map((o) => o.toLowerCase());
 
