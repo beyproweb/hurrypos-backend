@@ -51,10 +51,10 @@ router.get("/products/:identifier", async (req, res) => {
         category,
         description,
         image,
-        available
+        COALESCE(visible, true) AS visible
       FROM products
       WHERE restaurant_id = $1
-        AND COALESCE(available, true) = true
+        AND COALESCE(visible, true) = true
       ORDER BY category, name, id
       `,
       [restaurantId]
