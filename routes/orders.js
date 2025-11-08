@@ -1332,17 +1332,22 @@ router.patch("/:id/reset-if-empty", async (req, res) => {
     const itemsRes = await client.query("SELECT COUNT(*) FROM order_items WHERE order_id = $1", [id]);
     const itemCount = parseInt(itemsRes.rows[0].count, 10);
 
-    if (itemCount === 0) {
-await client.query(
-  "UPDATE orders SET status = 'closed' WHERE restaurant_id = $1 AND id = $2",
-  [req.user.restaurant_id, id]
-);
+if (itemCount === 0) {
+  const typeRes = await client.query("SELECT order_type FROM orders WHERE id = $1", [id]);
+  const type = typeRes.rows[0]?.order_type;
 
-// 🔒 Tenant-safe emit
-io.to(`restaurant_${req.user.restaurant_id}`).emit("order_closed", { orderId: parseInt(id, 10) });
+  if (type !== 'quick') {
+    await client.query(
+      "UPDATE orders SET status = 'closed' WHERE restaurant_id = $1 AND id = $2",
+      [req.user.restaurant_id, id]
+    );
+    io.to(`restaurant_${req.user.restaurant_id}`).emit("order_closed", { orderId: parseInt(id, 10) });
+    return res.json({ message: "Order status reset to closed" });
+  }
 
-      return res.json({ message: "Order status reset to closed" });
-    }
+  return res.json({ message: "Quick order skipped from auto-close" });
+}
+
 
     res.json({ message: "Order has items, not resetting" });
   } catch (error) {

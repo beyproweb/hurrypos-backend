@@ -72,7 +72,7 @@ module.exports = (io) => {
   // ---------------- TRANSACTIONS ----------------
 
 // POST /suppliers/transactions
-// POST /suppliers/transactions (compile multiple rows into 1 receipt)
+// POST /suppliers/transactions — upload receipt + update stock + supplier due
 router.post("/transactions", upload.array("receipt"), async (req, res) => {
   try {
     const restaurantId = req.user.restaurant_id;
@@ -84,20 +84,21 @@ router.post("/transactions", upload.array("receipt"), async (req, res) => {
     let totalCost = 0;
     const itemDetails = [];
 
+    // 🔹 Compile receipt rows
     for (const r of rows) {
       const quantity = parseFloat(r.quantity) || 0;
       const total = parseFloat(r.total_cost) || 0;
       totalCost += total;
       itemDetails.push({
-        ingredient: r.ingredient,
+        ingredient: r.ingredient?.trim(),
         quantity,
-        unit: r.unit,
+        unit: r.unit?.trim(),
         total_cost: total,
         price_per_unit: quantity > 0 ? total / quantity : 0,
       });
     }
 
-    // get supplier and current due
+    // 🔹 Validate supplier
     const supplierRes = await pool.query(
       "SELECT total_due, name FROM suppliers WHERE restaurant_id=$1 AND id=$2",
       [restaurantId, supplier_id]
@@ -108,12 +109,12 @@ router.post("/transactions", upload.array("receipt"), async (req, res) => {
     let currentDue = parseFloat(supplierRes.rows[0].total_due) || 0;
     const newDue = currentDue + totalCost;
 
-    // optional receipt upload
+    // 🔹 Optional receipt upload
     const receiptUrl = req.files?.[0]
       ? `/uploads/receipts/${req.files[0].filename}`
       : null;
 
-    // insert compiled transaction
+    // 🔹 Save transaction
     const result = await pool.query(
       `INSERT INTO transactions
        (restaurant_id, supplier_id, ingredient, quantity, unit, total_cost, amount_paid, due_after, payment_method, delivery_date, receipt_url, items)
@@ -130,20 +131,43 @@ router.post("/transactions", upload.array("receipt"), async (req, res) => {
       ]
     );
 
-    // update supplier balance
+    // 🔹 Update supplier balance
     await pool.query(
       "UPDATE suppliers SET total_due=$1 WHERE restaurant_id=$2 AND id=$3",
       [newDue, restaurantId, supplier_id]
     );
 
+    // ✅ NEW PART: Upsert ingredients into stock
+    for (const item of itemDetails) {
+      const { ingredient, quantity, unit } = item;
+
+      if (!ingredient || !quantity || !unit) continue;
+
+      await pool.query(
+        `INSERT INTO stock (name, quantity, unit, supplier_id, restaurant_id)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (name, unit, restaurant_id)
+         DO UPDATE SET
+           quantity = stock.quantity + EXCLUDED.quantity,
+           supplier_id = EXCLUDED.supplier_id`,
+        [ingredient, quantity, unit, supplier_id, restaurantId]
+      );
+    }
+
+    // 🔹 Emit updates to frontend
     io.emit("stock-updated");
-    res.json({ success: true, transaction: result.rows[0] });
+    io.emit("supplier-updated", { supplier_id });
+
+    res.json({
+      success: true,
+      transaction: result.rows[0],
+      message: "Transaction saved and stock updated successfully",
+    });
   } catch (err) {
     console.error("❌ Error compiling receipt:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
-
 
 
 // ---------------- INGREDIENTS ----------------
