@@ -53,57 +53,44 @@ router.use((req, res, next) => {
 
 // ✅ Get all products for current restaurant
 
+// ✅ Public + Auth route for /products
 router.get("/", async (req, res) => {
   try {
-    const identifier = (req.query.identifier || "").toString().trim();
+    const identifier = req.query.identifier;
+    let restaurantId = null;
 
-    // ✅ Public path for QR menu requests (identifier present)
-    if (identifier) {
-      let restaurantId;
-      if (/^\d+$/.test(identifier)) {
-        restaurantId = Number(identifier);
-      } else {
-        const { rows } = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [identifier]);
-        restaurantId = rows[0]?.id;
-      }
-      if (!restaurantId) return res.status(400).json({ error: "Invalid restaurant" });
-
-      const { rows } = await pool.query(
-        `SELECT *
-           FROM products
-          WHERE restaurant_id = $1
-            AND visible = true
-          ORDER BY id ASC`,
-        [restaurantId]
+    // 🔐 1. If logged-in user
+    if (req.user && req.user.restaurant_id) {
+      restaurantId = req.user.restaurant_id;
+    }
+    // 🌐 2. Else, fallback to identifier
+    else if (identifier) {
+      const r = await pool.query(
+        "SELECT id FROM restaurants WHERE slug = $1 OR id::text = $1 LIMIT 1",
+        [identifier]
       );
-      return res.json(rows);
+      if (r.rows.length === 0)
+        return res.status(404).json({ error: "Restaurant not found" });
+      restaurantId = r.rows[0].id;
+    } else {
+      return res
+        .status(400)
+        .json({ error: "Missing restaurant identifier or token" });
     }
 
-    // ✅ Authenticated dashboard path (no identifier → rely on JWT)
-    const restaurantId = await resolveRestaurantId(req);
-    if (!restaurantId) {
-      return res.status(400).json({ error: "Invalid restaurant" });
-    }
-
-    log("/api/products", "GET", { restaurantId });
-
-    const result = await pool.query(
-      `
-      SELECT id, name, category, price, preparation_time, description,
-             discount_type, discount_value, visible, tags, allergens,
-             promo_start, promo_end, image, image_url, ingredients, extras,
-             selected_extras_group, created_at
-        FROM products
-       WHERE restaurant_id = $1
-       ORDER BY id DESC
-      `,
+    // 🛍️ Fetch products
+    const { rows: products } = await pool.query(
+      `SELECT id, name, price, category, image, description, available
+       FROM products
+       WHERE restaurant_id = $1 AND available = true
+       ORDER BY category, name`,
       [restaurantId]
     );
 
-    res.json(result.rows);
+    res.json(products);
   } catch (err) {
-    console.error("❌ Fetch products error:", err);
-    res.status(500).json({ status: "error", message: "Failed to fetch products" });
+    console.error("❌ /products public fetch failed:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -587,6 +574,7 @@ router.post("/categories", authMiddleware, async (req, res) => {
   }
 });
 
+
 // ✏️ RENAME CATEGORY
 router.put("/categories", authMiddleware, async (req, res) => {
   const restaurantId = req.user.restaurant_id;
@@ -686,6 +674,29 @@ router.get("/:id", async (req, res) => {
   } catch (err) {
     console.error("❌ Fetch product error:", err);
     res.status(500).json({ status: "error", message: "Failed to fetch product" });
+  }
+});
+
+// 📦 Public QR Menu fetch
+router.get("/public/products", async (req, res) => {
+  try {
+    const identifier = req.query.identifier;
+    if (!identifier) return res.status(400).json({ error: "Missing identifier" });
+
+    const { rows } = await pool.query(
+      `SELECT p.*
+       FROM products p
+       JOIN restaurants r ON r.id = p.restaurant_id
+       WHERE r.slug = $1 OR r.id::text = $1
+       AND p.is_active = true
+       ORDER BY p.category, p.name`,
+      [identifier]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error("❌ Public products fetch failed:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
