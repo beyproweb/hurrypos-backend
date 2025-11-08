@@ -3,6 +3,52 @@ const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 
+// ✅ Public + Auth route for fetching products (supports QR identifier)
+router.get("/", async (req, res, next) => {
+  try {
+    const identifier = req.query.identifier;
+    let restaurantId = null;
+
+    // 1️⃣ If logged-in POS user
+    if (req.user && req.user.restaurant_id) {
+      restaurantId = req.user.restaurant_id;
+    }
+    // 2️⃣ Else via public QR link
+    else if (identifier) {
+      const r = await pool.query(
+        "SELECT id FROM restaurants WHERE slug = $1 OR id::text = $1 LIMIT 1",
+        [identifier]
+      );
+      if (r.rows.length === 0) {
+        return res.status(404).json({ error: "Restaurant not found" });
+      }
+      restaurantId = r.rows[0].id;
+    } else {
+      return res
+        .status(400)
+        .json({ error: "Missing restaurant identifier or auth token" });
+    }
+
+    // 3️⃣ Fetch products
+    const { rows } = await pool.query(
+      `SELECT id, name, price, category, description, image, available
+       FROM products
+       WHERE restaurant_id = $1 AND available = true
+       ORDER BY category, name`,
+      [restaurantId]
+    );
+
+    return res.json(rows);
+  } catch (err) {
+    console.error("❌ Error fetching products:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// 🛡️ All other product routes remain protected
+router.use(authMiddleware);
+
+
 async function resolveRestaurantId(req) {
   const identifier = req.query.identifier;
   let restaurantId = req.user?.restaurant_id;
@@ -51,48 +97,7 @@ router.use((req, res, next) => {
   });
 });
 
-// ✅ Get all products for current restaurant
 
-// ✅ Public + Auth route for /products
-router.get("/", async (req, res) => {
-  try {
-    const identifier = req.query.identifier;
-    let restaurantId = null;
-
-    // 🔐 1. If logged-in user
-    if (req.user && req.user.restaurant_id) {
-      restaurantId = req.user.restaurant_id;
-    }
-    // 🌐 2. Else, fallback to identifier
-    else if (identifier) {
-      const r = await pool.query(
-        "SELECT id FROM restaurants WHERE slug = $1 OR id::text = $1 LIMIT 1",
-        [identifier]
-      );
-      if (r.rows.length === 0)
-        return res.status(404).json({ error: "Restaurant not found" });
-      restaurantId = r.rows[0].id;
-    } else {
-      return res
-        .status(400)
-        .json({ error: "Missing restaurant identifier or token" });
-    }
-
-    // 🛍️ Fetch products
-    const { rows: products } = await pool.query(
-      `SELECT id, name, price, category, image, description, available
-       FROM products
-       WHERE restaurant_id = $1 AND available = true
-       ORDER BY category, name`,
-      [restaurantId]
-    );
-
-    res.json(products);
-  } catch (err) {
-    console.error("❌ /products public fetch failed:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
 
 // ----------------- PRODUCTS -----------------
 
