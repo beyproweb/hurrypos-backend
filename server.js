@@ -163,7 +163,9 @@ app.use("/api/auth", authRoutes); // public login/register
 app.use("/api/public", require("./routes/publicQR"));
 
 const authMiddleware = require("./middleware/authMiddleware");
-
+app.get("/api/me", authMiddleware, (req, res) => {
+  res.json(req.user); // ✅ returns current user info
+});
 // Settings, Printers
 app.use("/api/user-settings", require("./routes/userSettings"));
 app.use("/api/printer-settings", require("./routes/printer"));
