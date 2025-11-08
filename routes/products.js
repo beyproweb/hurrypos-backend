@@ -2,6 +2,35 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const jwt = require("jsonwebtoken");
+
+const JWT_SECRET = process.env.JWT_SECRET || "beypro_secret_2025";
+const decodeOptionalAuth = (req) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return { user: null, error: null };
+  if (!authHeader.startsWith("Bearer ")) {
+    return { user: null, error: "Malformed Authorization header" };
+  }
+
+  try {
+    const token = authHeader.slice(7).trim();
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded?.restaurant_id) {
+      return { user: null, error: "Token missing restaurant_id" };
+    }
+    return {
+      user: {
+        id: decoded.id,
+        name: decoded.name,
+        role: decoded.role,
+        restaurant_id: decoded.restaurant_id,
+      },
+      error: null,
+    };
+  } catch (err) {
+    return { user: null, error: "Invalid or expired token" };
+  }
+};
 
 // ✅ Public + Auth route for fetching products (supports QR identifier)
 router.get("/", async (req, res, next) => {
@@ -9,10 +38,17 @@ router.get("/", async (req, res, next) => {
     const identifier = req.query.identifier;
     let restaurantId = null;
 
-    // 1️⃣ If logged-in POS user
-    if (req.user && req.user.restaurant_id) {
-      restaurantId = req.user.restaurant_id;
+    // 1️⃣ If logged-in POS user (token optional but preferred)
+    const { user, error } = decodeOptionalAuth(req);
+    if (error) {
+      return res.status(401).json({ error });
     }
+
+    if (user?.restaurant_id) {
+      req.user = user;
+      restaurantId = user.restaurant_id;
+    }
+
     // 2️⃣ Else via public QR link
     else if (identifier) {
       const r = await pool.query(
@@ -32,9 +68,17 @@ if (r.rows.length === 0) {
 
     // 3️⃣ Fetch products
     const { rows } = await pool.query(
-      `SELECT id, name, price, category, description, image, available
+      `SELECT
+         id,
+         name,
+         price,
+         category,
+         description,
+         image,
+         COALESCE(visible, true) AS visible
        FROM products
-       WHERE restaurant_id = $1 AND available = true
+       WHERE restaurant_id = $1
+         AND COALESCE(visible, true) = true
        ORDER BY category, name`,
       [restaurantId]
     );
@@ -700,10 +744,10 @@ router.get("/public/products", async (req, res) => {
         category,
         description,
         image,
-        available
+        COALESCE(visible, true) AS visible
       FROM products
       WHERE restaurant_id = $1
-        AND COALESCE(available, true) = true
+        AND COALESCE(visible, true) = true
       ORDER BY category, name, id
       `,
       [rows[0].id]
