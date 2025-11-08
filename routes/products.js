@@ -672,20 +672,44 @@ router.get("/:id", async (req, res) => {
 // 📦 Public QR Menu fetch
 router.get("/public/products", async (req, res) => {
   try {
-    const identifier = req.query.identifier;
-    if (!identifier) return res.status(400).json({ error: "Missing identifier" });
+    const identifier = (req.query.identifier || "").trim();
+    if (!identifier) {
+      return res.status(400).json({ error: "Missing identifier" });
+    }
 
     const { rows } = await pool.query(
-      `SELECT p.*
-       FROM products p
-       JOIN restaurants r ON r.id = p.restaurant_id
-       WHERE r.slug = $1 OR r.id::text = $1
-       AND p.is_active = true
-       ORDER BY p.category, p.name`,
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1 OR id::text = $1 OR qr_code_id = $1
+      LIMIT 1
+      `,
       [identifier]
     );
 
-    res.json(rows);
+    if (!rows.length) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    const { rows: products } = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        price,
+        category,
+        description,
+        image,
+        available
+      FROM products
+      WHERE restaurant_id = $1
+        AND COALESCE(available, true) = true
+      ORDER BY category, name, id
+      `,
+      [rows[0].id]
+    );
+
+    res.json(products);
   } catch (err) {
     console.error("❌ Public products fetch failed:", err);
     res.status(500).json({ error: "Server error" });

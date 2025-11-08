@@ -21,22 +21,46 @@ router.get("/qr-resolve/:code", async (req, res) => {
 // ✅ New: GET /api/public/products/:slugOrCode
 router.get("/products/:identifier", async (req, res) => {
   try {
-    const { identifier } = req.params;
+    const identifier = (req.params.identifier || "").trim();
+    if (!identifier) {
+      return res.status(400).json({ error: "Missing identifier" });
+    }
 
-    // identifier may be slug or qr_code_id
+    // identifier may be slug, qr_code_id, or numeric id
     const { rows } = await pool.query(
-      "SELECT id FROM restaurants WHERE slug = $1 OR qr_code_id = $1 LIMIT 1",
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
+      LIMIT 1
+      `,
       [identifier]
     );
-    if (!rows.length) return res.status(404).json({ error: "Invalid restaurant" });
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Invalid restaurant" });
+    }
     const restaurantId = rows[0].id;
 
-    const products = await pool.query(
-      "SELECT * FROM products WHERE restaurant_id = $1 AND archived = false ORDER BY id",
+    const { rows: products } = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        price,
+        category,
+        description,
+        image,
+        available
+      FROM products
+      WHERE restaurant_id = $1
+        AND COALESCE(available, true) = true
+      ORDER BY category, name, id
+      `,
       [restaurantId]
     );
 
-    res.json(products.rows);
+    res.json(products);
   } catch (err) {
     console.error("❌ Public products fetch failed:", err);
     res.status(500).json({ error: "Server error" });
