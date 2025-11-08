@@ -19,9 +19,10 @@ router.get("/", async (req, res, next) => {
         "SELECT id FROM restaurants WHERE slug = $1 OR id::text = $1 LIMIT 1",
         [identifier]
       );
-      if (r.rows.length === 0) {
-        return res.status(404).json({ error: "Restaurant not found" });
-      }
+if (r.rows.length === 0) {
+  return res.status(404).json({ error: "Restaurant not found" });
+}
+
       restaurantId = r.rows[0].id;
     } else {
       return res
