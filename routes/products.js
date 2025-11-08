@@ -82,20 +82,6 @@ async function ensureCategoriesTable() {
   `);
 }
 
-router.use((req, res, next) => {
-  if (req.method === "GET" && req.query.identifier) {
-    return next();
-  }
-  return authMiddleware(req, res, () => {
-    if (!req.user || !req.user.restaurant_id) {
-      return res.status(401).json({
-        status: "error",
-        message: "Unauthorized: tenant not identified",
-      });
-    }
-    next();
-  });
-});
 
 
 
