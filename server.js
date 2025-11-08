@@ -160,6 +160,7 @@ if (process.env.IYZI_API_KEY && process.env.IYZI_SECRET) {
 // ========== AUTH ==========
 const authRoutes = require("./routes/auth");
 app.use("/api/auth", authRoutes); // public login/register
+app.use("/api/public", require("./routes/publicQR"));
 
 const authMiddleware = require("./middleware/authMiddleware");
 
@@ -190,6 +191,8 @@ app.use("/api/campaigns", require("./routes/campaigns"));
 app.use("/webhook", whatsappWebhook);
 // ✅ Mount KITCHEN router AFTER orders, with auth
 app.use("/api", kitchenRoutes);
+
+
 
 // ========== PROTECTED ROUTES ==========
 app.use("/api/products", require("./routes/products"));
@@ -236,9 +239,15 @@ app.get("/:slug", async (req, res, next) => {
   }
 
   try {
-    const { rows } = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [slug]);
+    const { rows } = await pool.query(
+      "SELECT id, qr_token FROM restaurants WHERE slug = $1",
+      [slug]
+    );
     if (rows.length) {
-      return res.redirect(302, `https://pos.beypro.com/qr-menu/${slug}`);
+      const { qr_token } = rows[0];
+     const target = `https://pos.beypro.com/qr-menu/${slug}/${rows[0].id}?token=${encodeURIComponent(qr_token)}`;
+return res.redirect(302, target);
+
     }
     return res.status(404).send("Restaurant not found");
   } catch (err) {
@@ -246,6 +255,7 @@ app.get("/:slug", async (req, res, next) => {
     return next(err);
   }
 });
+
 
 // Error catcher
 app.use((err, req, res, next) => {

@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 
+// ✅ protect all setting
 // ✅ protect all settings routes with tenant-safe auth
 router.use(authMiddleware);
 // Allowed setting sections
@@ -10,6 +11,79 @@ const allowedSections = [
   "notifications", "appearance", "payments", "register",
   "users", "subscription", "integrations", "log_files" ,"localization"
 ];
+
+
+// inside settings.js
+const jwt = require("jsonwebtoken");
+
+// POST /api/settings/qr-token
+router.post("/qr-token", async (req, res) => {
+  try {
+    const restaurantId = req.user.restaurant_id;
+    const restaurantSlug = req.body.slug || "default";
+
+    const token = jwt.sign(
+      { restaurant_id: restaurantId, slug: restaurantSlug },
+      process.env.JWT_SECRET,
+      { expiresIn: "180d" } // valid for 6 months
+    );
+
+    await pool.query(
+      "UPDATE restaurants SET qr_token = $1 WHERE id = $2",
+      [token, restaurantId]
+    );
+
+    res.json({ success: true, token });
+  } catch (err) {
+    console.error("❌ Failed to generate QR token:", err);
+    res.status(500).json({ error: "Failed to generate QR token" });
+  }
+});
+
+// ✅ GET /api/settings/qr-link — generate full public QR link for this restaurant
+// ✅ GET /api/settings/qr-link — short permanent QR link
+router.get("/qr-link", async (req, res) => {
+  try {
+    const restaurantId = req.user.restaurant_id;
+    const { rows } = await pool.query(
+      "SELECT id, slug, qr_token, qr_code_id FROM restaurants WHERE id = $1",
+      [restaurantId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Restaurant not found" });
+
+    let { id, slug, qr_token, qr_code_id } = rows[0];
+    const jwt = require("jsonwebtoken");
+
+    // ⚙️ Generate token if missing
+    if (!qr_token) {
+      const token = jwt.sign(
+        { restaurant_id: restaurantId, slug },
+        process.env.JWT_SECRET,
+        { expiresIn: "180d" }
+      );
+      await pool.query("UPDATE restaurants SET qr_token = $1 WHERE id = $2", [token, restaurantId]);
+      qr_token = token;
+    }
+
+    // ⚙️ Generate short QR code id if missing
+    if (!qr_code_id) {
+      const shortid = Math.random().toString(36).substring(2, 8); // e.g. "beyp12"
+      await pool.query("UPDATE restaurants SET qr_code_id = $1 WHERE id = $2", [shortid, restaurantId]);
+      qr_code_id = shortid;
+      console.log(`✅ Generated new short QR id: ${shortid}`);
+    }
+
+    // ✅ Final short link (no JWT exposed)
+    const link = `https://pos.beypro.com/qr-menu/${slug}/${qr_code_id}`;
+
+    res.json({ success: true, link });
+  } catch (err) {
+    console.error("❌ Failed to build QR link:", err);
+    res.status(500).json({ error: "Failed to build QR link" });
+  }
+});
+
+
 
 const JSON_COLUMN_TYPES = new Set(["json", "jsonb"]);
 const DEFAULT_LOCALIZATION = { language: "en", currency: "₺ TRY" };
