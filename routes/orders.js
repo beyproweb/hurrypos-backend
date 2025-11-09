@@ -32,7 +32,10 @@ async function resolveRestaurantId(req) {
     if (/^\d+$/.test(identifier)) {
       restaurant_id = Number(identifier);
     } else {
-      const result = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [identifier]);
+      const result = await pool.query(
+        "SELECT id FROM restaurants WHERE slug = $1 OR qr_code_id = $1 LIMIT 1",
+        [identifier]
+      );
       restaurant_id = result.rows[0]?.id;
     }
   }
