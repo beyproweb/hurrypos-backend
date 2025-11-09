@@ -7,6 +7,7 @@ const app = express();
 const { pool } = require('./db');
 const cors = require("cors");
 
+// ✅ Correct CORS setup — one unified config only
 const allowedOrigins = [
   "http://localhost:5173",
   "https://pos.beypro.com",
@@ -16,13 +17,10 @@ const allowedOrigins = [
   "https://www.beypro.com",
 ];
 
-
-const allowedOriginsNormalized = allowedOrigins.map((o) => o.toLowerCase());
-
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin) return callback(null, true); // allow REST clients / curl
+      if (!origin) return callback(null, true); // Allow curl/Postman
       const normalized = origin.toLowerCase();
       if (
         allowedOrigins.some((o) => normalized === o.toLowerCase()) ||
@@ -40,16 +38,20 @@ app.use(
       "X-Requested-With",
       "Content-Type",
       "Accept",
-      "Authorization",
+      "Authorization", // ✅ essential
       "x-client-lang",
       "X-Client-Lang",
     ],
   })
 );
 
+// ❌ Remove this duplicate line
+// app.options("*", cors());
 
-// ✅ Preflight
-app.options("*", cors());
+
+
+
+
 
 const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
