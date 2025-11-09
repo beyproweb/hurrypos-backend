@@ -1255,21 +1255,47 @@ router.get("/:id", async (req, res) => {
       return res.status(400).json({ error: "Missing restaurant ID" });
     }
 
-    const order = await pool.query(
+    const orderRes = await pool.query(
       `
-      SELECT *
-      FROM orders
-      WHERE id = $1 AND restaurant_id = $2
+      SELECT
+        o.*,
+        r.name AS restaurant_name,
+        r.slug AS restaurant_slug,
+        r.logo_url AS restaurant_logo_url
+      FROM orders o
+      LEFT JOIN restaurants r ON r.id = o.restaurant_id
+      WHERE o.id = $1 AND o.restaurant_id = $2
       LIMIT 1
       `,
       [id, restaurant_id]
     );
 
-    if (order.rows.length === 0) {
+    if (orderRes.rows.length === 0) {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    res.json(order.rows[0]);
+    const record = orderRes.rows[0];
+    const payment_method =
+      record.payment_method ||
+      record.payment_type ||
+      record.pay_method ||
+      record.method ||
+      null;
+
+    const response = {
+      ...record,
+      payment_method,
+    };
+
+    if (!response.restaurant && (record.restaurant_name || record.restaurant_slug || record.restaurant_logo_url)) {
+      response.restaurant = {
+        name: record.restaurant_name || null,
+        slug: record.restaurant_slug || null,
+        logo_url: record.restaurant_logo_url || null,
+      };
+    }
+
+    res.json(response);
   } catch (err) {
     console.error("❌ Error fetching order by id:", err);
     res.status(500).json({ error: "Internal server error" });
