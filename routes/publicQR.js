@@ -96,4 +96,29 @@ router.get("/restaurant-info", async (req, res) => {
   }
 });
 
+// ✅ Public QR link endpoint (no auth required)
+router.get("/qr-link/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    const { rows } = await pool.query(
+      "SELECT slug, qr_code_id FROM restaurants WHERE slug = $1 LIMIT 1",
+      [slug]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    const { slug: s, qr_code_id } = rows[0];
+    const link = `https://pos.beypro.com/qr-menu/${s}/${qr_code_id}`;
+
+    res.json({ success: true, link });
+  } catch (err) {
+    console.error("❌ Public qr-link error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
 module.exports = router;
