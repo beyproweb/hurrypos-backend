@@ -75,7 +75,10 @@ if (r.rows.length === 0) {
          category,
          description,
          image,
-         COALESCE(visible, true) AS visible
+         COALESCE(visible, true) AS visible,
+         ingredients,
+         extras,
+         selected_extras_group
        FROM products
        WHERE restaurant_id = $1
          AND COALESCE(visible, true) = true
@@ -754,6 +757,9 @@ router.get("/public/products", async (req, res) => {
         category,
         description,
         image,
+        ingredients,
+        extras,
+        selected_extras_group,
         COALESCE(visible, true) AS visible
       FROM products
       WHERE restaurant_id = $1
