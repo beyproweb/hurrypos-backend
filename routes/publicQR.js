@@ -51,6 +51,9 @@ router.get("/products/:identifier", async (req, res) => {
         category,
         description,
         image,
+        ingredients,
+        extras,
+        selected_extras_group,
         COALESCE(visible, true) AS visible
       FROM products
       WHERE restaurant_id = $1
