@@ -139,6 +139,7 @@ async function ensureCategoriesTable() {
 
 
 // ✅ Add new product
+// ✅ Add new product
 router.post("/", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   const {
@@ -168,7 +169,12 @@ router.post("/", async (req, res) => {
     });
   }
 
-    // 👇 ADD THIS DEBUG LINE HERE
+  // 🧩 Normalize promo date fields
+  const normalizedPromoStart =
+    promo_start && promo_start.trim() !== "" ? promo_start : null;
+  const normalizedPromoEnd =
+    promo_end && promo_end.trim() !== "" ? promo_end : null;
+
   console.log("🛠️ Incoming product payload:", req.body);
 
   try {
@@ -196,8 +202,8 @@ router.post("/", async (req, res) => {
         visible !== false, // default true
         tags || "",
         allergens || "",
-        promo_start || null,
-        promo_end || null,
+        normalizedPromoStart, // ✅ safe timestamps
+        normalizedPromoEnd,   // ✅ safe timestamps
         image || null,
         image_url || null,
         ingredients || [],
@@ -216,7 +222,6 @@ router.post("/", async (req, res) => {
     res.status(500).json({ status: "error", message: "Failed to add product" });
   }
 });
-
 
 
 // ✅ Update product
@@ -252,6 +257,10 @@ router.put("/:id", async (req, res) => {
       message: "No valid fields provided for update",
     });
   }
+
+  // ✅ Normalize timestamp fields before update
+  if (updates.promo_start === "") updates.promo_start = null;
+  if (updates.promo_end === "") updates.promo_end = null;
 
   // 🔑 Ensure JSON fields are properly stringified
   ["ingredients", "extras", "selected_extras_group"].forEach((f) => {
@@ -290,6 +299,7 @@ router.put("/:id", async (req, res) => {
       .json({ status: "error", message: "Failed to update product" });
   }
 });
+
 
 
 

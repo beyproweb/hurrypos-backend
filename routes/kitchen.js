@@ -14,6 +14,23 @@ const authMiddleware = require("../middleware/authMiddleware");
 
 router.options("*", (req, res) => res.sendStatus(204));
 
+let ensuredTakeawayColumns = false;
+async function ensureTakeawayColumns() {
+  if (ensuredTakeawayColumns) return;
+  try {
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS pickup_time TEXT`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS takeaway_notes TEXT`
+    );
+    ensuredTakeawayColumns = true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure takeaway columns for kitchen:", err.message);
+  }
+}
 /* ✅ PUBLIC endpoint used by GlobalOrderAlert */
 router.get("/order-items/preparing", async (req, res) => {
   try {
@@ -37,6 +54,7 @@ router.use(authMiddleware);
 // ✅ GET all confirmed or paid order items for the kitchen
 router.get("/kitchen-orders", authMiddleware, async (req, res) => {
   try {
+    await ensureTakeawayColumns();
     const restaurantId = req.user?.restaurant_id;
     if (!restaurantId) {
       return res.status(401).json({ error: "Unauthorized: missing restaurant_id" });
@@ -62,6 +80,8 @@ router.get("/kitchen-orders", authMiddleware, async (req, res) => {
         o.customer_name,
         o.customer_phone,
         o.customer_address,
+        o.pickup_time,
+        o.takeaway_notes,
         o.id AS order_id,
         o.driver_id,
         s.name AS driver_name,
@@ -129,6 +149,8 @@ AND o.order_type IN ('phone', 'packet', 'table', 'takeaway')
         customer_name: row.customer_name,
         customer_phone: row.customer_phone,
         customer_address: row.customer_address,
+        pickup_time: row.pickup_time,
+        takeaway_notes: row.takeaway_notes,
         order_id: row.order_id,
         driver_id: row.driver_id,
         driver_name: row.driver_name,

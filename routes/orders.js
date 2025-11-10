@@ -91,6 +91,27 @@ async function hasOrdersCreatedByColumn() {
   return ordersHasCreatedByColumn;
 }
 
+let ordersHasTakeawayFields = null;
+async function ensureTakeawayFields() {
+  if (ordersHasTakeawayFields === true) return true;
+  try {
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS pickup_time TEXT`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS takeaway_notes TEXT`
+    );
+    ordersHasTakeawayFields = true;
+    return true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure takeaway columns:", err.message);
+    ordersHasTakeawayFields = false;
+    return false;
+  }
+}
+
 
 // ---- Shared payload builder for printer (no order_number) ----
 async function buildFullOrderPayload(orderId, restaurantId) {
@@ -237,10 +258,18 @@ router.post("/", async (req, res) => {
       customer_name,
       customer_phone,
       customer_address,
-      payment_method
+      payment_method,
     } = req.body;
 
+    const pickupTime = req.body.pickup_time ?? req.body.pickupTime ?? null;
+    const takeawayNotes =
+      req.body.takeaway_notes ??
+      req.body.notes ??
+      req.body.takeawayNotes ??
+      null;
+
     console.log("ORDER TYPE from payload:", order_type);
+    const includeTakeawayFields = await ensureTakeawayFields();
     const hasCreatedByColumn = await hasOrdersCreatedByColumn();
     await client.query("BEGIN");
 
@@ -250,49 +279,29 @@ const initialStatus =
   order_type === "phone" ? "occupied" :
   "occupied";
 
-const orderInsertQuery = hasCreatedByColumn
-  ? `
-    INSERT INTO orders (
-      restaurant_id,
-      table_number, status, total, order_type,
-      customer_name, customer_phone, customer_address, payment_method,
-      created_by
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-    RETURNING *
-  `
-  : `
-    INSERT INTO orders (
-      restaurant_id,
-      table_number, status, total, order_type,
-      customer_name, customer_phone, customer_address, payment_method
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    RETURNING *
-  `;
+    let createdBy = null;
+    if (hasCreatedByColumn && req.user?.id) {
+      const staffCreator = await pool.query(
+        `SELECT id FROM staff WHERE restaurant_id = $1 AND id = $2 LIMIT 1`,
+        [restaurantId, req.user.id]
+      );
+      if (staffCreator.rowCount) {
+        createdBy = req.user.id;
+      }
+    }
 
-const staffCreator = hasCreatedByColumn && req.user?.id
-  ? await pool.query(
-      `SELECT id FROM staff WHERE restaurant_id = $1 AND id = $2 LIMIT 1`,
-      [restaurantId, req.user.id]
-    )
-  : { rowCount: 0 };
-const createdBy = staffCreator.rowCount ? req.user.id : null;
-
-const orderInsertParams = hasCreatedByColumn
-  ? [
-      restaurantId,
-      table_number || null,
-      initialStatus,
-      total,
-      order_type || null,
-      customer_name || null,
-      customer_phone || null,
-      customer_address || null,
-      payment_method || null,
-      createdBy,
-    ]
-  : [
+    const insertColumns = [
+      "restaurant_id",
+      "table_number",
+      "status",
+      "total",
+      "order_type",
+      "customer_name",
+      "customer_phone",
+      "customer_address",
+      "payment_method",
+    ];
+    const insertValues = [
       restaurantId,
       table_number || null,
       initialStatus,
@@ -304,7 +313,24 @@ const orderInsertParams = hasCreatedByColumn
       payment_method || null,
     ];
 
-const orderResult = await client.query(orderInsertQuery, orderInsertParams);
+    if (includeTakeawayFields) {
+      insertColumns.push("pickup_time", "takeaway_notes");
+      insertValues.push(pickupTime, takeawayNotes);
+    }
+
+    if (hasCreatedByColumn) {
+      insertColumns.push("created_by");
+      insertValues.push(createdBy);
+    }
+
+    const placeholders = insertColumns.map((_, idx) => `$${idx + 1}`).join(", ");
+    const orderInsertQuery = `
+      INSERT INTO orders (${insertColumns.join(", ")})
+      VALUES (${placeholders})
+      RETURNING *
+    `;
+
+const orderResult = await client.query(orderInsertQuery, insertValues);
 
 const order = orderResult.rows[0];
 
