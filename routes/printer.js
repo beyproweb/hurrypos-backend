@@ -6,50 +6,9 @@
 const express = require("express");
 const router = express.Router();
 
-const escpos = require("escpos");
-try {
-  escpos.USB = require("escpos-usb");
-} catch (e) {
-  // keep going; USB listing/printing will throw a helpful error later
-}
-escpos.Network = require("escpos-network");
-escpos.Serial = require("escpos-serialport");
-
+const { escpos, makeDevice, cleanErr, toHex } = require("../utils/printerHelpers");
 const { SerialPort } = require("serialport");
-
-// ---------- helpers ----------
-function toHex(n) {
-  if (typeof n !== "number") return null;
-  return "0x" + n.toString(16).padStart(4, "0");
-}
-function parseHex(h) {
-  if (typeof h === "number") return h;
-  if (typeof h !== "string") return null;
-  const s = h.toLowerCase().replace(/^0x/, "");
-  const v = parseInt(s, 16);
-  return Number.isFinite(v) ? v : null;
-}
-function cleanErr(e) {
-  return (e && (e.message || e.toString())) || "unknown";
-}
-function makeDevice({ iface, vendorId, productId, path, baudRate, host, port }) {
-  if (iface === "usb") {
-    if (!escpos.USB) throw new Error("USB support not available (install escpos-usb and libusb).");
-    const v = parseHex(vendorId);
-    const p = parseHex(productId);
-    if (v == null || p == null) throw new Error("Provide vendorId and productId like '0x04b8' and '0x0e15'.");
-    return new escpos.USB(v, p);
-  }
-  if (iface === "serial") {
-    if (!path) throw new Error("Provide serial 'path' (e.g., /dev/ttyUSB0 or COM3).");
-    return new escpos.Serial(path, { baudRate: baudRate || 9600 });
-  }
-  if (iface === "network") {
-    if (!host) throw new Error("Provide network 'host' (printer IP).");
-    return new escpos.Network(host, port || 9100);
-  }
-  throw new Error("Unsupported interface. Use one of: usb | serial | network");
-}
+const net = require("net");
 
 // ---------- routes ----------
 
@@ -176,6 +135,66 @@ router.post("/print", async (req, res) => {
       return res.status(500).json({ ok: false, error: "Print error: " + cleanErr(e2) });
     }
   });
+});
+
+function probeTcp(host, { port = 9100, timeout = 1200 } = {}) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    const started = Date.now();
+    let done = false;
+    const finish = (ok, error) => {
+      if (done) return;
+      done = true;
+      try { socket.destroy(); } catch {}
+      resolve({ host, port, ok, latency: Date.now() - started, error });
+    };
+    socket.setTimeout(timeout, () => finish(false, "timeout"));
+    socket.once("error", (err) => finish(false, err?.message || "socket error"));
+    socket.connect(port, host, () => finish(true));
+  });
+}
+
+router.post("/lan-scan", async (req, res) => {
+  try {
+    const {
+      hosts = [],
+      base,
+      from = 1,
+      to = 254,
+      port = 9100,
+      timeout = 1200,
+    } = req.body || {};
+
+    const explicitHosts = Array.isArray(hosts)
+      ? hosts.filter(Boolean)
+      : typeof hosts === "string"
+        ? hosts.split(",").map(h => h.trim()).filter(Boolean)
+        : [];
+
+    let generated = [];
+    if (base) {
+      const prefix = base.endsWith(".") ? base : `${base}.`;
+      const start = Math.max(1, Math.min(254, Number(from)));
+      const end = Math.max(start, Math.min(254, Number(to)));
+      for (let i = start; i <= end; i++) {
+        generated.push(`${prefix}${i}`);
+      }
+    }
+
+    const allHosts = [...new Set([...explicitHosts, ...generated])].slice(0, 64);
+    if (allHosts.length === 0) {
+      return res.status(400).json({ error: "Provide hosts[] or base range" });
+    }
+
+    const probes = await Promise.all(
+      allHosts.map(host => probeTcp(host, { port: Number(port) || 9100, timeout }))
+    );
+
+    res.json({ ok: true, printers: probes });
+  } catch (err) {
+    console.error("❌ LAN scan failed:", err);
+    res.status(500).json({ error: cleanErr(err) });
+  }
 });
 
 // Quick test ticket

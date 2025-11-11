@@ -9,6 +9,35 @@ module.exports = function(io) {
   const dlog = (...args) =>
     console.log(new Date().toISOString(), "[orders]", ...args);
   const authMiddleware = require("../middleware/authMiddleware");
+  const {
+    ensureCustomerDebtColumn,
+    increaseCustomerDebt,
+    decreaseCustomerDebt,
+  } = require("../utils/customerDebt");
+
+  let hasOrderDebtTracking = null;
+  async function ensureOrderDebtTracking() {
+    if (hasOrderDebtTracking !== null) return hasOrderDebtTracking;
+    try {
+      await pool.query(
+        `ALTER TABLE orders
+           ADD COLUMN IF NOT EXISTS debt_recorded_total NUMERIC(12,2) NOT NULL DEFAULT 0`
+      );
+      hasOrderDebtTracking = true;
+    } catch (err) {
+      console.warn("⚠️ Unable to ensure orders.debt_recorded_total column:", err.message);
+      hasOrderDebtTracking = false;
+    }
+    return hasOrderDebtTracking;
+  }
+  ensureCustomerDebtColumn();
+  ensureOrderDebtTracking();
+
+  const toMoney = (value) => {
+    const num = Number.parseFloat(value);
+    if (!Number.isFinite(num)) return 0;
+    return Math.round(num * 100) / 100;
+  };
 
   const PUBLIC_GET_PATTERNS = [/^\/$/, /^\/\d+$/, /^\/\d+\/items$/];
   router.use((req, res, next) => {
@@ -469,13 +498,49 @@ if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
 router.put("/:id/pay", async (req, res) => {
   const { id } = req.params;
   const { payment_method, total } = req.body;
-  const orderId = parseInt(id);
+  const orderId = parseInt(id, 10);
+  const restaurantId = req.user.restaurant_id;
 
   const client = await pool.connect();
   try {
+    await ensureOrderDebtTracking();
     await client.query("BEGIN");
 
     const hasCreatedByColumn = await hasOrdersCreatedByColumn();
+
+    const { rows: orderRows } = await client.query(
+      `SELECT
+         total,
+         is_paid,
+         customer_name,
+         customer_phone,
+         COALESCE(debt_recorded_total, 0) AS debt_recorded_total
+       FROM orders
+      WHERE restaurant_id = $1 AND id = $2
+      FOR UPDATE`,
+      [restaurantId, orderId]
+    );
+    if (!orderRows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order not found" });
+    }
+    const existingOrder = orderRows[0];
+
+    const amountPaid = toMoney(
+      total !== undefined && total !== null ? total : existingOrder.total
+    );
+    const recorded = toMoney(existingOrder.debt_recorded_total);
+    let debtReduction =
+      recorded > 0
+        ? amountPaid > 0
+          ? Math.min(recorded, amountPaid)
+          : recorded
+        : 0;
+    let nextRecordedTotal = Math.max(recorded - debtReduction, 0);
+    if (nextRecordedTotal > 0 && recorded > 0) {
+      debtReduction = recorded;
+      nextRecordedTotal = 0;
+    }
 
     // 1️⃣ Insert payment
     const paymentResult = await client.query(
@@ -487,14 +552,15 @@ router.put("/:id/pay", async (req, res) => {
 
     // 2️⃣ Update order
     const orderResult = await client.query(
-  `UPDATE orders
-   SET payment_method = $1,
-       total = $2,
-       is_paid = true
-   WHERE restaurant_id = $3 AND id = $4
-   RETURNING *`,
-  [payment_method, total, req.user.restaurant_id, orderId]
-);
+      `UPDATE orders
+          SET payment_method = $1,
+              total = $2,
+              is_paid = true,
+              debt_recorded_total = $5
+        WHERE restaurant_id = $3 AND id = $4
+        RETURNING *`,
+      [payment_method, total, restaurantId, orderId, nextRecordedTotal]
+    );
 
     if (hasCreatedByColumn && req.user?.id) {
       await client.query(
@@ -503,10 +569,9 @@ router.put("/:id/pay", async (req, res) => {
         SET created_by = COALESCE(created_by, $1)
         WHERE restaurant_id = $2 AND id = $3
         `,
-        [req.user.id, req.user.restaurant_id, orderId]
+        [req.user.id, restaurantId, orderId]
       );
     }
-
 
     // 3️⃣ Mark unpaid items as paid
     await client.query(
@@ -517,7 +582,14 @@ router.put("/:id/pay", async (req, res) => {
       [orderId]
     );
 
-    // ✅ FIX: DO NOT deliver anything here - keep kitchen_status unchanged!
+    if (debtReduction > 0 && existingOrder.customer_phone) {
+      await decreaseCustomerDebt(
+        client,
+        restaurantId,
+        { phone: existingOrder.customer_phone },
+        debtReduction
+      );
+    }
 
     const kitchenCheck = await client.query(
       `SELECT id, product_id, kitchen_status, paid_at
@@ -528,27 +600,19 @@ router.put("/:id/pay", async (req, res) => {
 
     console.log("🔍 Kitchen status after PAY:", kitchenCheck.rows);
 
-await client.query("COMMIT");
+    await client.query("COMMIT");
 
-// 🔒 tenant-safe orders_updated
-const restaurantId = req.user.restaurant_id;
-if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
-else io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+    if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
+    else io.to(`restaurant_${restaurantId}`).emit("orders_updated");
 
-// 🔥 Notify frontend that a payment was made
-emitPaymentMade(io, restaurantId, orderId, payment_method, total);
+    emitPaymentMade(io, restaurantId, orderId, payment_method, total);
 
+    console.log(`💸 [orders] payment_made emitted for restaurant_${restaurantId}, order ${orderId}`);
 
-
-console.log(`💸 [orders] payment_made emitted for restaurant_${restaurantId}, order ${orderId}`);
-
-res.json({
-  order: orderResult.rows[0],
-  payment: paymentResult.rows[0],
-});
-
-
-
+    res.json({
+      order: orderResult.rows[0],
+      payment: paymentResult.rows[0],
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Failed to update payment info:", err);
@@ -568,7 +632,25 @@ router.put("/:id/status", async (req, res) => {
   const client = await pool.connect();
 
   try {
+    await ensureOrderDebtTracking();
     await client.query("BEGIN");
+
+    const { rows: existingRows } = await client.query(
+      `SELECT
+         total,
+         is_paid,
+         customer_phone,
+         COALESCE(debt_recorded_total, 0) AS debt_recorded_total
+       FROM orders
+      WHERE id = $1 AND restaurant_id = $2
+      FOR UPDATE`,
+      [id, restaurantId]
+    );
+    if (!existingRows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order not found" });
+    }
+    const existingOrder = existingRows[0];
 
     const result = await client.query(
       `UPDATE orders
@@ -592,10 +674,49 @@ router.put("/:id/status", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
+    const updatedOrder = result.rows[0];
+    const becamePaid = updatedOrder.is_paid && !existingOrder.is_paid;
+
+    if (becamePaid) {
+      const recorded = toMoney(existingOrder.debt_recorded_total);
+      const amountReference = toMoney(
+        total !== undefined && total !== null ? total : existingOrder.total
+      );
+      let reduction =
+        recorded > 0
+          ? amountReference > 0
+            ? Math.min(recorded, amountReference)
+            : recorded
+          : 0;
+      let nextRecorded = Math.max(recorded - reduction, 0);
+      if (nextRecorded > 0 && recorded > 0) {
+        reduction = recorded;
+        nextRecorded = 0;
+      }
+
+      if (recorded > 0) {
+        await client.query(
+          `UPDATE orders
+              SET debt_recorded_total = $1
+            WHERE id = $2 AND restaurant_id = $3`,
+          [nextRecorded, id, restaurantId]
+        );
+      }
+
+      if (reduction > 0 && existingOrder.customer_phone) {
+        await decreaseCustomerDebt(
+          client,
+          restaurantId,
+          { phone: existingOrder.customer_phone },
+          reduction
+        );
+      }
+    }
+
     await client.query("COMMIT");
 
     io.to(`restaurant_${restaurantId}`).emit("orders_updated");
-    res.json(result.rows[0]);
+    res.json(updatedOrder);
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Failed to update order status:", err);
@@ -666,6 +787,35 @@ router.get("/driver-report", async (req, res) => {
   } catch (err) {
     console.error("❌ Error in /driver-report:", err);
     res.status(500).json({ error: "DB error" });
+  }
+});
+
+router.get("/debt/find", async (req, res) => {
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+  const phone = (req.query.phone || req.query.customer_phone || "").trim();
+  if (!phone) {
+    return res.status(400).json({ error: "customer_phone is required" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT *
+         FROM orders
+        WHERE restaurant_id = $1
+          AND customer_phone = $2
+          AND status = 'closed'
+          AND COALESCE(is_paid, false) = false
+          AND COALESCE(debt_recorded_total, 0) > 0
+        ORDER BY updated_at DESC NULLS LAST, id DESC
+        LIMIT 1`,
+      [restaurantId, phone]
+    );
+    if (!rows.length) return res.json(null);
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("❌ Failed to find debt order:", err);
+    res.status(500).json({ error: "Failed to find debt order" });
   }
 });
 
@@ -957,28 +1107,94 @@ const result = await pool.query(
 
 
 // POST /orders/:id/close
-// POST /orders/:id/close
 router.post("/:id/close", async (req, res) => {
   const { id } = req.params;
+  const restaurantId = req.user.restaurant_id;
   const client = await pool.connect();
   try {
+    await ensureOrderDebtTracking();
     await client.query("BEGIN");
 
-    const result = await client.query(
-  `UPDATE orders
-   SET status = 'closed'
-   WHERE restaurant_id = $1 AND id = $2
-   RETURNING *`,
-  [req.user.restaurant_id, id]
-);
+    const { rows } = await client.query(
+      `SELECT
+         id,
+         status,
+         total,
+         is_paid,
+         table_number,
+         customer_name,
+         customer_phone,
+         COALESCE(debt_recorded_total, 0) AS debt_recorded_total
+       FROM orders
+      WHERE restaurant_id = $1 AND id = $2
+      FOR UPDATE`,
+      [restaurantId, id]
+    );
 
-
-    if (result.rows.length === 0) {
+    if (!rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
     }
 
-    const order = result.rows[0];
+    const existing = rows[0];
+    if (existing.status === "closed") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Order already closed" });
+    }
+
+    const totalNow = toMoney(existing.total);
+    const recorded = toMoney(existing.debt_recorded_total);
+    const delta = existing.is_paid ? 0 : toMoney(totalNow - recorded);
+    const needsDebtAdjustment = delta !== 0 && !existing.is_paid;
+
+    if (needsDebtAdjustment) {
+      const phoneOk = (existing.customer_phone || "").trim();
+      if (!phoneOk) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "Customer phone is required before closing an unpaid order.",
+        });
+      }
+      if (delta > 0) {
+        const nameOk = (existing.customer_name || "").trim();
+        if (!nameOk) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: "Customer name is required before adding unpaid debt.",
+          });
+        }
+      }
+    }
+
+    const updated = await client.query(
+      `UPDATE orders
+          SET status = 'closed',
+              debt_recorded_total = $3
+        WHERE restaurant_id = $1 AND id = $2
+        RETURNING *`,
+      [restaurantId, id, existing.is_paid ? recorded : totalNow]
+    );
+
+    const order = updated.rows[0];
+
+    if (needsDebtAdjustment) {
+      if (delta > 0) {
+        await increaseCustomerDebt(
+          client,
+          restaurantId,
+          { name: existing.customer_name, phone: existing.customer_phone },
+          delta
+        );
+      } else if (delta < 0) {
+        await decreaseCustomerDebt(
+          client,
+          restaurantId,
+          { phone: existing.customer_phone },
+          Math.abs(delta)
+        );
+      }
+    }
+
     if (order.table_number) {
       await client.query(
         `UPDATE tables SET is_occupied = FALSE WHERE number = $1`,
@@ -986,12 +1202,16 @@ router.post("/:id/close", async (req, res) => {
       );
     }
 
-await client.query("COMMIT");
+    await client.query("COMMIT");
 
-// 🔒 Tenant-safe emit to this restaurant only
-io.to(`restaurant_${req.user.restaurant_id}`).emit("order_closed", { orderId: Number(order.id) });
-res.json({ message: "✅ Order closed" });
-
+    io.to(`restaurant_${restaurantId}`).emit("order_closed", { orderId: Number(order.id) });
+    res.json({
+      message: needsDebtAdjustment
+        ? delta > 0
+          ? "✅ Order closed and debt recorded"
+          : "✅ Order closed and debt adjusted"
+        : "✅ Order closed",
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error in closing order:", err);
@@ -1000,6 +1220,123 @@ res.json({ message: "✅ Order closed" });
     client.release();
   }
 });
+
+router.post("/:id/add-debt", async (req, res) => {
+  const { id } = req.params;
+  const restaurantId = req.user.restaurant_id;
+  const client = await pool.connect();
+  try {
+    await ensureOrderDebtTracking();
+    await client.query("BEGIN");
+
+    const payload = req.body || {};
+    const inputName = (payload.customer_name || "").trim();
+    const inputPhone = (payload.customer_phone || "").trim();
+
+    const { rows } = await client.query(
+      `SELECT
+         id,
+         total,
+         status,
+         is_paid,
+         table_number,
+         customer_name,
+         customer_phone,
+         COALESCE(debt_recorded_total, 0) AS debt_recorded_total
+       FROM orders
+      WHERE restaurant_id = $1 AND id = $2
+      FOR UPDATE`,
+      [restaurantId, id]
+    );
+
+    if (!rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const existing = rows[0];
+    if (existing.is_paid) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Paid orders cannot be added to debt" });
+    }
+
+    let customerName = (existing.customer_name || "").trim();
+    let customerPhone = (existing.customer_phone || "").trim();
+
+    if (!customerName && inputName) customerName = inputName;
+    if (!customerPhone && inputPhone) customerPhone = inputPhone;
+
+    if (!customerPhone) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Customer phone is required to track debt" });
+    }
+    if (!customerName) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Customer name is required to track debt" });
+    }
+
+    const currentTotal = toMoney(existing.total);
+    const recorded = toMoney(existing.debt_recorded_total);
+    const requestedAmount = toMoney(payload.amount);
+    let delta = currentTotal - recorded;
+    if (requestedAmount > 0) {
+      delta = requestedAmount;
+    }
+
+    if (delta <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "No remaining balance to add to debt" });
+    }
+
+    await increaseCustomerDebt(
+      client,
+      restaurantId,
+      { name: customerName, phone: customerPhone },
+      delta
+    );
+
+    const newRecordedTotal = recorded + delta;
+    const nextOrderTotal = Math.max(currentTotal, newRecordedTotal);
+    const updateResult = await client.query(
+      `UPDATE orders
+          SET status = 'closed',
+              is_paid = false,
+              debt_recorded_total = $3,
+              total = $4,
+              customer_name = $5,
+              customer_phone = $6
+        WHERE restaurant_id = $1 AND id = $2
+        RETURNING *`,
+      [restaurantId, id, newRecordedTotal, nextOrderTotal, customerName, customerPhone]
+    );
+
+    const order = updateResult.rows[0];
+
+    if (order.table_number) {
+      await client.query(
+        `UPDATE tables SET is_occupied = FALSE WHERE number = $1`,
+        [order.table_number]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    io.to(`restaurant_${restaurantId}`).emit("order_closed", { orderId: Number(order.id) });
+
+    res.json({
+      message: "✅ Order amount added to customer debt",
+      debt_added: delta,
+      order,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Failed to add order debt:", err);
+    res.status(500).json({ error: "Failed to add order debt" });
+  } finally {
+    client.release();
+  }
+});
+
 
 
 // Add to routes/orders.js or a debug file
@@ -2270,6 +2607,52 @@ router.get("/:raw", async (req, res) => {
   } catch (e) {
     console.error("🔥 [orders] resolver failed", e);
     return res.status(500).json({ error: "Failed to fetch order" });
+  }
+});
+// ✅ Merge all open orders with the same customer_name into one
+router.patch("/merge-by-customer", async (req, res) => {
+  const { customer_name } = req.body;
+  const restaurantId = req.user.restaurant_id;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1️⃣ Find all open orders for this customer
+    const { rows: openOrders } = await client.query(
+      `SELECT id, total FROM orders
+       WHERE restaurant_id = $1 AND status <> 'closed' AND LOWER(customer_name) = LOWER($2)
+       ORDER BY id ASC`,
+      [restaurantId, customer_name]
+    );
+
+    if (openOrders.length < 2) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "No multiple open orders found for this name." });
+    }
+
+    const target = openOrders[0];
+    const others = openOrders.slice(1);
+
+    // 2️⃣ Merge all others into target
+    for (const order of others) {
+      await client.query(`UPDATE order_items SET order_id = $1 WHERE order_id = $2`, [target.id, order.id]);
+      await client.query(`UPDATE sub_orders SET order_id = $1 WHERE order_id = $2`, [target.id, order.id]);
+      await client.query(`UPDATE orders SET status='closed', total=0 WHERE id=$1`, [order.id]);
+      await client.query(`UPDATE orders SET total = total + $2 WHERE id=$1`, [target.id, order.total || 0]);
+    }
+
+    await client.query("COMMIT");
+
+    // Emit update to frontend
+    io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+
+    res.json({ message: `Merged ${others.length} orders for ${customer_name}`, target_id: target.id });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ merge-by-customer failed:", err);
+    res.status(500).json({ error: "Failed to merge by customer" });
+  } finally {
+    client.release();
   }
 });
 

@@ -171,6 +171,7 @@ app.get("/api/me", authMiddleware, (req, res) => {
 // Settings, Printers
 app.use("/api/user-settings", require("./routes/userSettings"));
 app.use("/api/printer-settings", require("./routes/printer"));
+app.use("/api", require("./routes/cashDrawer"));
 
 // Subscription (register/login)
 app.use("/api", require("./routes/subscription"));
