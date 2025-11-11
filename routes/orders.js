@@ -23,9 +23,13 @@ module.exports = function(io) {
         `ALTER TABLE orders
            ADD COLUMN IF NOT EXISTS debt_recorded_total NUMERIC(12,2) NOT NULL DEFAULT 0`
       );
+      await pool.query(
+        `ALTER TABLE orders
+           ADD COLUMN IF NOT EXISTS debt_paid_at TIMESTAMPTZ`
+      );
       hasOrderDebtTracking = true;
     } catch (err) {
-      console.warn("⚠️ Unable to ensure orders.debt_recorded_total column:", err.message);
+      console.warn("⚠️ Unable to ensure orders debt tracking columns:", err.message);
       hasOrderDebtTracking = false;
     }
     return hasOrderDebtTracking;
@@ -497,7 +501,7 @@ if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
 // PUT /orders/:id/pay - Update payment info and insert a payment record
 router.put("/:id/pay", async (req, res) => {
   const { id } = req.params;
-  const { payment_method, total } = req.body;
+  const { payment_method, total, amount } = req.body;
   const orderId = parseInt(id, 10);
   const restaurantId = req.user.restaurant_id;
 
@@ -526,28 +530,29 @@ router.put("/:id/pay", async (req, res) => {
     }
     const existingOrder = orderRows[0];
 
-    const amountPaid = toMoney(
-      total !== undefined && total !== null ? total : existingOrder.total
-    );
+    const finalOrderTotal =
+      total !== undefined && total !== null ? total : existingOrder.total;
+    const paymentValue =
+      amount !== undefined && amount !== null ? amount : finalOrderTotal;
+    const amountPaid = toMoney(paymentValue);
     const recorded = toMoney(existingOrder.debt_recorded_total);
-    let debtReduction =
-      recorded > 0
-        ? amountPaid > 0
-          ? Math.min(recorded, amountPaid)
-          : recorded
-        : 0;
-    let nextRecordedTotal = Math.max(recorded - debtReduction, 0);
-    if (nextRecordedTotal > 0 && recorded > 0) {
-      debtReduction = recorded;
-      nextRecordedTotal = 0;
-    }
+    const debtReduction =
+      recorded > 0 && amountPaid > 0 ? Math.min(recorded, amountPaid) : 0;
+    const nextRecordedTotal = Math.max(recorded - debtReduction, 0);
+    const paidOff =
+      nextRecordedTotal === 0 &&
+      (recorded > 0
+        ? amountPaid >= recorded
+        : amountPaid >= toMoney(finalOrderTotal));
+
+    const markDebtPaid = debtReduction > 0;
 
     // 1️⃣ Insert payment
     const paymentResult = await client.query(
       `INSERT INTO payments (order_id, amount, payment_method)
        VALUES ($1, $2, $3)
        RETURNING *`,
-      [orderId, total, payment_method]
+      [orderId, amountPaid, payment_method]
     );
 
     // 2️⃣ Update order
@@ -555,23 +560,21 @@ router.put("/:id/pay", async (req, res) => {
       `UPDATE orders
           SET payment_method = $1,
               total = $2,
-              is_paid = true,
-              debt_recorded_total = $5
+              is_paid = $6,
+              debt_recorded_total = $5,
+              debt_paid_at = CASE WHEN $7 THEN NOW() ELSE debt_paid_at END
         WHERE restaurant_id = $3 AND id = $4
         RETURNING *`,
-      [payment_method, total, restaurantId, orderId, nextRecordedTotal]
+      [
+        payment_method,
+        finalOrderTotal,
+        restaurantId,
+        orderId,
+        nextRecordedTotal,
+        paidOff,
+        markDebtPaid && nextRecordedTotal === 0,
+      ]
     );
-
-    if (hasCreatedByColumn && req.user?.id) {
-      await client.query(
-        `
-        UPDATE orders
-        SET created_by = COALESCE(created_by, $1)
-        WHERE restaurant_id = $2 AND id = $3
-        `,
-        [req.user.id, restaurantId, orderId]
-      );
-    }
 
     // 3️⃣ Mark unpaid items as paid
     await client.query(
@@ -711,6 +714,15 @@ router.put("/:id/status", async (req, res) => {
           reduction
         );
       }
+
+      if (reduction > 0) {
+        await client.query(
+          `UPDATE orders
+              SET debt_paid_at = NOW()
+            WHERE id = $1 AND restaurant_id = $2`,
+          [id, restaurantId]
+        );
+      }
     }
 
     await client.query("COMMIT");
@@ -800,19 +812,36 @@ router.get("/debt/find", async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      `SELECT *
+      `SELECT
+          id,
+          table_number,
+          status,
+          total,
+          order_type,
+          created_at,
+          updated_at,
+          customer_name,
+          customer_phone,
+          COALESCE(debt_recorded_total, 0) AS debt_recorded_total
          FROM orders
         WHERE restaurant_id = $1
           AND customer_phone = $2
           AND status = 'closed'
           AND COALESCE(is_paid, false) = false
           AND COALESCE(debt_recorded_total, 0) > 0
-        ORDER BY updated_at DESC NULLS LAST, id DESC
-        LIMIT 1`,
+        ORDER BY updated_at DESC NULLS LAST, id DESC`,
       [restaurantId, phone]
     );
-    if (!rows.length) return res.json(null);
-    res.json(rows[0]);
+    if (!rows.length) return res.json({ orders: [], total_debt: 0 });
+    const normalized = rows.map((row) => ({
+      ...row,
+      debt_recorded_total: Number(row.debt_recorded_total || 0),
+    }));
+    const totalDebt = normalized.reduce(
+      (sum, order) => sum + (order.debt_recorded_total || 0),
+      0
+    );
+    res.json({ orders: normalized, total_debt: totalDebt });
   } catch (err) {
     console.error("❌ Failed to find debt order:", err);
     res.status(500).json({ error: "Failed to find debt order" });
@@ -875,6 +904,31 @@ res.json({ message: "Order items saved successfully" });
   } catch (err) {
     console.error("❌ Error saving order items:", err);
     res.status(500).json({ error: "Failed to save order items" });
+  }
+});
+
+router.get("/:id/payments", async (req, res) => {
+  const { id } = req.params;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+          p.id,
+          p.amount,
+          p.payment_method,
+          p.created_at
+       FROM payments p
+       JOIN orders o ON o.id = p.order_id
+      WHERE p.order_id = $1
+        AND o.restaurant_id = $2
+      ORDER BY p.created_at ASC`,
+      [id, restaurantId]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("❌ Failed to fetch order payments:", err);
+    res.status(500).json({ error: "Failed to fetch order payments" });
   }
 });
 
@@ -1304,7 +1358,8 @@ router.post("/:id/add-debt", async (req, res) => {
               debt_recorded_total = $3,
               total = $4,
               customer_name = $5,
-              customer_phone = $6
+              customer_phone = $6,
+              debt_paid_at = NULL
         WHERE restaurant_id = $1 AND id = $2
         RETURNING *`,
       [restaurantId, id, newRecordedTotal, nextOrderTotal, customerName, customerPhone]

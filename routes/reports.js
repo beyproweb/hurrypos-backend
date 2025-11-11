@@ -180,7 +180,8 @@ router.get("/history", async (req, res) => {
           receipt_id,
           customer_name,
           customer_address,
-          payment_method
+          payment_method,
+          debt_paid_at
         FROM orders
         WHERE status IN ('paid', 'closed')   -- ✅ include both paid + closed
         AND created_at >= $1::date
