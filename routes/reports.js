@@ -12,6 +12,18 @@ const authMiddleware = require("../middleware/authMiddleware");
 
 router.use(authMiddleware);
 const { getIO } = require("../utils/socket");
+const { ensureCashLogColumns } = require("../utils/registerLogColumns");
+
+const CASH_REGISTER_TYPES = new Set([
+  "open",
+  "close",
+  "entry",
+  "expense",
+  "sale",
+  "supplier",
+  "payroll",
+  "change",
+]);
 
 const { generateReportPDF, generateReportCSV } = require("../utils/exportUtils");
 
@@ -836,7 +848,8 @@ const todayStr = istNow.toISOString().slice(0, 10);
 
 
   // Allow open, close, entry, expense
-  if (!["open", "close", "entry", "expense"].includes(type) || amount == null) {
+  const numericAmount = Number(amount);
+  if (!CASH_REGISTER_TYPES.has(type) || !Number.isFinite(numericAmount)) {
     return res.status(400).json({ error: "Invalid type or amount" });
   }
 
@@ -873,13 +886,22 @@ const todayStr = istNow.toISOString().slice(0, 10);
       }
     }
 
+    await ensureCashLogColumns();
+    const staffName =
+      req.user?.name ||
+      req.user?.username ||
+      req.user?.full_name ||
+      req.user?.email ||
+      null;
+    const staffId = req.user?.id || req.user?.user_id || null;
+
     // Save the log (with note)
     await pool.query(
       `
-      INSERT INTO cash_register_logs (date, type, amount, note)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO cash_register_logs (date, type, amount, note, staff_name, staff_id)
+      VALUES ($1, $2, $3, $4, $5, $6)
       `,
-      [todayStr, type, amount, note || null]
+      [todayStr, type, numericAmount, note || null, staffName, staffId?.toString() || null]
     );
 
     res.json({ status: "ok" });

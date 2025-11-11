@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { ensureCashLogColumns } = require("../utils/registerLogColumns");
 
 // ✅ protect all setting
 // ✅ protect all settings routes with tenant-safe auth
@@ -250,12 +251,20 @@ router.get("/logs/:type", async (req, res) => {
     let result;
 
     if (type === "register") {
+      await ensureCashLogColumns();
       result = await pool.query(
         `
-          SELECT date::text AS date, type AS action, 'System' AS user
+          SELECT
+            date::text AS date,
+            type,
+            amount,
+            note,
+            COALESCE(staff_name, 'System') AS staff,
+            COALESCE(staff_id::text, '') AS staff_id,
+            created_at
           FROM cash_register_logs
           WHERE date BETWEEN $1 AND $2
-          ORDER BY date DESC
+          ORDER BY created_at DESC
         `,
         [fromDate, toDate]
       );

@@ -2,8 +2,10 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { ensureCustomerDebtColumn } = require("../utils/customerDebt");
 
 router.use(authMiddleware);
+ensureCustomerDebtColumn();
 
 // ✅ POST /api/customers - Create or return existing (tenant safe)
 router.post("/", async (req, res) => {
@@ -91,9 +93,15 @@ router.get("/", async (req, res) => {
     const { rows } = await pool.query(
       `
       SELECT
-        c.id, c.name, c.phone, c.address, c.birthday, c.email,
+        c.id,
+        c.name,
+        c.phone,
+        c.address,
+        c.birthday,
+        c.email,
         COALESCE(COUNT(o.id), 0) AS visit_count,
         COALESCE(SUM(o.total), 0) AS lifetime_value,
+        COALESCE(c.debt, 0)::float AS debt,
         MAX(o.created_at) AS last_visit
       FROM customers c
       LEFT JOIN orders o
@@ -101,9 +109,10 @@ router.get("/", async (req, res) => {
        AND o.customer_phone = c.phone
       WHERE c.restaurant_id = $1
         AND (c.name ILIKE $2 OR c.phone ILIKE $2)
-      GROUP BY c.id, c.name, c.phone, c.address, c.email
+      GROUP BY c.id, c.name, c.phone, c.address, c.email, c.birthday, c.debt
       ORDER BY visit_count DESC, last_visit DESC
-      LIMIT 50
+      LIMIT 50;
+
       `,
       [restaurantId, `%${search}%`]
     );
