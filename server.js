@@ -192,6 +192,7 @@ app.use("/api", require("./routes/Autosuppliersorder")(io));
 app.use("/api/phoneorders", require("./routes/phoneorders"));
 app.use("/api/customerAddresses", require("./routes/customerAddresses"));
 app.use("/api/customers", require("./routes/customers"));
+app.use("/api/tables", require("./routes/tables"));
 app.use("/api/campaigns", require("./routes/campaigns"));
 app.use("/webhook", whatsappWebhook);
 // ✅ Mount KITCHEN router AFTER orders, with auth

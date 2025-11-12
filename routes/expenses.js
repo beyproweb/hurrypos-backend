@@ -1,8 +1,9 @@
 const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
+const authMiddleware = require("../middleware/authMiddleware");
 
-router.post("/expenses", async (req, res) => {
+router.post("/expenses", authMiddleware, async (req, res) => {
   const { type, amount, note, payment_method, created_by } = req.body;
 
   if (!type || !amount || isNaN(parseFloat(amount))) {
@@ -16,10 +17,11 @@ router.post("/expenses", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `INSERT INTO expenses (type, amount, note, payment_method, created_by)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO expenses (restaurant_id, type, amount, note, payment_method, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
       [
+        req.user.restaurant_id,
         type.trim(),
         parseFloat(amount),
         note?.trim() || null,
@@ -35,12 +37,13 @@ router.post("/expenses", async (req, res) => {
 });
 
 
-router.get("/expenses", async (req, res) => {
+router.get("/expenses", authMiddleware, async (req, res) => {
   const { from, to, type } = req.query;
+  const restaurantId = req.user.restaurant_id;
 
   try {
-    let query = `SELECT * FROM expenses WHERE TRUE`;
-    const params = [];
+    let query = `SELECT * FROM expenses WHERE restaurant_id = $1`;
+    const params = [restaurantId];
 
     if (from) {
       params.push(from);
@@ -65,12 +68,13 @@ router.get("/expenses", async (req, res) => {
   }
 });
 
-router.get("/expenses/types", async (req, res) => {
+router.get("/expenses/types", authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT DISTINCT type FROM expenses ORDER BY type ASC
-    `);
-    res.json(result.rows.map(r => r.type));
+    const result = await pool.query(
+      `SELECT DISTINCT type FROM expenses WHERE restaurant_id = $1 ORDER BY type ASC`,
+      [req.user.restaurant_id]
+    );
+    res.json(result.rows.map((r) => r.type));
   } catch (err) {
     console.error("❌ Failed to fetch expense types:", err);
     res.status(500).json({ error: "Could not fetch types" });
@@ -78,10 +82,10 @@ router.get("/expenses/types", async (req, res) => {
 });
 
 
-router.delete("/expenses/:id", async (req, res) => {
+router.delete("/expenses/:id", authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
-    await pool.query(`DELETE FROM expenses WHERE restaurant_id = $1 AND id = $1`, [id]);
+    await pool.query(`DELETE FROM expenses WHERE restaurant_id = $1 AND id = $2`, [req.user.restaurant_id, id]);
     res.json({ success: true, message: "Expense deleted" });
   } catch (err) {
     console.error("❌ Failed to delete expense:", err);
