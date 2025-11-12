@@ -183,12 +183,13 @@ router.get("/history", async (req, res) => {
           payment_method,
           debt_paid_at
         FROM orders
-        WHERE status IN ('paid', 'closed')   -- ✅ include both paid + closed
-        AND created_at >= $1::date
-        AND created_at < ($2::date + INTERVAL '1 day')
+        WHERE restaurant_id = $1
+          AND status IN ('paid', 'closed')   -- ✅ include both paid + closed
+          AND created_at >= $2::date
+          AND created_at < ($3::date + INTERVAL '1 day')
         ORDER BY created_at DESC
       `,
-      [from, to]
+      [req.user.restaurant_id, from, to]
     );
     res.json(result.rows);
   } catch (err) {
@@ -400,31 +401,43 @@ router.get("/daily-expenses", async (req, res) => {
 router.get("/daily-cash-expenses", async (req, res) => {
   try {
     const openTime = req.query.openTime;
+    const restaurantId = req.user.restaurant_id;
 
     if (!openTime) {
       return res.status(400).json({ error: "Missing openTime in query" });
     }
 
-    // 1. Manual cash payments from register
-    const res1 = await pool.query(`
+    // 1. Manual cash expenses logged in register (incl. change mapped to expense)
+    const res1 = await pool.query(
+      `
       SELECT COALESCE(SUM(amount), 0) AS total
-      FROM payments
-      WHERE paid_at >= $1 AND LOWER(payment_method) = 'cash'
-    `, [openTime]);
+      FROM cash_register_logs
+      WHERE restaurant_id = $1
+        AND type = 'expense'
+        AND created_at >= $2
+      `,
+      [restaurantId, openTime]
+    );
 
     // 2. Supplier cash transactions
-    const res2 = await pool.query(`
+    const res2 = await pool.query(
+      `
       SELECT COALESCE(SUM(amount_paid), 0) AS total
       FROM transactions
-      WHERE delivery_date >= $1 AND LOWER(payment_method) = 'cash'
-    `, [openTime]);
+      WHERE restaurant_id = $1 AND delivery_date >= $2 AND LOWER(payment_method) = 'cash'
+      `,
+      [restaurantId, openTime]
+    );
 
-    // 3. Staff cash payouts (assuming all staff payments are in cash)
-    const res3 = await pool.query(`
+    // 3. Staff cash payouts
+    const res3 = await pool.query(
+      `
       SELECT COALESCE(SUM(amount), 0) AS total
       FROM staff_payments
-      WHERE created_at >= $1
-    `, [openTime]);
+      WHERE restaurant_id = $1 AND created_at >= $2 AND LOWER(payment_method) = 'cash'
+      `,
+      [restaurantId, openTime]
+    );
 
     // Total unified expense
     const totalExpense =
@@ -606,67 +619,109 @@ router.get("/category-trends", async (req, res) => {
 
 // GET /reports/cash-register-history?from=YYYY-MM-DD&to=YYYY-MM-DD
 router.get("/cash-register-history", async (req, res) => {
-
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: "Missing date range" });
+  const restaurantId = req.user.restaurant_id;
 
   try {
-    const result = await pool.query(`
-            WITH opens AS (
-        SELECT date, amount AS opening_cash FROM cash_register_logs WHERE type = 'open'
+    const result = await pool.query(
+      `
+      WITH opens AS (
+        SELECT date, amount AS opening_cash
+        FROM cash_register_logs
+        WHERE restaurant_id = $1 AND type = 'open'
       ),
       closes AS (
-        SELECT date, amount AS closing_cash FROM cash_register_logs WHERE type = 'close'
+        SELECT date, amount AS closing_cash
+        FROM cash_register_logs
+        WHERE restaurant_id = $1 AND type = 'close'
       ),
       sales AS (
-        SELECT TO_CHAR(created_at, 'YYYY-MM-DD') AS date, SUM(amount) AS cash_sales
-        FROM receipt_methods
-        WHERE LOWER(payment_method) = 'cash'
+        SELECT TO_CHAR(o.created_at, 'YYYY-MM-DD') AS date, SUM(rm.amount) AS cash_sales
+        FROM receipt_methods rm
+        JOIN orders o ON rm.receipt_id = o.receipt_id
+        WHERE o.restaurant_id = $1 AND LOWER(rm.payment_method) = 'cash'
         GROUP BY 1
       ),
+      direct_cash AS (
+        SELECT TO_CHAR(p.created_at, 'YYYY-MM-DD') AS date, SUM(p.amount) AS cash_sales
+        FROM payments p
+        JOIN orders o ON p.order_id = o.id
+        WHERE o.restaurant_id = $1
+          AND LOWER(p.payment_method) = 'cash'
+          AND (
+            o.receipt_id IS NULL OR NOT EXISTS (
+              SELECT 1 FROM receipt_methods rm2 WHERE rm2.receipt_id = o.receipt_id
+            )
+          )
+        GROUP BY 1
+      ),
+      orders_only AS (
+        SELECT TO_CHAR(o.created_at, 'YYYY-MM-DD') AS date, SUM(o.total) AS cash_sales
+        FROM orders o
+        WHERE o.restaurant_id = $1
+          AND (o.status IN ('paid','closed') OR o.is_paid = true)
+          AND LOWER(COALESCE(o.payment_method, '')) = 'cash'
+          AND NOT EXISTS (SELECT 1 FROM receipt_methods rm2 WHERE rm2.receipt_id = o.receipt_id)
+          AND NOT EXISTS (SELECT 1 FROM payments p2 WHERE p2.order_id = o.id)
+        GROUP BY 1
+      ),
+      sales_all AS (
+        SELECT date, SUM(cash_sales) AS total_cash
+        FROM (
+          SELECT date, cash_sales FROM sales
+          UNION ALL
+          SELECT date, cash_sales FROM direct_cash
+          UNION ALL
+          SELECT date, cash_sales FROM orders_only
+        ) u
+        GROUP BY date
+      ),
       supplier AS (
-        SELECT TO_CHAR(delivery_date, 'YYYY-MM-DD') AS date, SUM(amount_paid) AS supplier_expenses
-        FROM transactions
-        WHERE LOWER(payment_method) = 'cash'
+        SELECT TO_CHAR(t.delivery_date, 'YYYY-MM-DD') AS date, SUM(t.amount_paid) AS supplier_expenses
+        FROM transactions t
+        WHERE t.restaurant_id = $1 AND LOWER(t.payment_method) = 'cash'
         GROUP BY 1
       ),
       staff AS (
-        SELECT TO_CHAR(created_at, 'YYYY-MM-DD') AS date, SUM(amount) AS staff_expenses
-        FROM staff_payments
+        SELECT TO_CHAR(sp.created_at, 'YYYY-MM-DD') AS date, SUM(sp.amount) AS staff_expenses
+        FROM staff_payments sp
+        WHERE sp.restaurant_id = $1
         GROUP BY 1
       ),
       drawer AS (
         SELECT date, SUM(amount) AS register_expenses
         FROM cash_register_logs
-        WHERE type = 'expense'
+        WHERE restaurant_id = $1 AND type = 'expense'
         GROUP BY 1
       ),
       entries AS (
         SELECT date, SUM(amount) AS register_entries
         FROM cash_register_logs
-        WHERE type = 'entry'
+        WHERE restaurant_id = $1 AND type = 'entry'
         GROUP BY 1
       )
       SELECT
         o.date,
         o.opening_cash::numeric AS opening_cash,
         COALESCE(c.closing_cash, 0)::numeric AS closing_cash,
-        COALESCE(s.cash_sales, 0)::numeric AS cash_sales,
+        COALESCE(sa.total_cash, 0)::numeric AS cash_sales,
         COALESCE(sup.supplier_expenses, 0)::numeric AS supplier_expenses,
         COALESCE(st.staff_expenses, 0)::numeric AS staff_expenses,
         COALESCE(d.register_expenses, 0)::numeric AS register_expenses,
         COALESCE(e.register_entries, 0)::numeric AS register_entries
       FROM opens o
       LEFT JOIN closes c ON c.date = o.date
-      LEFT JOIN sales s ON s.date = TO_CHAR(o.date, 'YYYY-MM-DD')
+      LEFT JOIN sales_all sa ON sa.date = TO_CHAR(o.date, 'YYYY-MM-DD')
       LEFT JOIN supplier sup ON sup.date = TO_CHAR(o.date, 'YYYY-MM-DD')
       LEFT JOIN staff st ON st.date = TO_CHAR(o.date, 'YYYY-MM-DD')
       LEFT JOIN drawer d ON d.date = o.date
       LEFT JOIN entries e ON e.date = o.date
-      WHERE o.date BETWEEN $1 AND $2
+      WHERE o.date BETWEEN $2 AND $3
       ORDER BY o.date DESC;
-
-    `, [from, to]);
+      `,
+      [restaurantId, from, to]
+    );
 
     res.json(result.rows);
   } catch (err) {
@@ -679,15 +734,19 @@ router.get("/cash-register-history", async (req, res) => {
 router.get("/cash-register-events", async (req, res) => {
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: "Missing date range" });
+  const restaurantId = req.user.restaurant_id;
 
   try {
-    const result = await pool.query(`
-      SELECT
-        type, amount, created_at, date, note
+    const result = await pool.query(
+      `
+      SELECT type, amount, created_at, date, note
       FROM cash_register_logs
-      WHERE date BETWEEN $1 AND $2
+      WHERE restaurant_id = $1
+        AND date BETWEEN $2 AND $3
       ORDER BY created_at ASC
-    `, [from, to]);
+      `,
+      [restaurantId, from, to]
+    );
     res.json(result.rows);
   } catch (err) {
     console.error("❌ DB error:", err);
@@ -697,16 +756,21 @@ router.get("/cash-register-events", async (req, res) => {
 
 router.get("/cash-register-trends", async (req, res) => {
   try {
-    const result = await pool.query(`
+    const restaurantId = req.user.restaurant_id;
+    const result = await pool.query(
+      `
       SELECT
         date,
         SUM(CASE WHEN type = 'open' THEN amount ELSE 0 END) AS opening_cash,
         SUM(CASE WHEN type = 'close' THEN amount ELSE 0 END) AS closing_cash
       FROM cash_register_logs
+      WHERE restaurant_id = $1
       GROUP BY date
       ORDER BY date DESC
       LIMIT 30
-    `);
+      `,
+      [restaurantId]
+    );
 
     res.json(result.rows);
   } catch (err) {
@@ -772,10 +836,11 @@ router.post("/expenses", async (req, res) => {
 
 router.get("/expenses", async (req, res) => {
   const { from, to, type } = req.query;
+  const restaurantId = req.user.restaurant_id;
 
   try {
-    let query = `SELECT * FROM expenses WHERE TRUE`;
-    const params = [];
+    let query = `SELECT * FROM expenses WHERE restaurant_id = $1`;
+    const params = [restaurantId];
 
     if (from) {
       params.push(from);
@@ -812,10 +877,10 @@ router.get("/expenses/types", async (req, res) => {
   }
 });
 
-// GET /daily-cash-total?openTime=...
 router.get("/daily-cash-total", async (req, res) => {
   try {
     const openTime = req.query.openTime;
+    const restaurantId = req.user.restaurant_id;
 
     if (!openTime || openTime === "null" || openTime === "undefined") {
       console.warn("⚠️ Invalid or missing openTime in query");
@@ -824,20 +889,66 @@ router.get("/daily-cash-total", async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT COALESCE(SUM(CAST(amount AS FLOAT)), 0) AS cash_total
-      FROM receipt_methods
-      WHERE LOWER(payment_method) = 'cash'
-        AND created_at >= $1
+      WITH cash_orders AS (
+        SELECT o.id
+        FROM orders o
+        WHERE o.restaurant_id = $1
+          AND o.created_at >= $2
+          AND (o.status IN ('paid','closed') OR o.is_paid = true)
+          AND LOWER(COALESCE(o.payment_method,'')) = 'cash'
+      ),
+      suborder_cash AS (
+        SELECT COALESCE(SUM(so.total), 0) AS total
+        FROM sub_orders so
+        JOIN orders o ON so.order_id = o.id
+        WHERE o.restaurant_id = $1
+          AND so.created_at >= $2
+          AND LOWER(COALESCE(so.payment_method,'')) = 'cash'
+      ),
+      base_sum AS (
+        SELECT COALESCE(SUM(o.total), 0) AS total
+        FROM orders o
+        WHERE o.id IN (SELECT id FROM cash_orders)
+      ),
+      extras_sum AS (
+        SELECT COALESCE(SUM(extra_price), 0) AS total
+        FROM (
+          SELECT
+            (extra->>'price')::numeric *
+            COALESCE((extra->>'quantity')::numeric, 1) *
+            COALESCE(oi.quantity, 1) AS extra_price
+          FROM order_items oi
+          JOIN cash_orders co ON oi.order_id = co.id
+          CROSS JOIN LATERAL jsonb_array_elements(oi.extras) AS extra
+          WHERE oi.extras IS NOT NULL AND oi.extras <> '[]'
+        ) e
+      ),
+      receipts_sum AS (
+        SELECT COALESCE(SUM(rm.amount), 0) AS total
+        FROM receipt_methods rm
+        JOIN orders o ON rm.receipt_id = o.receipt_id
+        WHERE o.id IN (SELECT id FROM cash_orders)
+          AND LOWER(rm.payment_method) = 'cash'
+      )
+      SELECT
+        (SELECT total FROM base_sum) +
+        (SELECT total FROM extras_sum) +
+        (SELECT total FROM receipts_sum) +
+        (SELECT total FROM suborder_cash) AS cash_total;
       `,
-      [openTime]
+      [restaurantId, openTime]
     );
 
-    res.json({ cash_total: parseFloat(result.rows[0].cash_total) });
+    const value = parseFloat(result.rows?.[0]?.cash_total || 0);
+    res.json({ cash_total: value });
   } catch (err) {
     console.error("❌ Failed to calculate daily cash total:", err);
     res.status(500).json({ error: "Failed to fetch cash total" });
   }
 });
+
+
+
 
 
 // POST /cash-register-log
@@ -848,9 +959,14 @@ const istNow = new Date(now.toLocaleString("en-US", { timeZone: "Europe/Istanbul
 const todayStr = istNow.toISOString().slice(0, 10);
 
 
-  // Allow open, close, entry, expense
+  // Normalize and validate type/amount
   const numericAmount = Number(amount);
-  if (!CASH_REGISTER_TYPES.has(type) || !Number.isFinite(numericAmount)) {
+  const normalizedType = String(type || "").toLowerCase().trim();
+  // DB constraint typically allows only: open, close, entry, expense
+  const ALLOWED_DB_TYPES = new Set(["open", "close", "entry", "expense"]);
+  // Map extended types to DB-safe types
+  const mappedType = normalizedType === "change" ? "expense" : normalizedType;
+  if (!ALLOWED_DB_TYPES.has(mappedType) || !Number.isFinite(numericAmount)) {
     return res.status(400).json({ error: "Invalid type or amount" });
   }
 
@@ -896,13 +1012,21 @@ const todayStr = istNow.toISOString().slice(0, 10);
       null;
     const staffId = req.user?.id || req.user?.user_id || null;
 
-    // Save the log (with note)
+    // Save the log (with note) and tenant scope
     await pool.query(
       `
-      INSERT INTO cash_register_logs (date, type, amount, note, staff_name, staff_id)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO cash_register_logs (date, type, amount, note, staff_name, staff_id, restaurant_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
       `,
-      [todayStr, type, numericAmount, note || null, staffName, staffId?.toString() || null]
+      [
+        todayStr,
+        mappedType,
+        numericAmount,
+        note || null,
+        staffName,
+        staffId?.toString() || null,
+        req.user.restaurant_id,
+      ]
     );
 
     res.json({ status: "ok" });
@@ -920,14 +1044,18 @@ router.get("/cash-register-status", async (req, res) => {
   try {
     const now = new Date();
     const istTime = new Date(now.toLocaleString("en-US", { timeZone: "Europe/Istanbul" }));
+    const restaurantId = req.user.restaurant_id;
 
-    // 1. Get latest open log (regardless of day)
-    const { rows: openLogs } = await pool.query(`
+    // 1. Get latest open log (regardless of day) for this tenant
+    const { rows: openLogs } = await pool.query(
+      `
       SELECT * FROM cash_register_logs
-      WHERE type = 'open'
+      WHERE restaurant_id = $1 AND type = 'open'
       ORDER BY created_at DESC
       LIMIT 1
-    `);
+      `,
+      [restaurantId]
+    );
     const lastOpen = openLogs[0];
 
     if (!lastOpen) {
@@ -938,23 +1066,29 @@ router.get("/cash-register-status", async (req, res) => {
       });
     }
 
-    // 2. Get first close after last open
-    const { rows: closeLogs } = await pool.query(`
+    // 2. Get first close after last open for this tenant
+    const { rows: closeLogs } = await pool.query(
+      `
       SELECT * FROM cash_register_logs
-      WHERE type = 'close' AND created_at > $1
+      WHERE restaurant_id = $1 AND type = 'close' AND created_at > $2
       ORDER BY created_at ASC
       LIMIT 1
-    `, [lastOpen.created_at]);
+      `,
+      [restaurantId, lastOpen.created_at]
+    );
     const lastClose = closeLogs[0] || null;
 
     // If open (not closed after last open): show last close BEFORE open
     if (!lastClose || new Date(lastClose.created_at) < new Date(lastOpen.created_at)) {
-      const { rows: prevCloses } = await pool.query(`
+      const { rows: prevCloses } = await pool.query(
+        `
         SELECT amount FROM cash_register_logs
-        WHERE type = 'close' AND created_at < $1
+        WHERE restaurant_id = $1 AND type = 'close' AND created_at < $2
         ORDER BY created_at DESC
         LIMIT 1
-      `, [lastOpen.created_at]);
+        `,
+        [restaurantId, lastOpen.created_at]
+      );
       const prevCloseAmount = prevCloses[0]?.amount ?? null;
       return res.json({
         status: "open",
@@ -985,13 +1119,16 @@ router.get("/last-register-closes", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "5", 10);
 
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT amount, created_at
       FROM cash_register_logs
-      WHERE type = 'close'
+      WHERE restaurant_id = $1 AND type = 'close'
       ORDER BY created_at DESC
-      LIMIT $1
-    `, [limit]);
+      LIMIT $2
+      `,
+      [req.user.restaurant_id, limit]
+    );
 
     res.json(result.rows);
   } catch (err) {
@@ -1110,8 +1247,10 @@ router.get("/supplier-cash-payments", async (req, res) => {
 // GET /api/reports/staff-cash-payments?from=YYYY-MM-DD&to=YYYY-MM-DD
 router.get("/staff-cash-payments", async (req, res) => {
   const { from, to } = req.query;
+  const restaurantId = req.user.restaurant_id;
   try {
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT
         sp.amount,
         sp.created_at,
@@ -1119,11 +1258,14 @@ router.get("/staff-cash-payments", async (req, res) => {
         'staff' AS type
       FROM staff_payments sp
       JOIN staff s ON sp.staff_id = s.id
-      WHERE LOWER(sp.payment_method) = 'cash'
-        AND sp.created_at >= $1
-        AND sp.created_at < ($2::date + INTERVAL '1 day')
+      WHERE sp.restaurant_id = $1
+        AND LOWER(sp.payment_method) = 'cash'
+        AND sp.created_at >= $2
+        AND sp.created_at < ($3::date + INTERVAL '1 day')
       ORDER BY sp.created_at ASC
-    `, [from, to]);
+      `,
+      [restaurantId, from, to]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch staff cash payments" });

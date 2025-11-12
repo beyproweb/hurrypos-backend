@@ -253,7 +253,7 @@ router.get("/", async (req, res) => {
 
 
 
-// POST /orders - Create new order (table or phone), status 'occupied'
+// POST /orders - Create new order (table or phone)
 router.post("/", async (req, res) => {
   console.log("💬 /orders payload:", req.body);
 
@@ -294,7 +294,48 @@ router.post("/", async (req, res) => {
       payment_method,
     } = req.body;
 
-    const pickupTime = req.body.pickup_time ?? req.body.pickupTime ?? null;
+    // Normalize pickup_time to a full timestamp string if only HH:MM is provided
+    function normalizePickupTime(v) {
+      if (!v) return null;
+      const s = String(v).trim();
+      try {
+        // If only HH:MM or HH:MM:SS is provided, attach today's date
+        if (/^\d{1,2}:\d{2}$/.test(s) || /^\d{1,2}:\d{2}:\d{2}$/.test(s)) {
+          const now = new Date();
+          const parts = s.split(":").map((x) => parseInt(x, 10));
+          const hh = parts[0] || 0;
+          const mm = parts[1] || 0;
+          const ss = parts[2] || 0;
+          const dt = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate(),
+            hh,
+            mm,
+            ss,
+            0
+          );
+          // Format as "YYYY-MM-DD HH:MM:SS" which Postgres TIMESTAMP accepts
+          const pad = (n) => String(n).padStart(2, "0");
+          const ts = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+          return ts;
+        }
+        // If it's a date/time-like string, try to keep it as-is
+        if (/\d{4}-\d{2}-\d{2}.*\d{2}:\d{2}/.test(s)) return s;
+        // Last resort: try Date parsing
+        const d = new Date(s);
+        if (!isNaN(d)) {
+          const pad = (n) => String(n).padStart(2, "0");
+          return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        }
+      } catch (_) {
+        // ignore and fall through
+      }
+      return s;
+    }
+
+    const pickupTimeRaw = req.body.pickup_time ?? req.body.pickupTime ?? null;
+    const pickupTime = normalizePickupTime(pickupTimeRaw);
     const takeawayNotes =
       req.body.takeaway_notes ??
       req.body.notes ??
@@ -307,10 +348,8 @@ router.post("/", async (req, res) => {
     await client.query("BEGIN");
 
     const hasItems = Array.isArray(items) && items.length > 0;
-const initialStatus =
-  hasItems ? "confirmed" :
-  order_type === "phone" ? "occupied" :
-  "occupied";
+    // New orders without items start as 'occupied' to avoid exposing debt/paid flows prematurely
+    const initialStatus = hasItems ? "confirmed" : "occupied";
 
     let createdBy = null;
     if (hasCreatedByColumn && req.user?.id) {
@@ -664,7 +703,7 @@ router.put("/:id/status", async (req, res) => {
          payment_status = COALESCE($4, payment_status),       -- ✅ added this
          is_paid = CASE
                      WHEN $1 = 'paid' OR $4 = 'paid' THEN true  -- ✅ support both status or payment_status
-                     WHEN $1 IN ('confirmed', 'occupied') THEN false
+                     WHEN $1 IN ('confirmed') THEN false
                      ELSE is_paid
                    END
        WHERE id = $5 AND restaurant_id = $6
@@ -681,6 +720,19 @@ router.put("/:id/status", async (req, res) => {
     const becamePaid = updatedOrder.is_paid && !existingOrder.is_paid;
 
     if (becamePaid) {
+      // ✅ Also mark all existing order_items as paid for this order
+      try {
+        await client.query(
+          `UPDATE order_items
+             SET paid_at = NOW(),
+                 confirmed = TRUE
+           WHERE order_id = $1 AND paid_at IS NULL`,
+          [id]
+        );
+      } catch (markErr) {
+        console.warn("⚠️ Failed to mark order_items paid in /orders/:id/status:", markErr);
+      }
+
       const recorded = toMoney(existingOrder.debt_recorded_total);
       const amountReference = toMoney(
         total !== undefined && total !== null ? total : existingOrder.total
@@ -872,7 +924,8 @@ const orderRes = await pool.query(
   "SELECT status FROM orders WHERE restaurant_id = $1 AND id = $2",
   [restaurantId, order_id]
 );
-if (["closed", "occupied"].includes(orderRes.rows[0]?.status)) {
+const currentStatus = String(orderRes.rows[0]?.status || '').toLowerCase();
+if (["closed", "occupied", "pending", "open"].includes(currentStatus)) {
   await pool.query(
     "UPDATE orders SET status = 'confirmed' WHERE restaurant_id = $1 AND id = $2",
     [restaurantId, order_id]
