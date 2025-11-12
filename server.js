@@ -20,11 +20,14 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin) return callback(null, true); // Allow curl/Postman
-      const normalized = origin.toLowerCase();
+      // Allow curl/Postman and Electron file:// or null origins
+      if (!origin) return callback(null, true);
+      const normalized = String(origin).toLowerCase();
       if (
         allowedOrigins.some((o) => normalized === o.toLowerCase()) ||
-        /\.vercel\.app$/.test(normalized)
+        /\.vercel\.app$/.test(normalized) ||
+        normalized === "null" || // Electron often sends Origin: null
+        normalized.startsWith("file://") // Electron file scheme
       ) {
         return callback(null, true);
       }
