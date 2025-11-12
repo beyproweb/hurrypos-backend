@@ -10,11 +10,31 @@ function initSocket(server) {
 
   io = new Server(server, {
     cors: {
-      origin: [
-        "http://localhost:5173",
-        "https://pos.beypro.com",
-        "https://hurrypos-frontend.onrender.com",
-      ],
+      // Allow web, onrender frontend, localhost dev, and desktop apps (file:// -> null origin)
+      origin: (origin, callback) => {
+        try {
+          if (!origin) return callback(null, true);
+          const normalized = String(origin).toLowerCase();
+          const allowList = new Set([
+            "http://localhost:5173",
+            "https://pos.beypro.com",
+            "https://www.pos.beypro.com",
+            "https://hurrypos-frontend.onrender.com",
+          ]);
+          if (
+            allowList.has(normalized) ||
+            normalized.startsWith("file://") ||
+            normalized === "null" ||
+            /\.vercel\.app$/.test(normalized)
+          ) {
+            return callback(null, true);
+          }
+          console.warn("❌ Socket CORS blocked:", origin);
+          return callback(new Error("Not allowed by CORS"));
+        } catch (e) {
+          return callback(null, true);
+        }
+      },
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
       credentials: true,
     },
