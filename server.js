@@ -7,7 +7,7 @@ const app = express();
 const { pool } = require('./db');
 const cors = require("cors");
 
-// ✅ Correct CORS setup — one unified config only
+// ✅ Unified CORS setup — supports web, dev, and Electron
 const allowedOrigins = [
   "http://localhost:5173",
   "https://pos.beypro.com",
@@ -20,17 +20,23 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow curl/Postman and Electron file:// or null origins
+      // Electron may send null, app://, or omit Origin completely
       if (!origin) return callback(null, true);
+
       const normalized = String(origin).toLowerCase();
+
       if (
         allowedOrigins.some((o) => normalized === o.toLowerCase()) ||
         /\.vercel\.app$/.test(normalized) ||
-        normalized === "null" || // Electron often sends Origin: null
-        normalized.startsWith("file://") // Electron file scheme
+        normalized === "null" ||
+        normalized.startsWith("file://") ||
+        normalized.startsWith("app://") || // ✅ packaged Electron apps
+        normalized.startsWith("capacitor://") || // optional mobile builds
+        !origin // ✅ allow no Origin header
       ) {
         return callback(null, true);
       }
+
       console.warn("❌ Blocked by CORS:", origin);
       return callback(new Error("Not allowed by CORS"));
     },
@@ -41,16 +47,12 @@ app.use(
       "X-Requested-With",
       "Content-Type",
       "Accept",
-      "Authorization", // ✅ essential
+      "Authorization",
       "x-client-lang",
       "X-Client-Lang",
     ],
   })
 );
-
-// ❌ Remove this duplicate line
-// app.options("*", cors());
-
 
 
 
