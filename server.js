@@ -1,6 +1,7 @@
 // server.js
 require("dotenv").config();
 console.log("🔐 JWT_SECRET loaded =", process.env.JWT_SECRET ? "✅ OK" : "❌ MISSING");
+console.log("🟣 YS_SECRET is:", process.env.YS_SECRET);
 
 const express = require("express");
 const app = express();
@@ -67,6 +68,9 @@ const fs = require("fs");
 const http = require("http").createServer(app);
 const { initSocket } = require("./utils/socket");
 const io = initSocket(http);
+
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 app.set("io", io);
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -87,6 +91,9 @@ app.use(
   })
 );
 const whatsappWebhook = require("./routes/whatsappWebhook");
+
+app.use("/api/integrations/yemeksepeti", require("./routes/yemeksepeti"));
+
 // Beypro Bridge binaries (no-cache)
 app.use(
   "/bridge",
@@ -136,10 +143,14 @@ app.get("/installers/linux/*", (req, res) =>
   res.redirect(302, "/bridge/beypro-bridge-linux-x64.tar.gz")
 );
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
 
 // ========== ROUTES (Public / mixed) ==========
+
+app.use(
+  "/api/integrations/yemeksepeti",
+  require("./routes/yemeksepetiMenu")
+);
+
 app.use("/api", require("./routes/tasks"));
 
 const staffRoutes = require("./routes/staff");
@@ -189,7 +200,6 @@ app.use("/api/orders", require("./routes/orders")(io));
 
 // Other feature routes (public or internal-auth)
 app.use("/api/drinks", authMiddleware, require("./routes/drinks")(io));
-app.use("/api/integrations/yemeksepeti", require("./routes/yemeksepeti"));
 app.use("/api/category-images", require("./routes/categoryImages"));
 app.use("/api/settings", require("./routes/settings"));
 app.use("/api/extras-groups", require("./routes/extras-groups"));
