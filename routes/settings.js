@@ -595,6 +595,108 @@ router.delete("/roles/:role", async (req, res) => {
 
 
 // ✅ GET /api/settings/:section
+/* ===========================================================
+   QR MENU WEBSITE BUILDER
+   Save + Fetch Customization (titles, story, hero slides, etc.)
+   =========================================================== */
+
+// Place these BEFORE the generic /:section handlers so they are not shadowed
+router.get("/qr-menu-customization", async (req, res) => {
+  try {
+    const restaurantId = req.user.restaurant_id;
+
+    const result = await pool.query(
+      `
+      SELECT qr_menu_customization, value
+      FROM settings
+      WHERE restaurant_id = $1 AND key = 'qr-menu-customization'
+      LIMIT 1
+      `,
+      [restaurantId]
+    );
+
+    let data = {};
+
+    if (result.rows.length) {
+      // Prefer jsonb column
+      if (result.rows[0].qr_menu_customization) {
+        data = result.rows[0].qr_menu_customization;
+      }
+      // Fallback to value column
+      else if (result.rows[0].value) {
+        data = JSON.parse(result.rows[0].value);
+      }
+    }
+
+    // Default values if new restaurant
+    const defaults = {
+      main_title: "Welcome to Our Restaurant",
+      subtitle: "Fresh • Local • Crafted",
+      tagline: "",
+      phone: "",
+      primary_color: "#4F46E5",
+
+      hero_slides: [],
+
+      story_title: "",
+      story_text: "",
+      story_image: "",
+
+      reviews: [],
+
+      social_instagram: "",
+      social_tiktok: "",
+      social_website: "",
+
+      gallery_images: [],
+
+      show_open_status: true,
+      delivery_time: "25–35 min",
+      pickup_time: "10 min",
+      call_button_enabled: true,
+    };
+
+    res.json({
+      success: true,
+      customization: {
+        ...defaults,
+        ...data,
+      },
+    });
+  } catch (err) {
+    console.error("❌ Failed to load QR menu customization:", err);
+    res.status(500).json({ error: "Failed to load QR menu customization" });
+  }
+});
+
+router.post("/qr-menu-customization", async (req, res) => {
+  try {
+    const restaurantId = req.user.restaurant_id;
+    const newData = req.body;
+
+    if (!newData || typeof newData !== "object") {
+      return res.status(400).json({ error: "Invalid customization payload" });
+    }
+
+    // Upsert jsonb
+    await pool.query(
+      `
+      INSERT INTO settings (restaurant_id, key, qr_menu_customization)
+      VALUES ($1, 'qr-menu-customization', $2::jsonb)
+      ON CONFLICT (restaurant_id, key)
+      DO UPDATE SET qr_menu_customization = EXCLUDED.qr_menu_customization
+      `,
+      [restaurantId, JSON.stringify(newData)]
+    );
+
+    res.json({ success: true, customization: newData });
+  } catch (err) {
+    console.error("❌ Failed to save QR customization:", err);
+    res.status(500).json({ error: "Failed to save qr-menu-customization" });
+  }
+});
+
+// Generic GET after specific routes
 router.get("/:section", async (req, res) => {
   const { section } = req.params;
   const restaurantId = req.user.restaurant_id; // ✅ tenant-safe
@@ -717,7 +819,5 @@ router.post("/:section", async (req, res) => {
     res.status(500).json({ error: "Failed to save settings" });
   }
 });
-
-
 
 module.exports = router;
