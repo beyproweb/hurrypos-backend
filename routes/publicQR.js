@@ -124,4 +124,123 @@ router.get("/qr-link/:slug", async (req, res) => {
 });
 
 
+// 🔹 NEW: Public tables for QR menu
+router.get("/tables/:identifier", async (req, res) => {
+  try {
+    const identifier = (req.params.identifier || "").trim();
+    if (!identifier) return res.json([]);
+
+    const { rows } = await pool.query(
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
+      LIMIT 1
+      `,
+      [identifier]
+    );
+
+    if (!rows.length) return res.json([]);
+    const restaurantId = rows[0].id;
+
+    const { rows: tables } = await pool.query(
+      `
+      SELECT number,
+             color,
+             label,
+             seats,
+             area,
+             COALESCE(active, TRUE) AS active
+      FROM tables
+      WHERE restaurant_id = $1
+      ORDER BY number ASC
+      `,
+      [restaurantId]
+    );
+
+    res.json(tables);
+  } catch (err) {
+    console.error("❌ Public tables failed:", err);
+    res.json([]);
+  }
+});
+
+
+// 🔹 NEW: Public extras-groups for QR menu
+router.get("/extras-groups/:identifier", async (req, res) => {
+  try {
+    const identifier = (req.params.identifier || "").trim();
+    if (!identifier) return res.json([]);
+
+    const { rows } = await pool.query(
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
+      LIMIT 1
+      `,
+      [identifier]
+    );
+
+    if (!rows.length) return res.json([]);
+    const restaurantId = rows[0].id;
+
+    const { rows: groups } = await pool.query(
+      `
+      SELECT id,
+             group_name,
+             items
+      FROM extras_groups
+      WHERE restaurant_id = $1
+      ORDER BY id ASC
+      `,
+      [restaurantId]
+    );
+
+    res.json(groups);
+  } catch (err) {
+    console.error("❌ Public extras-groups failed:", err);
+    res.json([]);
+  }
+});
+
+
+// 🔹 NEW: Public category-images for QR menu
+router.get("/category-images/:identifier", async (req, res) => {
+  try {
+    const identifier = (req.params.identifier || "").trim();
+    if (!identifier) return res.json([]);
+
+    const { rows } = await pool.query(
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
+      LIMIT 1
+      `,
+      [identifier]
+    );
+
+    if (!rows.length) return res.json([]);
+    const restaurantId = rows[0].id;
+
+    const { rows: imgs } = await pool.query(
+      `
+      SELECT category,
+             image
+      FROM category_images
+      WHERE restaurant_id = $1
+      ORDER BY category
+      `,
+      [restaurantId]
+    );
+
+    res.json(imgs);
+  } catch (err) {
+    console.error("❌ Public category-images failed:", err);
+    res.json([]);
+  }
+});
+
+
 module.exports = router;
