@@ -654,6 +654,17 @@ router.get("/qr-menu-customization", async (req, res) => {
       delivery_time: "25–35 min",
       pickup_time: "10 min",
       call_button_enabled: true,
+
+      // === New customization fields ===
+      enable_popular: true,
+      // qr theme: auto | light | dark
+      qr_theme: "auto",
+
+      // Loyalty program
+      loyalty_enabled: false,
+      loyalty_goal: 10,
+      loyalty_reward_text: "Free Menu Item",
+      loyalty_color: "#F59E0B",
     };
 
     res.json({
