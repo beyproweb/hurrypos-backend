@@ -242,5 +242,58 @@ router.get("/category-images/:identifier", async (req, res) => {
   }
 });
 
+router.get("/qr-menu-customization/:slug", async (req, res) => {
+  try {
+    const slug = req.params.slug;
+
+    // 1️⃣ Find restaurant ID
+    const r1 = await pool.query(
+      `SELECT id FROM restaurants WHERE slug = $1 LIMIT 1`,
+      [slug]
+    );
+
+    if (!r1.rows.length) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    const restaurantId = r1.rows[0].id;
+
+    // 2️⃣ Load customization from settings
+    const r2 = await pool.query(
+      `
+      SELECT qr_menu_customization, value
+      FROM settings
+      WHERE restaurant_id = $1 AND key = 'qr-menu-customization'
+      LIMIT 1
+      `,
+      [restaurantId]
+    );
+
+    let data = {};
+
+    if (r2.rows.length) {
+      if (r2.rows[0].qr_menu_customization) {
+        data = r2.rows[0].qr_menu_customization;
+      } else if (r2.rows[0].value) {
+        data = r2.rows[0].value;   // << FIXED: no JSON.parse
+      }
+    }
+
+    res.json({
+      success: true,
+      customization: data
+    });
+
+  } catch (err) {
+    console.error("❌ Public QR Menu Customization failed:", err);
+    res.status(500).json({ error: "Public QR customization error" });
+  }
+});
+
+
+
+
+
+
 
 module.exports = router;
