@@ -8,6 +8,7 @@ const express = require("express");
 const os = require("os");
 const cors = require("cors");
 const bodyParser = require("body-parser");
+const net = require("net");
 
 const app = express();
 app.use(cors());
@@ -109,6 +110,51 @@ app.post("/usb/print-test", async (req, res) => {
   req.body.baudRate = baudRate;
   return app._router.handle(
     { ...req, url: "/usb/print-raw", method: "POST", body: req.body },
+    res,
+    () => {},
+  );
+});
+
+// ----- TCP (LAN) printer raw send/test -----
+// POST /tcp/print-raw  { host, port?: 9100, dataBase64 }
+app.post("/tcp/print-raw", (req, res) => {
+  const { host, port = 9100, dataBase64 } = req.body || {};
+  if (!host || !dataBase64) {
+    return res.status(400).json({ ok: false, error: "host and dataBase64 are required" });
+  }
+  const data = Buffer.from(dataBase64, "base64");
+  const socket = new net.Socket();
+  let done = false;
+  const finish = (ok, error) => {
+    if (done) return;
+    done = true;
+    try { socket.destroy(); } catch {}
+    if (ok) return res.json({ ok: true });
+    return res.status(500).json({ ok: false, error: error || "tcp send failed" });
+  };
+  socket.setTimeout(3000, () => finish(false, "timeout"));
+  socket.once("error", (err) => finish(false, err?.message || "socket error"));
+  socket.connect(Number(port) || 9100, host, () => {
+    socket.write(data, (err) => {
+      if (err) return finish(false, err.message);
+      socket.end(() => finish(true));
+    });
+  });
+});
+
+// POST /tcp/print-test { host, port?: 9100 }
+app.post("/tcp/print-test", (req, res) => {
+  const { host, port = 9100 } = req.body || {};
+  if (!host) return res.status(400).json({ ok: false, error: "host required" });
+  const bytes = Buffer.from(
+    [0x1b, 0x40, 0x1b, 0x61, 0x01] // init + center
+      .concat([...Buffer.from("BEYPRO TCP TEST\r\n", "ascii")])
+      .concat([0x0a, 0x0a, 0x0a, 0x1d, 0x56, 0x42, 0x00]),
+  );
+  const dataBase64 = bytes.toString("base64");
+  req.body.dataBase64 = dataBase64;
+  return app._router.handle(
+    { ...req, url: "/tcp/print-raw", method: "POST", body: { host, port, dataBase64 } },
     res,
     () => {},
   );
