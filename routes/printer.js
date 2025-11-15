@@ -9,6 +9,71 @@ const router = express.Router();
 const { escpos, makeDevice, cleanErr, toHex } = require("../utils/printerHelpers");
 const { SerialPort } = require("serialport");
 const net = require("net");
+const { pool } = require("../db");
+const authMiddleware = require("../middleware/authMiddleware");
+
+async function ensureSettingsColumn() {
+  try {
+    const { rows } = await pool.query(
+      `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'user_settings' AND column_name = 'settings'
+      `
+    );
+    if (!rows.length) {
+      await pool.query(
+        `
+        ALTER TABLE user_settings
+        ADD COLUMN settings jsonb DEFAULT '{}'::jsonb
+        `
+      );
+      console.log("✅ Added missing user_settings.settings column");
+    }
+  } catch (err) {
+    console.warn("⚠️ Could not ensure user_settings.settings column:", err.message);
+  }
+}
+
+ensureSettingsColumn();
+
+const DEFAULT_RECEIPT_LAYOUT = {
+  logoUrl: "",
+  showLogo: true,
+  headerTitle: "Beypro POS · Hurrybey",
+  headerSubtitle: "Your receipt, your brand",
+  showHeader: true,
+  showFooter: true,
+  footerText: "Teşekkür ederiz! / Thank you!",
+  showQr: true,
+  qrText: "Scan for feedback",
+  qrUrl: "https://hurrybey.com/feedback",
+  alignment: "left",
+  paperWidth: "80mm",
+  spacing: 1.25,
+  showTaxes: true,
+  showDiscounts: true,
+  taxLabel: "Tax",
+  discountLabel: "Discount",
+  showItemModifiers: true,
+  showSku: false,
+  taxRate: 0.18,
+  discountRate: 0,
+  margin: 12,
+  itemFontSize: 14,
+};
+
+const getDefaultPrinterConfig = () => ({
+  receiptPrinter: null,
+  kitchenPrinter: null,
+  layout: { ...DEFAULT_RECEIPT_LAYOUT },
+  defaults: {
+    cut: true,
+    cashDrawer: false,
+  },
+  customLines: [],
+  lastSynced: new Date().toISOString(),
+});
 
 // ---------- routes ----------
 
@@ -17,9 +82,21 @@ router.get("/status", (req, res) => {
   res.json({ ok: true, message: "Printer routes alive" });
 });
 
+function serializeUsb(p, idx, now) {
+  return {
+    id: `usb-${idx}`,
+    type: "usb",
+    vendorId: toHex(p?.deviceDescriptor?.idVendor),
+    productId: toHex(p?.deviceDescriptor?.idProduct),
+    status: "ready",
+    detectedAt: now,
+  };
+}
+
 // List printers (USB + Serial)
 router.get("/printers", async (req, res) => {
   const out = { usb: [], serial: [], tips: [] };
+  const now = new Date().toISOString();
 
   // USB
   try {
@@ -27,11 +104,7 @@ router.get("/printers", async (req, res) => {
       out.tips.push("USB module not loaded. Install 'escpos-usb' and system libusb.");
     } else {
       const list = escpos.USB.findPrinter?.() || [];
-      out.usb = list.map((p, idx) => ({
-        id: `usb-${idx}`,
-        vendorId: toHex(p?.deviceDescriptor?.idVendor),
-        productId: toHex(p?.deviceDescriptor?.idProduct),
-      }));
+      out.usb = list.map((p, idx) => serializeUsb(p, idx, now));
       if (out.usb.length === 0) {
         out.tips.push("No USB printers detected. On macOS/Linux, install/libusb and replug; on Windows, install the driver.");
       }
@@ -47,9 +120,12 @@ router.get("/printers", async (req, res) => {
       .filter(p => /usb|serial|tty|COM/i.test([p.path, p.friendlyName, p.manufacturer].join(" ")))
       .map((p, idx) => ({
         id: `serial-${idx}`,
+        type: "serial",
         path: p.path,
         manufacturer: p.manufacturer || "",
         friendlyName: p.friendlyName || "",
+        status: "ready",
+        detectedAt: now,
       }));
     if (out.serial.length === 0) {
       out.tips.push("No Serial ports detected. Many USB printers expose a serial interface on macOS (e.g. /dev/tty.usbserial-*).");
@@ -66,11 +142,8 @@ router.get("/usb/list", async (req, res) => {
   try {
     if (!escpos.USB) throw new Error("USB module not loaded. Install 'escpos-usb' and libusb.");
     const list = escpos.USB.findPrinter?.() || [];
-    const usb = list.map((p, idx) => ({
-      id: `usb-${idx}`,
-      vendorId: toHex(p?.deviceDescriptor?.idVendor),
-      productId: toHex(p?.deviceDescriptor?.idProduct),
-    }));
+    const now = new Date().toISOString();
+    const usb = list.map((p, idx) => serializeUsb(p, idx, now));
     res.json({ ok: true, usb });
   } catch (e) {
     res.status(500).json({ ok: false, error: cleanErr(e) });
@@ -194,6 +267,68 @@ router.post("/lan-scan", async (req, res) => {
   } catch (err) {
     console.error("❌ LAN scan failed:", err);
     res.status(500).json({ error: cleanErr(err) });
+  }
+});
+
+router.get("/sync", authMiddleware, async (req, res) => {
+  const restaurantId = req.user?.restaurant_id;
+  if (!restaurantId) {
+    return res.status(400).json({ ok: false, error: "restaurant_id is required" });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT settings
+      FROM user_settings
+      WHERE restaurant_id = $1 AND section = 'printers'
+      `,
+      [restaurantId]
+    );
+
+    const settings = result.rows[0]?.settings || getDefaultPrinterConfig();
+    res.json({ ok: true, settings });
+  } catch (err) {
+    console.error("❌ Failed to fetch printer settings:", err);
+    res.status(500).json({ ok: false, error: "Failed to fetch printer settings" });
+  }
+});
+
+router.post("/sync", authMiddleware, async (req, res) => {
+  const restaurantId = req.user?.restaurant_id;
+  const payload = req.body || {};
+  const layoutOverride =
+    payload.layout && typeof payload.layout === "object" ? payload.layout : {};
+
+  if (!restaurantId) {
+    return res.status(400).json({ ok: false, error: "restaurant_id is required" });
+  }
+
+  const settings = {
+    ...getDefaultPrinterConfig(),
+    ...payload,
+    layout: {
+      ...DEFAULT_RECEIPT_LAYOUT,
+      ...layoutOverride,
+    },
+    lastSynced: new Date().toISOString(),
+  };
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO user_settings (restaurant_id, section, settings)
+      VALUES ($1, 'printers', $2)
+      ON CONFLICT (restaurant_id, section)
+      DO UPDATE SET settings = EXCLUDED.settings
+      `,
+      [restaurantId, JSON.stringify(settings)]
+    );
+
+    res.json({ ok: true, settings });
+  } catch (err) {
+    console.error("❌ Failed to save printer settings:", err);
+    res.status(500).json({ ok: false, error: "Failed to save printer settings" });
   }
 });
 
