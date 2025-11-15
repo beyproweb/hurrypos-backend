@@ -4,7 +4,11 @@ module.exports = (io) => {
   const router = express.Router();
   const { pool } = require("../db");
   const authMiddleware = require("../middleware/authMiddleware");
-  const { emitAlert, emitStockUpdate } = require("../utils/realtime");
+  const {
+    emitAlert,
+    emitStockUpdate,
+  } = require("../utils/realtime");
+  const { maybeEmitExpiryAlert, normalizeExpiryDate } = require("../utils/expiryMonitor");
 
   // ---------- helpers for unit conversion ----------
   const normalizeUnit = (unit) => (unit || "").trim().toLowerCase();
@@ -151,6 +155,7 @@ module.exports = (io) => {
       supplier_id,
       from_production,
       batch_count,         // optional; may be provided by frontend
+      expiry_date,
       // restaurant_id   // ❌ ignore body: we trust JWT tenant
     } = req.body;
 
@@ -158,6 +163,7 @@ module.exports = (io) => {
     const trimmedName = (name || "").trim();
     const trimmedUnit = (unit || "").trim();
     const parsedQty = parseFloat(quantity);
+    const normalizedExpiry = normalizeExpiryDate(expiry_date);
 
     if (!trimmedName || !parsedQty || parsedQty <= 0 || !trimmedUnit) {
       return res.status(400).json({ error: "Missing or invalid fields." });
@@ -261,21 +267,34 @@ module.exports = (io) => {
 
       // 🔺 Upsert finished product stock (tenant-safe)
       const upsertRes = await client.query(
-        `INSERT INTO stock (name, quantity, unit, supplier_id, restaurant_id)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO stock (name, quantity, unit, supplier_id, restaurant_id, expiry_date)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (name, unit, restaurant_id)
          DO UPDATE SET
            quantity = stock.quantity + EXCLUDED.quantity,
-           supplier_id = EXCLUDED.supplier_id
+           supplier_id = EXCLUDED.supplier_id,
+           expiry_date = CASE
+             WHEN stock.expiry_date IS NULL THEN EXCLUDED.expiry_date
+             WHEN EXCLUDED.expiry_date IS NULL THEN stock.expiry_date
+             ELSE LEAST(stock.expiry_date, EXCLUDED.expiry_date)
+           END
          RETURNING *`,
-        [trimmedName, parsedQty, trimmedUnit, supplier_id || null, restaurantId]
+        [trimmedName, parsedQty, trimmedUnit, supplier_id || null, restaurantId, normalizedExpiry]
       );
 
       await client.query("COMMIT");
 
       // notify listeners
-      emitStockUpdate(io, upsertRes.rows[0].id);
-      return res.json(upsertRes.rows[0]);
+      const stockPayload = upsertRes.rows[0];
+      emitStockUpdate(io, stockPayload.id);
+      await maybeEmitExpiryAlert(
+        io,
+        restaurantId,
+        stockPayload.id,
+        stockPayload.name,
+        stockPayload.expiry_date
+      );
+      return res.json(stockPayload);
     } catch (error) {
       await client.query("ROLLBACK");
       console.error("❌ Error inserting/updating stock (with production deduction):", error);
@@ -291,17 +310,19 @@ module.exports = (io) => {
   router.patch("/:id", async (req, res) => {
     try {
       const { id } = req.params;
-      const { quantity, critical_quantity, reorder_quantity } = req.body;
+      const { quantity, critical_quantity, reorder_quantity, expiry_date } = req.body;
       const restaurantId = req.user.restaurant_id;
+      const normalizedExpiry = normalizeExpiryDate(expiry_date);
 
       const updateRes = await pool.query(
         `UPDATE stock
          SET quantity = COALESCE($1, quantity),
              critical_quantity = COALESCE($2, critical_quantity),
-             reorder_quantity = COALESCE($3, reorder_quantity)
-         WHERE restaurant_id = $4 AND id = $5
+             reorder_quantity = COALESCE($3, reorder_quantity),
+             expiry_date = COALESCE($4, expiry_date)
+         WHERE restaurant_id = $5 AND id = $6
          RETURNING *`,
-        [quantity, critical_quantity, reorder_quantity, restaurantId, id]
+        [quantity, critical_quantity, reorder_quantity, normalizedExpiry, restaurantId, id]
       );
 
       const updated = updateRes.rows[0];
@@ -321,6 +342,15 @@ module.exports = (io) => {
       }
 
       emitStockUpdate(io, id);
+      if (updated.expiry_date) {
+        await maybeEmitExpiryAlert(
+          io,
+          restaurantId,
+          updated.id,
+          updated.name,
+          updated.expiry_date
+        );
+      }
       res.json({ success: true, stock: updated });
     } catch (error) {
       console.error("❌ Error updating stock:", error);

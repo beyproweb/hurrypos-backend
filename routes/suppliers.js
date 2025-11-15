@@ -6,8 +6,8 @@ module.exports = (io) => {
   const multer = require("multer");
   const path = require("path");
   const fs = require("fs");
-  const { emitAlert } = require("../utils/realtime");
   const authMiddleware = require("../middleware/authMiddleware");
+  const { maybeEmitExpiryAlert, normalizeExpiryDate } = require("../utils/expiryMonitor");
 
   // ✅ Apply tenant auth everywhere
   router.use(authMiddleware);
@@ -83,19 +83,33 @@ router.post("/transactions", upload.array("receipt"), async (req, res) => {
 
     let totalCost = 0;
     const itemDetails = [];
+    let earliestExpiry = null;
 
     // 🔹 Compile receipt rows
     for (const r of rows) {
       const quantity = parseFloat(r.quantity) || 0;
       const total = parseFloat(r.total_cost) || 0;
+      const normalizedExpiry = normalizeExpiryDate(r.expiry_date);
       totalCost += total;
       itemDetails.push({
         ingredient: r.ingredient?.trim(),
         quantity,
         unit: r.unit?.trim(),
         total_cost: total,
+        expiry_date: normalizedExpiry,
         price_per_unit: quantity > 0 ? total / quantity : 0,
       });
+      if (normalizedExpiry) {
+        const candidate = new Date(normalizedExpiry).getTime();
+        if (!Number.isNaN(candidate)) {
+          if (
+            !earliestExpiry ||
+            candidate < new Date(earliestExpiry).getTime()
+          ) {
+            earliestExpiry = normalizedExpiry;
+          }
+        }
+      }
     }
 
     // 🔹 Validate supplier
@@ -117,8 +131,8 @@ router.post("/transactions", upload.array("receipt"), async (req, res) => {
     // 🔹 Save transaction
     const result = await pool.query(
       `INSERT INTO transactions
-       (restaurant_id, supplier_id, ingredient, quantity, unit, total_cost, amount_paid, due_after, payment_method, delivery_date, receipt_url, items)
-       VALUES ($1,$2,'Compiled Receipt',0,NULL,$3,0,$4,$5,NOW(),$6,$7)
+       (restaurant_id, supplier_id, ingredient, quantity, unit, total_cost, amount_paid, due_after, payment_method, delivery_date, expiry_date, receipt_url, items)
+       VALUES ($1,$2,'Compiled Receipt',0,NULL,$3,0,$4,$5,NOW(),$6,$7,$8)
        RETURNING *`,
       [
         restaurantId,
@@ -126,6 +140,7 @@ router.post("/transactions", upload.array("receipt"), async (req, res) => {
         totalCost,
         newDue,
         payment_method || "Due",
+        earliestExpiry,
         receiptUrl,
         JSON.stringify(itemDetails),
       ]
@@ -139,19 +154,36 @@ router.post("/transactions", upload.array("receipt"), async (req, res) => {
 
     // ✅ NEW PART: Upsert ingredients into stock
     for (const item of itemDetails) {
-      const { ingredient, quantity, unit } = item;
+      const { ingredient, quantity, unit, expiry_date } = item;
 
       if (!ingredient || !quantity || !unit) continue;
 
-      await pool.query(
-        `INSERT INTO stock (name, quantity, unit, supplier_id, restaurant_id)
-         VALUES ($1, $2, $3, $4, $5)
+      const stockUpsert = await pool.query(
+        `INSERT INTO stock (name, quantity, unit, supplier_id, restaurant_id, expiry_date)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (name, unit, restaurant_id)
          DO UPDATE SET
            quantity = stock.quantity + EXCLUDED.quantity,
-           supplier_id = EXCLUDED.supplier_id`,
-        [ingredient, quantity, unit, supplier_id, restaurantId]
+           supplier_id = EXCLUDED.supplier_id,
+           expiry_date = CASE
+             WHEN stock.expiry_date IS NULL THEN EXCLUDED.expiry_date
+             WHEN EXCLUDED.expiry_date IS NULL THEN stock.expiry_date
+             ELSE LEAST(stock.expiry_date, EXCLUDED.expiry_date)
+           END
+         RETURNING id, expiry_date`,
+        [ingredient, quantity, unit, supplier_id, restaurantId, expiry_date]
       );
+
+      const stockRow = stockUpsert.rows[0];
+      if (stockRow?.id) {
+        await maybeEmitExpiryAlert(
+          io,
+          restaurantId,
+          stockRow.id,
+          ingredient,
+          stockRow.expiry_date
+        );
+      }
     }
 
     // 🔹 Emit updates to frontend
@@ -281,6 +313,7 @@ router.get("/:id/transactions", async (req, res) => {
       SELECT
         id, supplier_id, ingredient, quantity, unit, total_cost,
         amount_paid, due_after, payment_method, delivery_date,
+        expiry_date,
         price_per_unit, receipt_url, items
       FROM transactions
       WHERE restaurant_id = $1

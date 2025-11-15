@@ -665,6 +665,7 @@ router.get("/qr-menu-customization", async (req, res) => {
       loyalty_goal: 10,
       loyalty_reward_text: "Free Menu Item",
       loyalty_color: "#F59E0B",
+      delivery_enabled: true,
     };
 
     res.json({
@@ -704,6 +705,58 @@ router.post("/qr-menu-customization", async (req, res) => {
   } catch (err) {
     console.error("❌ Failed to save QR customization:", err);
     res.status(500).json({ error: "Failed to save qr-menu-customization" });
+  }
+});
+
+router.post("/qr-menu-delivery", async (req, res) => {
+  try {
+    const restaurantId = req.user.restaurant_id;
+    const { delivery_enabled } = req.body;
+
+    if (typeof delivery_enabled !== "boolean") {
+      return res.status(400).json({ error: "delivery_enabled must be boolean" });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT qr_menu_customization, value
+      FROM settings
+      WHERE restaurant_id = $1 AND key = 'qr-menu-customization'
+      LIMIT 1
+      `,
+      [restaurantId]
+    );
+
+    let data = {};
+    if (result.rows.length) {
+      const row = result.rows[0];
+      if (row.qr_menu_customization) {
+        data = { ...row.qr_menu_customization };
+      } else if (row.value) {
+        try {
+          data = { ...JSON.parse(row.value) };
+        } catch {
+          data = {};
+        }
+      }
+    }
+
+    data.delivery_enabled = delivery_enabled;
+
+    await pool.query(
+      `
+      INSERT INTO settings (restaurant_id, key, qr_menu_customization)
+      VALUES ($1, 'qr-menu-customization', $2::jsonb)
+      ON CONFLICT (restaurant_id, key)
+      DO UPDATE SET qr_menu_customization = EXCLUDED.qr_menu_customization
+      `,
+      [restaurantId, JSON.stringify(data)]
+    );
+
+    res.json({ success: true, delivery_enabled });
+  } catch (err) {
+    console.error("❌ Failed to update delivery flag:", err);
+    res.status(500).json({ error: "Failed to update delivery setting" });
   }
 });
 

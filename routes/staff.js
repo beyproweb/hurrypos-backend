@@ -12,6 +12,46 @@ const logRequest = (route, method, data) => {
   console.log(`🔍 Received data: ${JSON.stringify(data, null, 2)}`);
 };
 
+const normalizeIpAddress = (value) => {
+  if (!value) return "";
+  let candidate = String(value).trim();
+  if (!candidate) return "";
+
+  if (candidate.includes(",")) {
+    candidate = candidate.split(",")[0].trim();
+  }
+
+  if (candidate.startsWith("::ffff:")) {
+    return candidate.replace("::ffff:", "");
+  }
+
+  return candidate;
+};
+
+const extractClientIp = (req) => {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) {
+    const first = forwarded.split(",")[0].trim();
+    if (first) return first;
+  }
+
+  return (
+    req.headers["x-real-ip"] ||
+    req.connection?.remoteAddress ||
+    req.socket?.remoteAddress ||
+    req.ip ||
+    ""
+  );
+};
+
+const loadUserSettings = async (restaurantId) => {
+  const result = await pool.query(
+    `SELECT users FROM settings WHERE restaurant_id = $1 AND key = 'global' LIMIT 1`,
+    [restaurantId]
+  );
+  return result.rows[0]?.users || {};
+};
+
 // Add a new staff schedule
 // ✅ Add or update a staff schedule (tenant-safe)
 router.post('/schedule', async (req, res) => {
@@ -114,7 +154,7 @@ router.get('/roles', async (req, res) => {
 // ✅ Staff Check-In / Check-Out (tenant-safe)
 router.post('/checkin', async (req, res) => {
   const restaurantId = req.user.restaurant_id; // tenant isolation
-  const { staffId, deviceId, wifiVerified, action } = req.body;
+  const { staffId, deviceId, action } = req.body;
 
   logRequest('/api/staff/checkin', 'POST', req.body);
 
@@ -129,6 +169,40 @@ router.post('/checkin', async (req, res) => {
       console.warn(`❌ Staff ${staffId} not found for tenant ${restaurantId}`);
       return res.status(404).json({ status: 'error', message: 'Staff not found' });
     }
+
+    const userSettings = await loadUserSettings(restaurantId);
+    const rawWhitelist = Array.isArray(userSettings.allowedWifiIps)
+      ? userSettings.allowedWifiIps
+      : [];
+    const normalizedWhitelist = rawWhitelist
+      .map(normalizeIpAddress)
+      .filter(Boolean);
+
+    const hasWifiRestriction = normalizedWhitelist.length > 0;
+    const clientIp = normalizeIpAddress(extractClientIp(req));
+    const ipAllowed = !hasWifiRestriction || Boolean(clientIp && normalizedWhitelist.includes(clientIp));
+
+    if (hasWifiRestriction && !clientIp) {
+      console.warn(`🚫 Staff ${staffId} blocked: unable to determine IP for Wi-Fi restriction`);
+      return res.status(403).json({
+        status: 'error',
+        error: 'Unable to determine your IP for the configured Wi-Fi restriction.',
+      });
+    }
+
+    if (hasWifiRestriction && !ipAllowed) {
+      console.warn(
+        `🚫 Staff ${staffId} ${action} blocked: ${clientIp || 'unknown'} not in ${normalizedWhitelist.join(
+          ", "
+        )}`
+      );
+      return res.status(403).json({
+        status: 'error',
+        error: 'Staff check-in/out is restricted to the configured Wi-Fi IP address.',
+      });
+    }
+
+    const wifiVerifiedFlag = hasWifiRestriction ? ipAllowed : true;
 
     // 🕓 Current Istanbul time
     const now = new Date().toLocaleString("en-US", { timeZone: "Europe/Istanbul" });
@@ -154,7 +228,7 @@ router.post('/checkin', async (req, res) => {
       await pool.query(
         `INSERT INTO attendance (restaurant_id, staff_id, check_in_time, device_id, wifi_verified)
          VALUES ($1, $2, $3, $4, $5)`,
-        [restaurantId, staffId, currentTime, deviceId, wifiVerified]
+        [restaurantId, staffId, currentTime, deviceId, wifiVerifiedFlag]
       );
 
       console.log(`✅ Checked in staff ID ${staffId}`);
