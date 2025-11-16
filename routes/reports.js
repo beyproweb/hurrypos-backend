@@ -181,10 +181,12 @@ router.get("/history", async (req, res) => {
           customer_name,
           customer_address,
           payment_method,
-          debt_paid_at
+          debt_paid_at,
+          cancellation_reason,
+          cancelled_at
         FROM orders
         WHERE restaurant_id = $1
-          AND status IN ('paid', 'closed')   -- ✅ include both paid + closed
+          AND status IN ('paid', 'closed', 'cancelled')
           AND created_at >= $2::date
           AND created_at < ($3::date + INTERVAL '1 day')
         ORDER BY created_at DESC
@@ -889,52 +891,13 @@ router.get("/daily-cash-total", async (req, res) => {
 
     const result = await pool.query(
       `
-      WITH cash_orders AS (
-        SELECT o.id
-        FROM orders o
-        WHERE o.restaurant_id = $1
-          AND o.created_at >= $2
-          AND (o.status IN ('paid','closed') OR o.is_paid = true)
-          AND LOWER(COALESCE(o.payment_method,'')) = 'cash'
-      ),
-      suborder_cash AS (
-        SELECT COALESCE(SUM(so.total), 0) AS total
-        FROM sub_orders so
-        JOIN orders o ON so.order_id = o.id
-        WHERE o.restaurant_id = $1
-          AND so.created_at >= $2
-          AND LOWER(COALESCE(so.payment_method,'')) = 'cash'
-      ),
-      base_sum AS (
-        SELECT COALESCE(SUM(o.total), 0) AS total
-        FROM orders o
-        WHERE o.id IN (SELECT id FROM cash_orders)
-      ),
-      extras_sum AS (
-        SELECT COALESCE(SUM(extra_price), 0) AS total
-        FROM (
-          SELECT
-            (extra->>'price')::numeric *
-            COALESCE((extra->>'quantity')::numeric, 1) *
-            COALESCE(oi.quantity, 1) AS extra_price
-          FROM order_items oi
-          JOIN cash_orders co ON oi.order_id = co.id
-          CROSS JOIN LATERAL jsonb_array_elements(oi.extras) AS extra
-          WHERE oi.extras IS NOT NULL AND oi.extras <> '[]'
-        ) e
-      ),
-      receipts_sum AS (
-        SELECT COALESCE(SUM(rm.amount), 0) AS total
-        FROM receipt_methods rm
-        JOIN orders o ON rm.receipt_id = o.receipt_id
-        WHERE o.id IN (SELECT id FROM cash_orders)
-          AND LOWER(rm.payment_method) = 'cash'
-      )
-      SELECT
-        (SELECT total FROM base_sum) +
-        (SELECT total FROM extras_sum) +
-        (SELECT total FROM receipts_sum) +
-        (SELECT total FROM suborder_cash) AS cash_total;
+      SELECT COALESCE(SUM(rm.amount), 0) AS cash_total
+      FROM receipt_methods rm
+      JOIN orders o ON rm.receipt_id = o.receipt_id
+      WHERE o.restaurant_id = $1
+        AND o.created_at >= $2
+        AND LOWER(rm.payment_method) = 'cash'
+        AND (o.status IN ('paid', 'closed') OR o.is_paid = true)
       `,
       [restaurantId, openTime]
     );
@@ -1316,7 +1279,7 @@ router.get("/orders/history", async (req, res) => {
     const result = await pool.query(
       `
         SELECT * FROM orders
-        WHERE status = 'closed'
+        WHERE status IN ('closed', 'cancelled')
         AND created_at >= $1::date
         AND created_at < ($2::date + INTERVAL '1 day')
         ORDER BY created_at DESC
