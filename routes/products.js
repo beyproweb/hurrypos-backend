@@ -76,6 +76,7 @@ if (r.rows.length === 0) {
          description,
          image,
          COALESCE(visible, true) AS visible,
+         COALESCE(show_add_to_cart_modal, true) AS show_add_to_cart_modal,
          ingredients,
          extras,
          selected_extras_group
@@ -163,7 +164,10 @@ router.post("/", async (req, res) => {
     ingredients,
     extras,
     selected_extras_group, // frontend field
+    show_add_to_cart_modal,
   } = req.body;
+
+  const showAddToCartModal = show_add_to_cart_modal === false ? false : true;
 
   if (!name || !price || !category) {
     return res.status(400).json({
@@ -186,11 +190,12 @@ router.post("/", async (req, res) => {
       INSERT INTO products (
         restaurant_id, name, category, price, preparation_time,
         description, discount_type, discount_value, visible, tags, allergens,
-        promo_start, promo_end, image, image_url, ingredients, extras, selected_extras_group
+        promo_start, promo_end, image, image_url, ingredients, extras, selected_extras_group,
+        show_add_to_cart_modal
       )
       VALUES ($1,$2,$3,$4,$5,
               $6,$7,$8,$9,$10,$11,
-              $12,$13,$14,$15,$16,$17,$18)
+              $12,$13,$14,$15,$16,$17,$18,$19)
       RETURNING *
       `,
       [
@@ -212,6 +217,7 @@ router.post("/", async (req, res) => {
         ingredients || [],
         extras || [],
         selected_extras_group || [], // ✅ mapped correctly now
+        showAddToCartModal,
       ]
     );
 
@@ -251,6 +257,7 @@ router.put("/:id", async (req, res) => {
     "ingredients",
     "extras",
     "selected_extras_group",
+    "show_add_to_cart_modal",
   ];
 
   const fields = Object.keys(updates).filter((k) => allowed.includes(k));
@@ -710,7 +717,9 @@ router.get("/:id", async (req, res) => {
   try {
     const result = await pool.query(
       `
-      SELECT id, name, category, price, cost, image, stock, unit, description, status, created_at
+      SELECT id, name, category, price, cost, image, stock, unit, description, status,
+             COALESCE(show_add_to_cart_modal, true) AS show_add_to_cart_modal,
+             created_at
       FROM products
       WHERE restaurant_id = $1 AND id = $2
       `,
@@ -760,7 +769,8 @@ router.get("/public/products", async (req, res) => {
         ingredients,
         extras,
         selected_extras_group,
-        COALESCE(visible, true) AS visible
+        COALESCE(visible, true) AS visible,
+        COALESCE(show_add_to_cart_modal, true) AS show_add_to_cart_modal
       FROM products
       WHERE restaurant_id = $1
         AND COALESCE(visible, true) = true

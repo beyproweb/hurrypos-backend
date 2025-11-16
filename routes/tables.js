@@ -36,7 +36,7 @@ router.get("/", async (req, res) => {
   await ensureTableColumns();
   try {
     const { rows } = await pool.query(
-  `SELECT number, is_occupied,
+  `SELECT number,
           COALESCE(active, TRUE) AS active,
           color, label,
           seats,
@@ -82,8 +82,8 @@ router.put("/count", async (req, res) => {
         );
       } else {
         await client.query(
-          `INSERT INTO tables (restaurant_id, number, is_occupied, active)
-           VALUES ($1, $2, FALSE, TRUE)`,
+          `INSERT INTO tables (restaurant_id, number, active)
+           VALUES ($1, $2, TRUE)`,
           [restaurantId, n]
         );
       }
@@ -174,8 +174,8 @@ router.patch("/:number", async (req, res) => {
       // === INSERT NEW ENTRY ===
       await pool.query(
         `INSERT INTO tables 
-           (restaurant_id, number, is_occupied, color, label, active, seats, area)
-         VALUES ($1, $2, FALSE, $3, $4, COALESCE($5, TRUE), $6, $7)`,
+           (restaurant_id, number, color, label, active, seats, area)
+         VALUES ($1, $2, $3, $4, COALESCE($5, TRUE), $6, $7)`,
         [
           restaurantId,
           number,
@@ -196,4 +196,3 @@ router.patch("/:number", async (req, res) => {
 });
 
 module.exports = router;
-

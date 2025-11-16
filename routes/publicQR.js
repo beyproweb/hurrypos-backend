@@ -54,7 +54,8 @@ router.get("/products/:identifier", async (req, res) => {
         ingredients,
         extras,
         selected_extras_group,
-        COALESCE(visible, true) AS visible
+        COALESCE(visible, true) AS visible,
+        COALESCE(show_add_to_cart_modal, true) AS show_add_to_cart_modal
       FROM products
       WHERE restaurant_id = $1
         AND COALESCE(visible, true) = true

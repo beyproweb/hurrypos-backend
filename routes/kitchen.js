@@ -97,7 +97,7 @@ router.get("/kitchen-orders", authMiddleware, async (req, res) => {
         o.restaurant_id = $1
         AND oi.confirmed = true
         AND oi.kitchen_status IN ('new', 'preparing', 'ready')
-        AND o.status IN ('occupied', 'confirmed', 'paid')
+        AND o.status IN ('confirmed', 'paid')
 AND o.order_type IN ('phone', 'packet', 'table', 'takeaway')
       ORDER BY o.created_at ASC
       `,

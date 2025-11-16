@@ -145,6 +145,55 @@ async function ensureTakeawayFields() {
   }
 }
 
+let ordersHasCancellationFields = null;
+async function ensureCancellationFields() {
+  if (ordersHasCancellationFields === true) return true;
+  try {
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS cancellation_reason TEXT`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ`
+    );
+    ordersHasCancellationFields = true;
+    return true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure cancellation columns:", err.message);
+    ordersHasCancellationFields = false;
+    return false;
+  }
+}
+
+ensureCancellationFields();
+
+let orderItemsHasCancellationFields = null;
+async function ensureOrderItemCancellationFields() {
+  if (orderItemsHasCancellationFields !== null) return orderItemsHasCancellationFields;
+  try {
+    await pool.query(
+      `ALTER TABLE order_items
+         ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ`
+    );
+    await pool.query(
+      `ALTER TABLE order_items
+         ADD COLUMN IF NOT EXISTS cancellation_reason TEXT`
+    );
+    orderItemsHasCancellationFields = true;
+    return true;
+  } catch (err) {
+    console.warn(
+      "⚠️ Unable to ensure order_items cancellation columns:",
+      err.message
+    );
+    orderItemsHasCancellationFields = false;
+    return false;
+  }
+}
+
+ensureOrderItemCancellationFields();
+
 
 // ---- Shared payload builder for printer (no order_number) ----
 async function buildFullOrderPayload(orderId, restaurantId) {
@@ -348,8 +397,8 @@ router.post("/", async (req, res) => {
     await client.query("BEGIN");
 
     const hasItems = Array.isArray(items) && items.length > 0;
-    // New orders without items start as 'occupied' to avoid exposing debt/paid flows prematurely
-    const initialStatus = hasItems ? "confirmed" : "occupied";
+    // Default to confirmed so tables remain actionable even before items are added
+    const initialStatus = "confirmed";
 
     let createdBy = null;
     if (hasCreatedByColumn && req.user?.id) {
@@ -925,7 +974,7 @@ const orderRes = await pool.query(
   [restaurantId, order_id]
 );
 const currentStatus = String(orderRes.rows[0]?.status || '').toLowerCase();
-if (["closed", "occupied", "pending", "open"].includes(currentStatus)) {
+if (["closed", "pending", "open"].includes(currentStatus)) {
   await pool.query(
     "UPDATE orders SET status = 'confirmed' WHERE restaurant_id = $1 AND id = $2",
     [restaurantId, order_id]
@@ -1302,13 +1351,6 @@ router.post("/:id/close", async (req, res) => {
       }
     }
 
-    if (order.table_number) {
-      await client.query(
-        `UPDATE tables SET is_occupied = FALSE WHERE number = $1`,
-        [order.table_number]
-      );
-    }
-
     await client.query("COMMIT");
 
     io.to(`restaurant_${restaurantId}`).emit("order_closed", { orderId: Number(order.id) });
@@ -1325,6 +1367,173 @@ router.post("/:id/close", async (req, res) => {
     res.status(500).json({ error: "Failed to close order" });
   } finally {
     client.release();
+  }
+});
+
+router.patch("/:id/cancel", async (req, res) => {
+  const { id } = req.params;
+  const orderId = Number(id);
+  if (!Number.isFinite(orderId)) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+
+  const restaurantId = await requireRestaurantId(req);
+  if (!restaurantId) return;
+
+  const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+  const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+  const partialItems = Array.from(
+    new Set(
+      rawItems
+        .map((entry) => {
+          if (entry === null || entry === undefined) return "";
+          return typeof entry === "string" ? entry.trim() : String(entry).trim();
+        })
+        .filter(Boolean)
+    )
+  );
+
+  if (partialItems.length > 0) {
+    const hasFields = await ensureOrderItemCancellationFields();
+    if (!hasFields) {
+      return res.status(500).json({
+        error: "Unable to prepare order item cancellation; contact your administrator.",
+      });
+    }
+
+    let client;
+    try {
+      client = await pool.connect();
+      await client.query("BEGIN");
+
+      const { rows: orderRows } = await client.query(
+        `SELECT id, total, status
+         FROM orders
+         WHERE restaurant_id = $1 AND id = $2
+         FOR UPDATE`,
+        [restaurantId, orderId]
+      );
+
+      if (!orderRows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Order not found" });
+      }
+
+      if (orderRows[0].status === "cancelled") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Order already cancelled" });
+      }
+
+      const { rows: itemsRows } = await client.query(
+        `SELECT id, unique_id, price, quantity
+         FROM order_items
+         WHERE order_id = $1
+           AND unique_id = ANY($2::text[])
+           AND cancelled_at IS NULL
+         FOR UPDATE`,
+        [orderId, partialItems]
+      );
+
+      if (!itemsRows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "No matching items found" });
+      }
+
+      const itemIds = itemsRows.map((item) => item.id);
+      const totalReduction = itemsRows.reduce((sum, item) => {
+        const price = toMoney(parseFloat(item.price) || 0);
+        const qty = Number(item.quantity) || 0;
+        return sum + price * qty;
+      }, 0);
+      const updatedTotal = Math.max(
+        0,
+        toMoney(orderRows[0].total || 0) - toMoney(totalReduction)
+      );
+
+      await client.query(
+        `UPDATE order_items
+           SET cancelled_at = NOW(),
+               cancellation_reason = NULLIF($1, ''),
+               kitchen_status = 'cancelled'
+         WHERE id = ANY($2::int[])`,
+        [reason, itemIds]
+      );
+
+      await client.query(
+        `UPDATE orders
+           SET total = $1
+         WHERE restaurant_id = $2 AND id = $3`,
+        [updatedTotal, restaurantId, orderId]
+      );
+
+      const { rows: remainingRows } = await client.query(
+        `SELECT COUNT(*)::int AS count
+         FROM order_items
+         WHERE order_id = $1
+           AND cancelled_at IS NULL`,
+        [orderId]
+      );
+      const remainingCount = Number(remainingRows[0]?.count ?? 0);
+      let orderNowCancelled = false;
+
+      if (remainingCount === 0) {
+        await client.query(
+          `UPDATE orders
+             SET status = 'cancelled',
+                 cancellation_reason = NULLIF($1, cancellation_reason),
+                 cancelled_at = NOW()
+           WHERE restaurant_id = $2 AND id = $3`,
+          [reason, restaurantId, orderId]
+        );
+        orderNowCancelled = true;
+      }
+
+      await client.query("COMMIT");
+
+      const ioRef = req.app.get("io");
+      ioRef && ioRef.to(`restaurant_${restaurantId}`).emit("orders_updated");
+      if (orderNowCancelled) {
+        ioRef && ioRef.to(`restaurant_${restaurantId}`).emit("order_cancelled", { orderId });
+      }
+
+      return res.json({
+        ok: true,
+        partial: true,
+        orderCancelled: orderNowCancelled,
+        itemsCancelled: itemIds.length,
+        remainingCount,
+        newTotal: updatedTotal,
+      });
+    } catch (err) {
+      if (client) await client.query("ROLLBACK");
+      console.error("❌ Failed to cancel selected items:", err);
+      return res.status(500).json({ error: "Failed to cancel selected items" });
+    } finally {
+      if (client) client.release();
+    }
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE orders
+         SET status = 'cancelled',
+             cancellation_reason = NULLIF($1, ''),
+             cancelled_at = NOW()
+       WHERE restaurant_id = $2 AND id = $3 AND status <> 'cancelled'
+       RETURNING id, table_number`,
+      [reason, restaurantId, orderId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Order not found or already cancelled" });
+    }
+
+    const ioRef = req.app.get("io");
+    ioRef && ioRef.to(`restaurant_${restaurantId}`).emit("order_cancelled", { orderId });
+    return res.json({ ok: true, orderId, orderCancelled: true, partial: false });
+  } catch (err) {
+    console.error("❌ Failed to cancel order:", err);
+    res.status(500).json({ error: "Failed to cancel order" });
   }
 });
 
@@ -1419,13 +1628,6 @@ router.post("/:id/add-debt", async (req, res) => {
     );
 
     const order = updateResult.rows[0];
-
-    if (order.table_number) {
-      await client.query(
-        `UPDATE tables SET is_occupied = FALSE WHERE number = $1`,
-        [order.table_number]
-      );
-    }
 
     await client.query("COMMIT");
 
@@ -1783,6 +1985,8 @@ router.get("/:id/items", async (req, res) => {
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
   try {
+    const hasCancellationColumn = await ensureOrderItemCancellationFields();
+    const cancelFilter = hasCancellationColumn ? "AND oi.cancelled_at IS NULL" : "";
     const result = await pool.query(
   `SELECT
      oi.product_id,
@@ -1806,7 +2010,7 @@ router.get("/:id/items", async (req, res) => {
    FROM order_items oi
    LEFT JOIN products p ON oi.product_id = p.id
    JOIN orders o ON o.id = oi.order_id
-   WHERE oi.order_id = $1 AND o.restaurant_id = $2`,
+   WHERE oi.order_id = $1 AND o.restaurant_id = $2 ${cancelFilter}`,
   [id, restaurantId]
 );
 
@@ -2040,14 +2244,6 @@ router.patch("/:id/reopen", async (req, res) => {
        RETURNING *`,
       [restaurantId, id]
     );
-
-    // 3️⃣ Re-mark the table as occupied
-    if (order.table_number) {
-      await client.query(
-        `UPDATE tables SET is_occupied = TRUE WHERE number = $1`,
-        [order.table_number]
-      );
-    }
 
     await client.query("COMMIT");
 
@@ -2400,12 +2596,6 @@ router.patch("/:id/move-table", async (req, res) => {
     }
 
     const order = rows[0];
-
-    // 1️⃣ Free old table
-    await client.query(`UPDATE tables SET is_occupied = FALSE WHERE number = $1`, [order.table_number]);
-
-    // 2️⃣ Occupy new table
-    await client.query(`UPDATE tables SET is_occupied = TRUE WHERE number = $1`, [new_table_number]);
 
     // 3️⃣ Move the order
     const updatedOrder = await client.query(
