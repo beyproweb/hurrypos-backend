@@ -249,7 +249,14 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
 
     // 1️⃣ Find restaurant ID
     const r1 = await pool.query(
-      `SELECT id FROM restaurants WHERE slug = $1 LIMIT 1`,
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1
+         OR qr_code_id = $1
+         OR id::text = $1
+      LIMIT 1
+      `,
       [slug]
     );
 
