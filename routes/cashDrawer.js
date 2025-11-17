@@ -8,8 +8,6 @@ const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 const { escpos, makeDevice, cleanErr } = require("../utils/printerHelpers");
 
-router.use(authMiddleware);
-
 async function loadRegisterSettings(restaurantId) {
   const { rows } = await pool.query(
     `
@@ -44,7 +42,7 @@ async function resolvePrinterConfig(restaurantId, override) {
   return registerSettings?.cashDrawerPrinter || null;
 }
 
-router.post("/cashdrawer/open", async (req, res) => {
+router.post("/cashdrawer/open", authMiddleware, async (req, res) => {
   const restaurantId = req.user?.restaurant_id || req.body?.restaurant_id;
   if (!restaurantId) {
     return res.status(400).json({ error: "Restaurant not resolved for cash drawer." });
