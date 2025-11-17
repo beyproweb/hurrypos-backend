@@ -1490,7 +1490,7 @@ router.post('/:staffId/payments', async (req, res) => {
       ]
     );
 
-    console.log(`✅ Payment saved for staff ${staffId}: ₺${amount} (${payment_method})`);
+    console.log(`✅ Payment saved for staff ${staffId}: ${amount} (${payment_method})`);
 
     // 🔁 Step 4: Create or update auto payroll if applicable
     if (auto && repeat_type && repeat_time) {
@@ -1524,7 +1524,7 @@ router.post('/:staffId/payments', async (req, res) => {
           <h2>💼 Payroll Receipt</h2>
           <p><strong>Name:</strong> ${name}</p>
           <p><strong>Role:</strong> ${role}</p>
-          <p><strong>Amount Paid:</strong> ₺${amount.toFixed(2)}</p>
+          <p><strong>Amount Paid:</strong> ${amount.toFixed(2)}</p>
           <p><strong>Method:</strong> ${payment_method}</p>
           <p><strong>Date:</strong> ${date || new Date().toISOString().slice(0, 10)}</p>
           ${note ? `<p><strong>Note:</strong> ${note}</p>` : ""}

@@ -10,16 +10,15 @@ const {
   getExpensesBreakdown,
   getProfitLoss,
 } = require("./reportDataService");
+const { formatCurrency: formatCurrencyWithLabel } = require("./currency");
 
-// ✅ Compatible currency format
-function formatCurrency(val) {
-  return `${parseFloat(val).toLocaleString("tr-TR", { minimumFractionDigits: 0 })} TL`;
-}
-
-async function generateReportPDF({ from, to, sections }) {
+async function generateReportPDF({ from, to, sections, currency }) {
   const doc = new PDFDocument({ margin: 50 });
   const buffers = [];
   doc.on("data", buffers.push.bind(buffers));
+
+  const formatCurrency = (val) =>
+    formatCurrencyWithLabel(val, currency);
 
   // Optional logo
   const logoPath = "public/logo.png";

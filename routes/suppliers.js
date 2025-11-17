@@ -31,9 +31,52 @@ module.exports = (io) => {
   // GET /suppliers - tenant-safe
   router.get("/", async (req, res) => {
     try {
+      const restaurantId = req.user.restaurant_id;
+
+      // Include basic aggregates per supplier so the dashboard
+      // can display total paid / spent and last purchase date.
       const result = await pool.query(
-        "SELECT * FROM suppliers WHERE restaurant_id=$1 ORDER BY name",
-        [req.user.restaurant_id]
+        `
+        SELECT
+          s.*,
+          COALESCE(tx.total_spent, 0)::numeric   AS total_spent,
+          COALESCE(tx.total_spent, 0)::numeric   AS total_purchase,
+          COALESCE(tx.total_paid, 0)::numeric    AS total_paid,
+          tx.last_purchase_date
+        FROM suppliers s
+        LEFT JOIN (
+          SELECT
+            supplier_id,
+            -- Sum of all purchase amounts (exclude pure payment rows)
+            COALESCE(SUM(
+              CASE
+                WHEN ingredient <> 'Payment' THEN total_cost
+                ELSE 0
+              END
+            ), 0) AS total_spent,
+            -- Sum of all recorded payments
+            COALESCE(SUM(
+              CASE
+                WHEN ingredient = 'Payment' THEN amount_paid
+                ELSE 0
+              END
+            ), 0) AS total_paid,
+            -- Latest purchase date (ignore payment-only rows)
+            MAX(
+              CASE
+                WHEN ingredient <> 'Payment' THEN delivery_date
+                ELSE NULL
+              END
+            ) AS last_purchase_date
+          FROM transactions
+          WHERE restaurant_id = $1
+          GROUP BY supplier_id
+        ) AS tx
+          ON tx.supplier_id = s.id
+        WHERE s.restaurant_id = $1
+        ORDER BY s.name
+        `,
+        [restaurantId]
       );
       res.json(result.rows);
     } catch (err) {
