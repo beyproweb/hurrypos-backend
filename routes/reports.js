@@ -26,11 +26,23 @@ const CASH_REGISTER_TYPES = new Set([
 ]);
 
 const { generateReportPDF, generateReportCSV } = require("../utils/exportUtils");
+const { loadLocalizationForRestaurant } = require("../utils/localization");
 
 router.post("/export/pdf", async (req, res) => {
   try {
     const { from, to, sections } = req.body;
-    const pdfBuffer = await generateReportPDF({ from, to, sections });
+    const restaurantId = req.user.restaurant_id;
+    let currency;
+    try {
+      const localization = await loadLocalizationForRestaurant(restaurantId);
+      currency = localization?.currency;
+    } catch (err) {
+      console.warn(
+        "⚠️ Failed to load localization for PDF export:",
+        err?.message || err
+      );
+    }
+    const pdfBuffer = await generateReportPDF({ from, to, sections, currency });
     res.setHeader("Content-Type", "routerlication/pdf");
     res.setHeader("Content-Disposition", "attachment; filename=report.pdf");
     res.send(pdfBuffer);

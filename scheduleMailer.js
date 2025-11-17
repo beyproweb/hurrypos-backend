@@ -1,6 +1,8 @@
 const pool = require("./db");
 const { sendEmail } = require("./utils/notifications");
 const sendNoOrderEmail = require("./utils/sendNoOrderEmail");
+const { loadLocalizationForRestaurant } = require("./utils/localization");
+const { getCurrencyMeta } = require("./utils/currency");
 require("dotenv").config();
 const dayjs = require("dayjs");
 
@@ -188,7 +190,19 @@ const runScheduledPayroll = async () => {
         VALUES ($1, $2, 'cash', '[AUTO Payroll]', true, $3, $3, $4)
       `, [staff_id, amount.toFixed(2), today, restaurant_id]);
 
-      console.log(`✅ Auto-paid staff ${staff_id} ₺${amount.toFixed(2)}`);
+      let symbol = "₺";
+      try {
+        const localization = await loadLocalizationForRestaurant(restaurant_id);
+        const meta = getCurrencyMeta(localization?.currency);
+        symbol = meta.symbol || symbol;
+      } catch (err) {
+        console.warn(
+          "⚠️ Failed to resolve currency for payroll:",
+          err?.message || err
+        );
+      }
+
+      console.log(`✅ Auto-paid staff ${staff_id} ${symbol}${amount.toFixed(2)}`);
 
       if (email) {
         const subject = `📄 Payroll Receipt - ${name}`;
@@ -196,7 +210,7 @@ const runScheduledPayroll = async () => {
           <h2>💼 Payroll Receipt</h2>
           <p><strong>Name:</strong> ${name}</p>
           <p><strong>Role:</strong> ${role}</p>
-          <p><strong>Amount Paid:</strong> ₺${amount.toFixed(2)}</p>
+          <p><strong>Amount Paid:</strong> ${symbol}${amount.toFixed(2)}</p>
           <p><strong>Method:</strong> cash</p>
           <p><strong>Date:</strong> ${today}</p>
           <p><strong>Note:</strong> [AUTO Payroll]</p>

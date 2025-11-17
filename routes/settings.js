@@ -86,72 +86,14 @@ router.get("/qr-link", async (req, res) => {
 
 
 
-const JSON_COLUMN_TYPES = new Set(["json", "jsonb"]);
-const DEFAULT_LOCALIZATION = { language: "en", currency: "₺ TRY" };
-
-async function getSettingsSchemaInfo() {
-  const { rows } = await pool.query(
-    `
-      SELECT column_name, data_type
-      FROM information_schema.columns
-      WHERE table_schema = 'public' AND table_name = 'settings'
-    `
-  );
-
-  const find = (name) => rows.find((row) => row.column_name === name);
-
-  return {
-    hasLocalization: Boolean(find("localization")),
-    localizationType: find("localization")?.data_type || null,
-    hasRestaurantId: Boolean(find("restaurant_id")),
-    hasValue: Boolean(find("value")),
-  };
-}
-
-function parseMaybeJson(value) {
-  if (value === null || typeof value === "undefined") return undefined;
-  if (typeof value === "object") return value;
-
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (
-      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-      (trimmed.startsWith("[") && trimmed.endsWith("]"))
-    ) {
-      try {
-        return JSON.parse(trimmed);
-      } catch {
-        return value;
-      }
-    }
-  }
-
-  return value;
-}
-
-function normalizeCurrency(currency) {
-  if (!currency) return DEFAULT_LOCALIZATION.currency;
-
-  const map = {
-    "₺": "₺ TRY",
-    "try": "₺ TRY",
-    "₺ try": "₺ TRY",
-    "try ₺": "₺ TRY",
-  };
-
-  const key = String(currency).trim().toLowerCase();
-  return map[key] || currency;
-}
-
-function buildLocalizationResponse(rawLocalization = {}) {
-  const merged = {
-    ...DEFAULT_LOCALIZATION,
-    ...rawLocalization,
-  };
-
-  merged.currency = normalizeCurrency(merged.currency);
-  return merged;
-}
+const {
+  JSON_COLUMN_TYPES,
+  DEFAULT_LOCALIZATION,
+  getSettingsSchemaInfo,
+  parseMaybeJson,
+  normalizeCurrency,
+  buildLocalizationResponse,
+} = require("../utils/localization");
 
 // POST /settings/shop-hours
 router.post("/shop-hours/all", async (req, res) => {
@@ -224,7 +166,17 @@ router.get("/logs/payments", async (req, res) => {
     const result = await pool.query(
       `
       SELECT to_char(delivery_date, 'YYYY-MM-DD') AS date,
-             'Paid ' || amount_paid || '₺ via ' || payment_method AS action,
+             'Paid ' || amount_paid || ' ' || COALESCE(
+               (SELECT split_part(l.localization->>'currency', ' ', 1)
+                FROM settings s
+                CROSS JOIN LATERAL COALESCE(
+                  s.localization,
+                  (s.value::jsonb -> 'localization')
+                ) AS l(localization)
+                WHERE s.key = 'global'
+                LIMIT 1),
+               '₺'
+             ) || ' via ' || payment_method AS action,
              'System' AS user
       FROM transactions
       WHERE ingredient = 'Payment'
