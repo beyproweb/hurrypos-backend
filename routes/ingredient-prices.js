@@ -12,37 +12,148 @@ module.exports = (io) => {
   // ✅ GET latest ingredient prices (tenant-safe)
   router.get("/", async (req, res) => {
     try {
-      const restaurantId = req.user.restaurant_id;
+      const restaurantId = req.user && req.user.restaurant_id;
 
-      const result = await pool.query(
-        `
-        SELECT x.name, x.unit, x.supplier, x.price_per_unit, x.previous_price, x.reason, x.changed_at
-        FROM (
-          SELECT
-            h.ingredient_name AS name,
-            h.unit,
-            h.supplier_name AS supplier,
-            h.price AS price_per_unit,
-            LAG(h.price) OVER (
-              PARTITION BY h.restaurant_id, h.ingredient_name, h.unit, h.supplier_name
-              ORDER BY h.changed_at
-            ) AS previous_price,
-            h.reason,
-            h.changed_at,
-            ROW_NUMBER() OVER (
-              PARTITION BY h.restaurant_id, h.ingredient_name, h.unit, h.supplier_name
-              ORDER BY h.changed_at DESC
-            ) AS rn
-          FROM ingredient_price_history h
-          WHERE h.restaurant_id = $1
-        ) x
-        WHERE x.rn = 1
-        ORDER BY x.name, x.supplier, x.unit
-        `,
-        [restaurantId]
-      );
+      let rows = [];
 
-      res.json(result.rows);
+      try {
+        // Prefer tenant-aware query when restaurant_id is available
+        if (!restaurantId) {
+          throw new Error("NO_TENANT_ID");
+        }
+
+        const tenantResult = await pool.query(
+          `
+          SELECT x.name, x.unit, x.supplier, x.price_per_unit, x.previous_price, x.reason, x.changed_at
+          FROM (
+            SELECT
+              h.ingredient_name AS name,
+              h.unit,
+              h.supplier_name AS supplier,
+              h.price AS price_per_unit,
+              LAG(h.price) OVER (
+                PARTITION BY h.restaurant_id, h.ingredient_name, h.unit, h.supplier_name
+                ORDER BY h.changed_at
+              ) AS previous_price,
+              h.reason,
+              h.changed_at,
+              ROW_NUMBER() OVER (
+                PARTITION BY h.restaurant_id, h.ingredient_name, h.unit, h.supplier_name
+                ORDER BY h.changed_at DESC
+              ) AS rn
+            FROM ingredient_price_history h
+            WHERE h.restaurant_id = $1
+          ) x
+          WHERE x.rn = 1
+          ORDER BY x.name, x.supplier, x.unit
+          `,
+          [restaurantId]
+        );
+
+        rows = tenantResult.rows;
+      } catch (innerErr) {
+        // Fallback for legacy databases without restaurant_id on ingredient_price_history
+        console.warn(
+          "⚠️ Tenant-aware ingredient price query failed, falling back to legacy global query:",
+          innerErr.message
+        );
+
+        const legacyResult = await pool.query(
+          `
+          SELECT x.name, x.unit, x.supplier, x.price_per_unit, x.previous_price, x.reason, x.changed_at
+          FROM (
+            SELECT
+              h.ingredient_name AS name,
+              h.unit,
+              h.supplier_name AS supplier,
+              h.price AS price_per_unit,
+              LAG(h.price) OVER (
+                PARTITION BY h.ingredient_name, h.unit, h.supplier_name
+                ORDER BY h.changed_at
+              ) AS previous_price,
+              h.reason,
+              h.changed_at,
+              ROW_NUMBER() OVER (
+                PARTITION BY h.ingredient_name, h.unit, h.supplier_name
+                ORDER BY h.changed_at DESC
+              ) AS rn
+            FROM ingredient_price_history h
+          ) x
+          WHERE x.rn = 1
+          ORDER BY x.name, x.supplier, x.unit
+          `
+        );
+
+        rows = legacyResult.rows;
+      }
+
+      // If still no rows (fresh DB or no history yet), fall back to stock/transactions
+      if (!rows || rows.length === 0) {
+        try {
+          if (!restaurantId) {
+            throw new Error("NO_RESTAURANT_FOR_STOCK_FALLBACK");
+          }
+
+          const stockResult = await pool.query(
+            `
+            SELECT
+              s.name,
+              s.unit,
+              sp.name AS supplier,
+              COALESCE(
+                NULLIF(ip1.price_per_unit, 0),
+                NULLIF(ip2.price_per_unit, 0),
+                (SELECT ROUND(total_cost / NULLIF(quantity, 0), 4)
+                 FROM transactions
+                 WHERE restaurant_id = s.restaurant_id
+                   AND LOWER(ingredient) = LOWER(s.name)
+                   AND unit = s.unit
+                   AND quantity > 0
+                 ORDER BY delivery_date DESC LIMIT 1),
+                0
+              ) AS price_per_unit,
+              NULL::numeric AS previous_price,
+              'From last transaction'::text AS reason,
+              NOW() AS changed_at
+            FROM stock s
+            LEFT JOIN suppliers sp
+              ON s.supplier_id = sp.id
+             AND sp.restaurant_id = s.restaurant_id
+            LEFT JOIN LATERAL (
+              SELECT price AS price_per_unit
+              FROM ingredient_price_history
+              WHERE LOWER(ingredient_name) = LOWER(s.name) AND unit = s.unit
+              ORDER BY changed_at DESC
+              LIMIT 1
+            ) ip1 ON true
+            LEFT JOIN LATERAL (
+              SELECT ROUND(total_cost / NULLIF(quantity, 0), 4) AS price_per_unit
+              FROM transactions
+              WHERE restaurant_id = s.restaurant_id
+                AND LOWER(ingredient) = LOWER(s.name)
+                AND unit = s.unit
+              ORDER BY delivery_date DESC
+              LIMIT 1
+            ) ip2 ON true
+            WHERE s.restaurant_id = $1
+              AND s.name IS NOT NULL
+              AND s.name <> ''
+            GROUP BY s.name, s.unit, sp.name
+            ORDER BY LOWER(s.name) ASC
+            `,
+            [restaurantId]
+          );
+
+          rows = stockResult.rows;
+        } catch (fallbackErr) {
+          console.warn(
+            "⚠️ Ingredient price stock fallback failed:",
+            fallbackErr.message
+          );
+        }
+      }
+
+      res.json(rows || []);
     } catch (err) {
       console.error("❌ Error fetching ingredient prices:", err);
       res.status(500).json({ error: "Failed to fetch ingredient prices" });
