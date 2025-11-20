@@ -107,13 +107,19 @@ router.get("/location/:driver_id", async (req, res) => {
       return res.status(400).json({ error: "Missing driver_id" });
 
     try {
-      const result = await pool.query(
-        `UPDATE orders
-         SET driver_id = $1
-         WHERE restaurant_id = $2 AND id = $3 AND driver_id IS NULL
-         RETURNING *`,
-        [driver_id, restaurantId, id]
-      );
+      const restaurantId = req.user.restaurant_id;
+const isAdmin = req.user.role === "admin" || req.user.is_admin;
+
+const result = await pool.query(
+  `UPDATE orders
+   SET driver_id = $1
+   WHERE id = $2
+     AND (driver_id IS NULL)
+     ${isAdmin ? "" : "AND restaurant_id = $3"}
+   RETURNING *`,
+   isAdmin ? [driver_id, id] : [driver_id, id, restaurantId]
+);
+
 
       if (result.rowCount === 0)
         return res.status(409).json({ error: "Already claimed" });

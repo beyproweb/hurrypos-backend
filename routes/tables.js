@@ -2,6 +2,13 @@ const express = require("express");
 const router = express.Router();
 const authMiddleware = require("../middleware/authMiddleware");
 const { pool } = require("../db");
+const jwt = require("jsonwebtoken");
+
+// Secret for signing table-level QR tokens
+const TABLE_QR_SECRET =
+  process.env.TABLE_QR_SECRET ||
+  process.env.JWT_SECRET ||
+  "table_qr_secret_2025";
 
 router.use(authMiddleware);
 
@@ -104,6 +111,53 @@ router.put("/count", async (req, res) => {
     res.status(500).json({ error: "Failed to update table count" });
   } finally {
     client.release();
+  }
+});
+
+// GET /api/tables/:number/qr-token — generate a short-lived JWT for this table
+router.get("/:number/qr-token", async (req, res) => {
+  const restaurantId = req.user.restaurant_id;
+  const number = parseInt(req.params.number, 10);
+
+  if (!Number.isFinite(number) || number <= 0) {
+    return res.status(400).json({ error: "Invalid table number" });
+  }
+
+  try {
+    // Ensure the table exists for this restaurant
+    const existing = await pool.query(
+      `SELECT id FROM tables WHERE restaurant_id = $1 AND number = $2 LIMIT 1`,
+      [restaurantId, number]
+    );
+
+    if (!existing.rows.length) {
+      return res.status(404).json({ error: "Table not found" });
+    }
+
+    const token = jwt.sign(
+      {
+        type: "table",
+        restaurant_id: restaurantId,
+        table_number: number,
+      },
+      TABLE_QR_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    const base =
+      process.env.PUBLIC_QR_BASE_URL ||
+      process.env.QR_BASE_URL ||
+      "https://pos.beypro.com";
+    const cleanBase = base.replace(/\/+$/, "");
+
+    const url = `${cleanBase}/qr?mode=table&table=${encodeURIComponent(
+      number
+    )}&token=${encodeURIComponent(token)}`;
+
+    res.json({ success: true, token, url });
+  } catch (err) {
+    console.error("❌ Failed to generate table QR token:", err);
+    res.status(500).json({ error: "Failed to generate table QR token" });
   }
 });
 
