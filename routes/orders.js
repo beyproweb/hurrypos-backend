@@ -6,6 +6,7 @@ module.exports = function(io) {
   const { getIO } = require("../utils/socket");
   const { v4: uuidv4 } = require("uuid");
   const { performance } = require("perf_hooks");
+  const jwt = require("jsonwebtoken");
   const dlog = (...args) =>
     console.log(new Date().toISOString(), "[orders]", ...args);
   const authMiddleware = require("../middleware/authMiddleware");
@@ -14,6 +15,11 @@ module.exports = function(io) {
     increaseCustomerDebt,
     decreaseCustomerDebt,
   } = require("../utils/customerDebt");
+
+  const TABLE_QR_SECRET =
+    process.env.TABLE_QR_SECRET ||
+    process.env.JWT_SECRET ||
+    "table_qr_secret_2025";
 
   let hasOrderDebtTracking = null;
   async function ensureOrderDebtTracking() {
@@ -44,15 +50,71 @@ module.exports = function(io) {
   };
 
   const PUBLIC_GET_PATTERNS = [/^\/$/, /^\/\d+$/, /^\/\d+\/items$/];
+
+  // Authentication layer:
+  // - Public GETs with ?identifier=... stay public (for dashboards)
+  // - Table QR mode (?mode=table) uses a lightweight table JWT
+  // - Everything else falls back to normal staff authMiddleware
   router.use((req, res, next) => {
-    if (req.method === "GET") {
-      const identifier = typeof req.query.identifier === "string"
-        ? req.query.identifier.trim()
-        : String(req.query.identifier || "").trim();
+    const mode =
+      typeof req.query.mode === "string"
+        ? req.query.mode.toLowerCase()
+        : String(req.query.mode || "").toLowerCase();
+
+    // 1) Public GETs for non-table QR flows
+    if (req.method === "GET" && mode !== "table") {
+      const identifier =
+        typeof req.query.identifier === "string"
+          ? req.query.identifier.trim()
+          : String(req.query.identifier || "").trim();
       if (identifier && PUBLIC_GET_PATTERNS.some((re) => re.test(req.path))) {
         return next();
       }
     }
+
+    // 2) Table QR mode – require a table-scoped JWT and attach limited context
+    if (mode === "table") {
+      const authHeader = req.headers.authorization || "";
+      if (!authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Missing table token" });
+      }
+
+      const token = authHeader.slice(7).trim();
+      try {
+        const decoded = jwt.verify(token, TABLE_QR_SECRET);
+        if (
+          !decoded ||
+          decoded.type !== "table" ||
+          !decoded.restaurant_id ||
+          typeof decoded.table_number === "undefined"
+        ) {
+          return res.status(401).json({ error: "Invalid table token" });
+        }
+
+        req.qrTable = {
+          restaurant_id: decoded.restaurant_id,
+          table_number: Number(decoded.table_number),
+        };
+
+        // Minimal req.user so requireRestaurantId() continues to work
+        req.user = {
+          ...(req.user || {}),
+          id: null,
+          name: "QR Table",
+          role: "qr-table",
+          restaurant_id: decoded.restaurant_id,
+        };
+
+        return next();
+      } catch (err) {
+        console.warn("⚠️ Table QR token verification failed:", err.message);
+        return res
+          .status(401)
+          .json({ error: "Invalid or expired table token" });
+      }
+    }
+
+    // 3) Default: staff / backend tokens
     return authMiddleware(req, res, next);
   });
 
@@ -343,6 +405,24 @@ router.post("/", async (req, res) => {
       payment_method,
     } = req.body;
 
+    // When coming from a QR table token, lock the table_number to the token
+    let effectiveTableNumber = table_number || null;
+    if (req.qrTable && order_type === "table") {
+      const tokenTable = Number(req.qrTable.table_number);
+      if (!Number.isFinite(tokenTable) || tokenTable <= 0) {
+        return res.status(403).json({ error: "Invalid table in QR token" });
+      }
+      if (
+        effectiveTableNumber !== null &&
+        Number(effectiveTableNumber) !== tokenTable
+      ) {
+        return res
+          .status(403)
+          .json({ error: "QR token does not match requested table" });
+      }
+      effectiveTableNumber = tokenTable;
+    }
+
     // Normalize pickup_time to a full timestamp string if only HH:MM is provided
     function normalizePickupTime(v) {
       if (!v) return null;
@@ -424,7 +504,7 @@ router.post("/", async (req, res) => {
     ];
     const insertValues = [
       restaurantId,
-      table_number || null,
+      effectiveTableNumber || null,
       initialStatus,
       total,
       order_type || null,
@@ -489,7 +569,12 @@ if (customer_phone && customer_address) {
 }
 
     // DEBUG
-    dlog("POST /orders created", { id: order.id, order_type, table_number, total });
+    dlog("POST /orders created", {
+      id: order.id,
+      order_type,
+      table_number: effectiveTableNumber,
+      total,
+    });
     touch(order.id, "POST /orders create");
 
     if (hasItems) {
@@ -731,6 +816,7 @@ router.put("/:id/status", async (req, res) => {
          total,
          is_paid,
          customer_phone,
+         table_number,
          COALESCE(debt_recorded_total, 0) AS debt_recorded_total
        FROM orders
       WHERE id = $1 AND restaurant_id = $2
@@ -742,6 +828,22 @@ router.put("/:id/status", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
     const existingOrder = existingRows[0];
+
+    // In table QR mode, only allow status changes for the matching table
+    if (req.qrTable) {
+      const tokenTable = Number(req.qrTable.table_number);
+      const orderTable = Number(existingOrder.table_number || 0);
+      if (
+        !Number.isFinite(tokenTable) ||
+        !Number.isFinite(orderTable) ||
+        tokenTable !== orderTable
+      ) {
+        await client.query("ROLLBACK");
+        return res
+          .status(403)
+          .json({ error: "QR token does not match this table" });
+      }
+    }
 
     const result = await client.query(
       `UPDATE orders
@@ -955,6 +1057,39 @@ router.post("/order-items", async (req, res) => {
   const { order_id, items, receipt_id } = req.body;
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
+
+  // If this request comes from a table QR token, make sure the order
+  // really belongs to that table in this restaurant.
+  if (req.qrTable) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT table_number
+         FROM orders
+         WHERE id = $1 AND restaurant_id = $2`,
+        [order_id, restaurantId]
+      );
+      const dbTable = rows.length
+        ? Number(rows[0].table_number || 0)
+        : null;
+      const tokenTable = Number(req.qrTable.table_number);
+      if (!rows.length || !Number.isFinite(dbTable)) {
+        return res.status(404).json({ error: "Order not found" });
+      }
+      if (!Number.isFinite(tokenTable) || dbTable !== tokenTable) {
+        return res
+          .status(403)
+          .json({ error: "QR token does not match this table" });
+      }
+    } catch (err) {
+      console.error(
+        "❌ Failed to verify table ownership for /orders/order-items:",
+        err
+      );
+      return res
+        .status(500)
+        .json({ error: "Failed to verify table ownership" });
+    }
+  }
 
   const preparedItems = items.map((item, idx) => {
 
