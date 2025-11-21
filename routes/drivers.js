@@ -101,34 +101,75 @@ router.get("/location/:driver_id", async (req, res) => {
   router.post("/orders/:id/claim-driver", async (req, res) => {
     const { id } = req.params;
     const { driver_id } = req.body;
-    const restaurantId = req.user.restaurant_id;
+
+    // Debug authentication
+    console.log("📍 Claim driver endpoint called:", {
+      orderId: id,
+      driverId: driver_id,
+      user: req.user ? { id: req.user.id, role: req.user.role, restaurant_id: req.user.restaurant_id } : null,
+    });
 
     if (!driver_id)
       return res.status(400).json({ error: "Missing driver_id" });
 
+    const restaurantId = req.user?.restaurant_id;
+    if (!restaurantId) {
+      return res.status(401).json({ error: "Missing restaurant context - authentication failed" });
+    }
+
     try {
-      const restaurantId = req.user.restaurant_id;
-const isAdmin = req.user.role === "admin" || req.user.is_admin;
+      const isAdmin = req.user.role === "admin" || req.user.is_admin;
 
-const result = await pool.query(
-  `UPDATE orders
-   SET driver_id = $1
-   WHERE id = $2
-     AND (driver_id IS NULL)
-     ${isAdmin ? "" : "AND restaurant_id = $3"}
-   RETURNING *`,
-   isAdmin ? [driver_id, id] : [driver_id, id, restaurantId]
-);
+      // First, verify the order exists and belongs to this restaurant
+      const orderCheck = await pool.query(
+        `SELECT id, driver_id, restaurant_id FROM orders WHERE id = $1`,
+        [id]
+      );
 
+      if (orderCheck.rowCount === 0) {
+        console.log("❌ Order not found:", id);
+        return res.status(404).json({ error: "Order not found" });
+      }
 
-      if (result.rowCount === 0)
-        return res.status(409).json({ error: "Already claimed" });
+      const order = orderCheck.rows[0];
+      console.log("📋 Order found:", { id: order.id, driver_id: order.driver_id, restaurant_id: order.restaurant_id });
 
+      if (!isAdmin) {
+        if (order.restaurant_id !== restaurantId) {
+          console.log("❌ Order restaurant mismatch:", { orderRestaurant: order.restaurant_id, userRestaurant: restaurantId });
+          return res.status(403).json({ error: "Order does not belong to your restaurant" });
+        }
+      }
+
+      if (order.driver_id !== null) {
+        console.log("❌ Order already has driver:", order.driver_id);
+        return res.status(409).json({ error: "Order already claimed by another driver" });
+      }
+
+      const result = await pool.query(
+        `UPDATE orders
+         SET driver_id = $1
+         WHERE id = $2
+           AND driver_id IS NULL
+         RETURNING *`,
+        [driver_id, id]
+      );
+
+      if (result.rowCount === 0) {
+        console.log("❌ Update failed - order already claimed");
+        return res.status(409).json({ error: "Order was already claimed" });
+      }
+
+      console.log("✅ Order claimed successfully:", { orderId: id, driverId: driver_id });
       emitOrderUpdate(io, restaurantId);
       res.json(result.rows[0]);
     } catch (err) {
-      console.error("❌ Error claiming order:", err);
-      res.status(500).json({ error: "Failed to claim order" });
+      console.error("❌ Error claiming order:", {
+        error: err.message,
+        stack: err.stack,
+        code: err.code,
+      });
+      res.status(500).json({ error: "Failed to claim order", details: err.message });
     }
   });
 

@@ -202,7 +202,7 @@ app.use("/api/orders", require("./routes/orders")(io));
 app.use("/api/drinks", authMiddleware, require("./routes/drinks")(io));
 app.use("/api/category-images", require("./routes/categoryImages"));
 app.use("/api/settings", require("./routes/settings"));
-app.use("/api/extras-groups", require("./routes/extras-groups"));
+app.use("/api/extras-groups", authMiddleware, require("./routes/extras-groups"));
 app.use("/api", require("./routes/Autosuppliersorder")(io));
 app.use("/api/phoneorders", require("./routes/phoneorders"));
 app.use("/api/customerAddresses", require("./routes/customerAddresses"));

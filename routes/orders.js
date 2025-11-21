@@ -1415,6 +1415,7 @@ router.post("/:id/close", async (req, res) => {
          table_number,
          customer_name,
          customer_phone,
+         kitchen_delivered_at,
          COALESCE(debt_recorded_total, 0) AS debt_recorded_total
        FROM orders
       WHERE restaurant_id = $1 AND id = $2
@@ -1431,6 +1432,12 @@ router.post("/:id/close", async (req, res) => {
     if (existing.status === "closed") {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Order already closed" });
+    }
+
+    // Check if kitchen has delivered the order
+    if (!existing.kitchen_delivered_at) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Order still preparing. Kitchen must deliver first!" });
     }
 
     const totalNow = toMoney(existing.total);
