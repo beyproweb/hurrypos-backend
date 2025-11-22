@@ -1449,8 +1449,30 @@ router.post("/:id/close", async (req, res) => {
       return res.status(400).json({ error: "Order already closed" });
     }
 
-    // Check if kitchen has delivered the order
-    if (!existing.kitchen_delivered_at) {
+    // Check if kitchen has delivered the order. If the order-level flag isn't set,
+    // fall back to item-level kitchen_status (some setups mark items but not order flag).
+    let kitchenDelivered = Boolean(existing.kitchen_delivered_at);
+    if (!kitchenDelivered) {
+      try {
+        const itemsRes = await client.query(
+          `SELECT kitchen_status FROM order_items WHERE order_id = $1 AND restaurant_id = $2`,
+          [id, restaurantId]
+        );
+        const items = itemsRes.rows || [];
+        if (items.length > 0) {
+          const allReady = items.every((it) => {
+            const s = (it.kitchen_status || "").toString().toLowerCase();
+            return s === "delivered" || s === "ready";
+          });
+          if (allReady) kitchenDelivered = true;
+        }
+      } catch (err) {
+        // If item-level check fails, fall back to strict order flag behavior
+        console.error("⚠️ Failed to read order items while checking kitchen delivery:", err);
+      }
+    }
+
+    if (!kitchenDelivered) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Order still preparing. Kitchen must deliver first!" });
     }
