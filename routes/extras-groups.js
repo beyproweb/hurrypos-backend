@@ -3,6 +3,36 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const jwt = require("jsonwebtoken");
+
+const JWT_SECRET = process.env.JWT_SECRET || "beypro_secret_2025";
+
+const decodeOptionalAuth = (req) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return { user: null, error: null };
+  if (!authHeader.startsWith("Bearer ")) {
+    return { user: null, error: "Malformed Authorization header" };
+  }
+
+  try {
+    const token = authHeader.slice(7).trim();
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded?.restaurant_id) {
+      return { user: null, error: "Token missing restaurant_id" };
+    }
+    return {
+      user: {
+        id: decoded.id,
+        name: decoded.name,
+        role: decoded.role,
+        restaurant_id: decoded.restaurant_id,
+      },
+      error: null,
+    };
+  } catch (err) {
+    return { user: null, error: "Invalid or expired token" };
+  }
+};
 
 async function resolveRestaurantId(req) {
   const identifier = req.query.identifier;
@@ -23,12 +53,19 @@ async function resolveRestaurantId(req) {
 /**
  * GET /api/extras-groups
  * Fetch all extras groups for the current tenant (restaurant)
+ * Supports both authenticated (Bearer token) and public (identifier query) access
  */
 router.get("/", async (req, res) => {
-  const restaurant_id = await resolveRestaurantId(req);
-  if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
-
   try {
+    // Decode optional auth token (don't fail if invalid, just skip)
+    const { user } = decodeOptionalAuth(req);
+    if (user?.restaurant_id) {
+      req.user = user;
+    }
+
+    const restaurant_id = await resolveRestaurantId(req);
+    if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
+
     const result = await pool.query(
       `
       SELECT
@@ -65,13 +102,20 @@ router.get("/", async (req, res) => {
 /**
  * GET /api/extras-groups/:id
  * Fetch one group with all its items
+ * Supports both authenticated (Bearer token) and public (identifier query) access
  */
 router.get("/:id", async (req, res) => {
-  const restaurant_id = await resolveRestaurantId(req);
-  const { id } = req.params;
-  if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
-
   try {
+    // Decode optional auth token (don't fail if invalid, just skip)
+    const { user } = decodeOptionalAuth(req);
+    if (user?.restaurant_id) {
+      req.user = user;
+    }
+
+    const restaurant_id = await resolveRestaurantId(req);
+    const { id } = req.params;
+    if (!restaurant_id) return res.status(400).json({ error: "Missing restaurant ID" });
+
     const result = await pool.query(
       `
       SELECT
