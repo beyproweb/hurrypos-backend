@@ -719,6 +719,7 @@ router.get("/:id", async (req, res) => {
       `
       SELECT id, name, category, price, cost, image, stock, unit, description, status,
              COALESCE(show_add_to_cart_modal, true) AS show_add_to_cart_modal,
+             ingredients, extras, selected_extras_group,
              created_at
       FROM products
       WHERE restaurant_id = $1 AND id = $2
