@@ -1452,18 +1452,29 @@ router.post("/:id/close", async (req, res) => {
     // Check if kitchen has delivered the order. If the order-level flag isn't set,
     // fall back to item-level kitchen_status (some setups mark items but not order flag).
     let kitchenDelivered = Boolean(existing.kitchen_delivered_at);
+    console.log(`🔍 [Order ${id}] Order-level kitchen_delivered_at: ${existing.kitchen_delivered_at} (delivered=${kitchenDelivered})`);
+    
     if (!kitchenDelivered) {
       try {
         const itemsRes = await client.query(
-          `SELECT kitchen_status FROM order_items WHERE order_id = $1 AND restaurant_id = $2`,
+          `SELECT id, kitchen_status FROM order_items WHERE order_id = $1 AND restaurant_id = $2`,
           [id, restaurantId]
         );
         const items = itemsRes.rows || [];
-        if (items.length > 0) {
+        console.log(`🍽️ [Order ${id}] Found ${items.length} items:`, items.map(it => ({ id: it.id, kitchen_status: it.kitchen_status })));
+        
+        // If there are NO items, allow close (empty order or items not tracked)
+        if (items.length === 0) {
+          console.log(`✅ [Order ${id}] No items found - allowing close`);
+          kitchenDelivered = true;
+        } else if (items.length > 0) {
           const allReady = items.every((it) => {
             const s = (it.kitchen_status || "").toString().toLowerCase();
-            return s === "delivered" || s === "ready";
+            const ready = s === "delivered" || s === "ready";
+            console.log(`   - Item ${it.id}: status="${it.kitchen_status}" → normalized="${s}" → ready=${ready}`);
+            return ready;
           });
+          console.log(`✅ [Order ${id}] All items ready? ${allReady}`);
           if (allReady) kitchenDelivered = true;
         }
       } catch (err) {
@@ -1474,8 +1485,10 @@ router.post("/:id/close", async (req, res) => {
 
     if (!kitchenDelivered) {
       await client.query("ROLLBACK");
+      console.log(`❌ [Order ${id}] Kitchen NOT delivered. Rejecting close.`);
       return res.status(409).json({ error: "Order still preparing. Kitchen must deliver first!" });
     }
+    console.log(`✅ [Order ${id}] Kitchen delivered. Proceeding with close.`);
 
     const totalNow = toMoney(existing.total);
     const recorded = toMoney(existing.debt_recorded_total);
