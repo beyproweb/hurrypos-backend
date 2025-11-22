@@ -674,7 +674,7 @@ if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
 // PUT /orders/:id/pay - Update payment info and insert a payment record
 router.put("/:id/pay", async (req, res) => {
   const { id } = req.params;
-  const { payment_method, total, amount } = req.body;
+  const { payment_method, total, amount, item_ids } = req.body;
   const orderId = parseInt(id, 10);
   const restaurantId = req.user.restaurant_id;
 
@@ -749,14 +749,29 @@ router.put("/:id/pay", async (req, res) => {
       ]
     );
 
-    // 3️⃣ Mark unpaid items as paid
-    await client.query(
-      `UPDATE order_items
-       SET paid_at = NOW(),
-           confirmed = true
-       WHERE order_id = $1 AND paid_at IS NULL`,
-      [orderId]
-    );
+    // 3️⃣ Mark selected items as paid (or all unpaid if item_ids not provided)
+    if (Array.isArray(item_ids) && item_ids.length > 0) {
+      // Partial payment: mark only selected items
+      const itemIds = item_ids.map(id => parseInt(id, 10)).filter(id => Number.isFinite(id));
+      if (itemIds.length > 0) {
+        await client.query(
+          `UPDATE order_items
+           SET paid_at = NOW(),
+               confirmed = true
+           WHERE order_id = $1 AND id = ANY($2)`,
+          [orderId, itemIds]
+        );
+      }
+    } else {
+      // Full payment: mark all unpaid items
+      await client.query(
+        `UPDATE order_items
+         SET paid_at = NOW(),
+             confirmed = true
+         WHERE order_id = $1 AND paid_at IS NULL`,
+        [orderId]
+      );
+    }
 
     if (debtReduction > 0 && existingOrder.customer_phone) {
       await decreaseCustomerDebt(
@@ -2131,6 +2146,7 @@ router.get("/:id/items", async (req, res) => {
     const cancelFilter = hasCancellationColumn ? "AND oi.cancelled_at IS NULL" : "";
     const result = await pool.query(
   `SELECT
+     oi.id,
      oi.product_id,
      oi.external_product_id,
      oi.quantity,
