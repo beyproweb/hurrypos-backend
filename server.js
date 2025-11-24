@@ -11,6 +11,9 @@ const cors = require("cors");
 // ✅ Unified CORS setup — supports web, dev, and Electron
 const allowedOrigins = [
   "http://localhost:5173",
+  "http://localhost:8081",  // Expo web dev server
+  "http://localhost:3000",  // Common dev port
+  "http://10.55.189.102:8081", // Local network dev server
   "https://pos.beypro.com",
   "https://www.pos.beypro.com",
   "https://hurrypos-frontend.onrender.com",
