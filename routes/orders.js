@@ -40,8 +40,28 @@ module.exports = function(io) {
     }
     return hasOrderDebtTracking;
   }
+
+  // ✅ Ensure payments table has previous_payment_method column for change tracking
+  let hasPaymentChangeTracking = null;
+  async function ensurePaymentChangeTracking() {
+    if (hasPaymentChangeTracking !== null) return hasPaymentChangeTracking;
+    try {
+      await pool.query(
+        `ALTER TABLE payments
+           ADD COLUMN IF NOT EXISTS previous_payment_method VARCHAR(255)`
+      );
+      hasPaymentChangeTracking = true;
+      console.log("✅ Payment change tracking column added/verified");
+    } catch (err) {
+      console.warn("⚠️ Unable to ensure payments change tracking column:", err.message);
+      hasPaymentChangeTracking = false;
+    }
+    return hasPaymentChangeTracking;
+  }
+
   ensureCustomerDebtColumn();
   ensureOrderDebtTracking();
+  ensurePaymentChangeTracking();
 
   const toMoney = (value) => {
     const num = Number.parseFloat(value);
@@ -832,6 +852,7 @@ router.put("/:id/status", async (req, res) => {
          is_paid,
          customer_phone,
          table_number,
+         payment_method AS current_payment_method,
          COALESCE(debt_recorded_total, 0) AS debt_recorded_total
        FROM orders
       WHERE id = $1 AND restaurant_id = $2
@@ -884,6 +905,22 @@ router.put("/:id/status", async (req, res) => {
 
     const updatedOrder = result.rows[0];
     const becamePaid = updatedOrder.is_paid && !existingOrder.is_paid;
+
+    // ✅ If payment_method changed, insert a record tracking the change
+    if (payment_method && payment_method !== existingOrder.current_payment_method) {
+      console.log(`💾 Payment changed from "${existingOrder.current_payment_method}" to "${payment_method}"`);
+      try {
+        await client.query(
+          `INSERT INTO payments (order_id, payment_method, previous_payment_method, amount, created_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT DO NOTHING`,
+          [id, payment_method, existingOrder.current_payment_method, 0]
+        );
+      } catch (paymentErr) {
+        console.warn("⚠️  Could not insert payment change record:", paymentErr.message);
+        // Don't fail the whole transaction if this fails
+      }
+    }
 
     if (becamePaid) {
       // ✅ Also mark all existing order_items as paid for this order
@@ -1169,6 +1206,7 @@ router.get("/:id/payments", async (req, res) => {
           p.id,
           p.amount,
           p.payment_method,
+          p.previous_payment_method,
           p.created_at
        FROM payments p
        JOIN orders o ON o.id = p.order_id
