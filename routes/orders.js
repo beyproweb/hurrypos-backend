@@ -511,6 +511,46 @@ router.post("/", async (req, res) => {
       }
     }
 
+    // 📍 Geocode customer delivery address if provided
+    let deliveryLat = null;
+    let deliveryLng = null;
+    if (customer_address && (order_type === 'packet' || order_type === 'phone')) {
+      try {
+        const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+        if (GOOGLE_API_KEY) {
+          const geocodeUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(
+            customer_address + ', Turkey'
+          )}&key=${GOOGLE_API_KEY}`;
+          const geocodeResponse = await fetch(geocodeUrl);
+          const geocodeData = await geocodeResponse.json();
+          
+          if (geocodeData.status === 'OK' && geocodeData.results[0]) {
+            deliveryLat = geocodeData.results[0].geometry.location.lat;
+            deliveryLng = geocodeData.results[0].geometry.location.lng;
+            console.log(`✅ Geocoded delivery address: ${deliveryLat}, ${deliveryLng}`);
+          }
+        }
+      } catch (err) {
+        console.warn('⚠️ Geocoding failed for delivery address:', err.message);
+      }
+    }
+    
+    // 📍 Get restaurant pickup coordinates
+    let pickupLat = null;
+    let pickupLng = null;
+    try {
+      const restaurantCoords = await pool.query(
+        'SELECT pos_location_lat, pos_location_lng FROM restaurants WHERE id = $1',
+        [restaurantId]
+      );
+      if (restaurantCoords.rows[0]) {
+        pickupLat = restaurantCoords.rows[0].pos_location_lat;
+        pickupLng = restaurantCoords.rows[0].pos_location_lng;
+      }
+    } catch (err) {
+      console.warn('⚠️ Failed to fetch restaurant coordinates:', err.message);
+    }
+
     const insertColumns = [
       "restaurant_id",
       "table_number",
@@ -521,6 +561,10 @@ router.post("/", async (req, res) => {
       "customer_phone",
       "customer_address",
       "payment_method",
+      "pickup_lat",
+      "pickup_lng",
+      "delivery_lat",
+      "delivery_lng",
     ];
     const insertValues = [
       restaurantId,
@@ -532,6 +576,10 @@ router.post("/", async (req, res) => {
       customer_phone || null,
       customer_address || null,
       payment_method || null,
+      pickupLat,
+      pickupLng,
+      deliveryLat,
+      deliveryLng,
     ];
 
     if (includeTakeawayFields) {
