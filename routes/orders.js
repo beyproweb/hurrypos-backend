@@ -2168,7 +2168,9 @@ router.get("/:id", async (req, res) => {
         r.name AS restaurant_name,
         r.slug AS restaurant_slug,
         r.logo_url AS restaurant_logo_url,
-        r.pos_location AS restaurant_pos_location
+        r.pos_location AS restaurant_pos_location,
+        r.pos_location_lat AS restaurant_pos_location_lat,
+        r.pos_location_lng AS restaurant_pos_location_lng
       FROM orders o
       LEFT JOIN restaurants r ON r.id = o.restaurant_id
       WHERE o.id = $1 AND o.restaurant_id = $2
@@ -2193,6 +2195,8 @@ router.get("/:id", async (req, res) => {
       ...record,
       payment_method,
       pos_location: record.restaurant_pos_location || null,
+      pos_location_lat: record.restaurant_pos_location_lat || null,
+      pos_location_lng: record.restaurant_pos_location_lng || null,
     };
 
     if (!response.restaurant && (record.restaurant_name || record.restaurant_slug || record.restaurant_logo_url)) {
@@ -2201,6 +2205,8 @@ router.get("/:id", async (req, res) => {
         slug: record.restaurant_slug || null,
         logo_url: record.restaurant_logo_url || null,
         pos_location: record.restaurant_pos_location || null,
+        pos_location_lat: record.restaurant_pos_location_lat || null,
+        pos_location_lng: record.restaurant_pos_location_lng || null,
       };
     }
 
