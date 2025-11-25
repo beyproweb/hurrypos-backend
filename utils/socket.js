@@ -10,7 +10,7 @@ function initSocket(server) {
 
   io = new Server(server, {
     cors: {
-      // Allow web, onrender frontend, localhost dev, and desktop apps (file:// -> null origin)
+      // Allow web, onrender frontend, localhost dev, desktop apps, and mobile
      origin: (origin, callback) => {
   try {
     if (!origin) return callback(null, true);
@@ -20,12 +20,16 @@ function initSocket(server) {
       "https://pos.beypro.com",
       "https://www.pos.beypro.com",
       "https://hurrypos-frontend.onrender.com",
+      "https://hurrypos-backend.onrender.com:443", // ✅ Mobile WebView
+      "https://hurrypos-backend.onrender.com",     // ✅ Mobile WebView
+      "http://localhost:8081",                     // ✅ Expo dev server
     ]);
 
     if (
       allowList.has(normalized) ||
       normalized.startsWith("file://") ||
       normalized.startsWith("app://") || // ✅ packaged Electron
+      normalized.startsWith("capacitor://") || // ✅ Capacitor mobile
       normalized === "null" ||
       /\.vercel\.app$/.test(normalized) ||
       !origin // ✅ allow missing header (Electron)
