@@ -206,6 +206,8 @@ router.put("/me", authMiddleware, async (req, res) => {
     cvv,
     phone,
     posLocation,
+    posLocationLat,
+    posLocationLng,
     usageType,
     efatura,
     invoiceTitle,
@@ -261,20 +263,24 @@ router.put("/me", authMiddleware, async (req, res) => {
       ]
     );
 
-    // ✅ Update RESTAURANT table (pos_location, usage_type, billing_cycle, plan)
+    // ✅ Update RESTAURANT table (pos_location, pos_location_lat, pos_location_lng, usage_type, billing_cycle, plan)
     await pool.query(
       `UPDATE restaurants
          SET name=$1,
              billing_cycle=$2,
              plan=$3,
              pos_location=$4,
-             usage_type=$5
-       WHERE id=$6`,
+             pos_location_lat=$5,
+             pos_location_lng=$6,
+             usage_type=$7
+       WHERE id=$8`,
       [
         businessName || existing.business_name,
         billingCycle || "monthly",
         activePlan || existing.subscription_plan,
         posLocation || null,
+        posLocationLat || null,
+        posLocationLng || null,
         usageType || null,
         existing.restaurant_id,
       ]
