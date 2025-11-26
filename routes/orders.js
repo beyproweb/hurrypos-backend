@@ -564,11 +564,42 @@ router.post("/", async (req, res) => {
     // Helper function for Nominatim geocoding with retry
     async function geocodeWithNominatim(address) {
       try {
+        // Try 0: Google Maps API (if available)
+        if (process.env.GOOGLE_API_KEY) {
+          console.log(`  📍 Attempt 0: Google Maps API`);
+          try {
+            const googleUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(
+              address
+            )}&region=tr&key=${process.env.GOOGLE_API_KEY}`;
+            
+            const response = await fetch(googleUrl);
+            const data = await response.json();
+            
+            if (data.results && data.results.length > 0) {
+              const result = data.results[0].geometry.location;
+              const lat = parseFloat(result.lat);
+              const lng = parseFloat(result.lng);
+              
+              // Validate result is in Tire area
+              if (lat >= 38.0 && lat <= 38.3 && lng >= 27.6 && lng <= 27.9) {
+                console.log(`    ✅ Geocoded via Google Maps: ${address} → (${lat}, ${lng})`);
+                return { lat, lng };
+              } else {
+                console.log(`    ⚠️ Google Maps result outside Tire area (${lat}, ${lng}), trying fallback`);
+              }
+            } else {
+              console.log(`    ⚠️ Google Maps returned no results`);
+            }
+          } catch (googleErr) {
+            console.error(`    ❌ Google Maps error:`, googleErr.message);
+          }
+        }
+
         // Try 1: Full address with Tire bias
         console.log(`  📍 Attempt 1: Full address with Tire bias`);
         let url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
-          address + ', Tire, İzmir, Turkey'
-        )}&format=json&limit=1&viewbox=27.6,38.0,27.9,38.3&bounded=1`;
+          address
+        )}&format=json&limit=1&countrycodes=tr`;
         
         let response = await fetch(url, {
           headers: { 'User-Agent': 'HurryPOS-Backend' }
@@ -576,38 +607,80 @@ router.post("/", async (req, res) => {
         let data = await response.json();
         
         if (data && data.length > 0) {
-          console.log(`    ✅ Found with Tire bias`);
-          return {
-            lat: parseFloat(data[0].lat),
-            lng: parseFloat(data[0].lon)
-          };
+          // Check if result is in Tire area (not just any city match)
+          const lat = parseFloat(data[0].lat);
+          const lng = parseFloat(data[0].lon);
+          
+          // Tire area bounds: lat 38.0-38.3, lng 27.6-27.9
+          if (lat >= 38.0 && lat <= 38.3 && lng >= 27.6 && lng <= 27.9) {
+            console.log(`    ✅ Found in Tire area`);
+            return { lat, lng };
+          } else {
+            console.log(`    ⚠️ Found but outside Tire area (${lat}, ${lng}), trying next attempt`);
+          }
         }
         
-        // Try 2: Simplified - just extract street + number + city
-        console.log(`  📍 Attempt 2: Simplified address`);
-        const simplified = address.replace(/Türkiye|Turkey|, \d{5}/gi, '').trim();
-        url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
-          simplified + ', Turkey'
-        )}&format=json&limit=1`;
-        
-        response = await fetch(url, {
-          headers: { 'User-Agent': 'HurryPOS-Backend' }
-        });
-        data = await response.json();
-        
-        if (data && data.length > 0) {
-          console.log(`    ✅ Found with simplified address`);
-          return {
-            lat: parseFloat(data[0].lat),
-            lng: parseFloat(data[0].lon)
-          };
+        // Try 2: Extract street name and number only
+        console.log(`  📍 Attempt 2: Street-level search`);
+        // Extract pattern: "Street Name No:XX"
+        const streetMatch = address.match(/(.+?)\s+[Nn]o[.:]?\s*(\d+)/);
+        if (streetMatch) {
+          const streetName = streetMatch[1].trim();
+          const streetNum = streetMatch[2];
+          const searchAddr = `${streetName} ${streetNum}, Tire, İzmir`;
+          
+          console.log(`    Searching for: "${searchAddr}"`);
+          url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
+            searchAddr
+          )}&format=json&limit=1&countrycodes=tr`;
+          
+          response = await fetch(url, {
+            headers: { 'User-Agent': 'HurryPOS-Backend' }
+          });
+          data = await response.json();
+          
+          if (data && data.length > 0) {
+            const lat = parseFloat(data[0].lat);
+            const lng = parseFloat(data[0].lon);
+            if (lat >= 38.0 && lat <= 38.3 && lng >= 27.6 && lng <= 27.9) {
+              console.log(`    ✅ Found street location`);
+              return { lat, lng };
+            }
+          }
         }
         
-        // Try 3: Just the city name as fallback
-        console.log(`  📍 Attempt 3: City-level fallback`);
+        // Try 3: Just neighborhood + Tire
+        console.log(`  📍 Attempt 3: Neighborhood-level search`);
+        const neighborhoodMatch = address.match(/([A-Za-zıöüşğçİÖÜŞĞÇ\s]+),\s*([A-Za-zıöüşğçİÖÜŞĞÇ\s]+)\s*[,\s]/);
+        if (neighborhoodMatch) {
+          const neighborhood = neighborhoodMatch[1].trim();
+          const searchAddr = `${neighborhood}, Tire, İzmir`;
+          
+          console.log(`    Searching for: "${searchAddr}"`);
+          url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
+            searchAddr
+          )}&format=json&limit=1&countrycodes=tr`;
+          
+          response = await fetch(url, {
+            headers: { 'User-Agent': 'HurryPOS-Backend' }
+          });
+          data = await response.json();
+          
+          if (data && data.length > 0) {
+            const lat = parseFloat(data[0].lat);
+            const lng = parseFloat(data[0].lon);
+            if (lat >= 38.0 && lat <= 38.3 && lng >= 27.6 && lng <= 27.9) {
+              console.log(`    ✅ Found neighborhood location`);
+              return { lat, lng };
+            }
+          }
+        }
+        
+        // Try 4: City-level fallback
+        console.log(`  📍 Attempt 4: City-level fallback`);
         url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
           'Tire, İzmir, Turkey'
-        )}&format=json&limit=1`;
+        )}&format=json&limit=1&countrycodes=tr`;
         
         response = await fetch(url, {
           headers: { 'User-Agent': 'HurryPOS-Backend' }
