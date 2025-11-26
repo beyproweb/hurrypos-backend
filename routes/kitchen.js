@@ -179,7 +179,7 @@ router.patch("/orders/:id/status", async (req, res) => {
       `UPDATE orders
        SET status = $1,
            total = COALESCE($2, total),
-           payment_method = CASE WHEN $3 IS NOT NULL THEN $3 ELSE payment_method END,
+           payment_method = CASE WHEN $3::TEXT IS NOT NULL THEN $3::TEXT ELSE payment_method END,
            is_paid = CASE WHEN $1 = 'paid' THEN true ELSE is_paid END
        WHERE restaurant_id = $4 AND id = $5
        RETURNING *`,
