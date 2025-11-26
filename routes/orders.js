@@ -538,8 +538,8 @@ router.post("/", async (req, res) => {
             console.warn(`⚠️ Google Maps geocoding failed (${geocodeData.status}). Trying Nominatim fallback...`);
             // Fallback to Nominatim
             const nominatimUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
-              customer_address + ', Turkey'
-            )}&format=json&limit=1`;
+              customer_address + ', Tire, İzmir, Turkey'
+            )}&format=json&limit=1&viewbox=27.6,38.0,27.9,38.3&bounded=1`;
             
             const nominatimResponse = await fetch(nominatimUrl, {
               headers: { 'User-Agent': 'HurryPOS-Backend' }
@@ -556,10 +556,10 @@ router.post("/", async (req, res) => {
           }
         } else {
           console.warn('⚠️ GOOGLE_MAPS_API_KEY not set. Trying Nominatim...');
-          // Use Nominatim as default
+          // Use Nominatim as default with Tire, İzmir bias
           const nominatimUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
-            customer_address + ', Turkey'
-          )}&format=json&limit=1`;
+            customer_address + ', Tire, İzmir, Turkey'
+          )}&format=json&limit=1&viewbox=27.6,38.0,27.9,38.3&bounded=1`;
           
           const nominatimResponse = await fetch(nominatimUrl, {
             headers: { 'User-Agent': 'HurryPOS-Backend' }
