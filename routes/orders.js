@@ -516,24 +516,70 @@ router.post("/", async (req, res) => {
     let deliveryLng = null;
     if (customer_address && (order_type === 'packet' || order_type === 'phone')) {
       try {
+        console.log(`🌍 Attempting to geocode delivery address: "${customer_address}"`);
+        
         const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
         if (GOOGLE_API_KEY) {
           const geocodeUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(
             customer_address + ', Turkey'
           )}&key=${GOOGLE_API_KEY}`;
+          
+          console.log(`📡 Google Maps geocoding request for: ${customer_address}`);
           const geocodeResponse = await fetch(geocodeUrl);
           const geocodeData = await geocodeResponse.json();
+          
+          console.log(`📊 Google Maps response status: ${geocodeData.status}`);
           
           if (geocodeData.status === 'OK' && geocodeData.results[0]) {
             deliveryLat = geocodeData.results[0].geometry.location.lat;
             deliveryLng = geocodeData.results[0].geometry.location.lng;
-            console.log(`✅ Geocoded delivery address: ${deliveryLat}, ${deliveryLng}`);
+            console.log(`✅ Geocoded via Google Maps: ${customer_address} → (${deliveryLat}, ${deliveryLng})`);
+          } else {
+            console.warn(`⚠️ Google Maps geocoding failed (${geocodeData.status}). Trying Nominatim fallback...`);
+            // Fallback to Nominatim
+            const nominatimUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
+              customer_address + ', Turkey'
+            )}&format=json&limit=1`;
+            
+            const nominatimResponse = await fetch(nominatimUrl, {
+              headers: { 'User-Agent': 'HurryPOS-Backend' }
+            });
+            const nominatimData = await nominatimResponse.json();
+            
+            if (nominatimData && nominatimData.length > 0) {
+              deliveryLat = parseFloat(nominatimData[0].lat);
+              deliveryLng = parseFloat(nominatimData[0].lon);
+              console.log(`✅ Geocoded via Nominatim: ${customer_address} → (${deliveryLat}, ${deliveryLng})`);
+            } else {
+              console.warn(`⚠️ Nominatim also failed for: ${customer_address}`);
+            }
+          }
+        } else {
+          console.warn('⚠️ GOOGLE_MAPS_API_KEY not set. Trying Nominatim...');
+          // Use Nominatim as default
+          const nominatimUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
+            customer_address + ', Turkey'
+          )}&format=json&limit=1`;
+          
+          const nominatimResponse = await fetch(nominatimUrl, {
+            headers: { 'User-Agent': 'HurryPOS-Backend' }
+          });
+          const nominatimData = await nominatimResponse.json();
+          
+          if (nominatimData && nominatimData.length > 0) {
+            deliveryLat = parseFloat(nominatimData[0].lat);
+            deliveryLng = parseFloat(nominatimData[0].lon);
+            console.log(`✅ Geocoded via Nominatim: ${customer_address} → (${deliveryLat}, ${deliveryLng})`);
+          } else {
+            console.warn(`⚠️ Nominatim failed for: ${customer_address}`);
           }
         }
       } catch (err) {
-        console.warn('⚠️ Geocoding failed for delivery address:', err.message);
+        console.error('❌ Geocoding error:', err.message);
       }
     }
+    
+    console.log(`📍 FINAL DELIVERY COORDS FOR ORDER: lat=${deliveryLat}, lng=${deliveryLng}`);
     
     // 📍 Get restaurant pickup coordinates
     let pickupLat = null;
