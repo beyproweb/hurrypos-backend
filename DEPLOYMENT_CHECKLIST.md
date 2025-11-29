@@ -3,23 +3,28 @@
 ## Pre-Deployment (Verification)
 
 - [ ] Backend code added to `routes/drivers.js` (lines 85-154)
+
   ```bash
   grep -n "active-orders" routes/drivers.js
   ```
+
   Should show: `GET /:id/active-orders` endpoint exists
 
 - [ ] Database schema verified using `verify_multi_stop_schema.sql`
+
   ```bash
   psql -U youruser -d yourdatabase -f migrations/verify_multi_stop_schema.sql
   ```
 
 - [ ] Required orders table columns exist:
+
   - `id`, `order_number`, `driver_id`, `restaurant_id`
   - `customer_name`, `delivery_address`
   - `delivery_lat`, `delivery_lng`
   - `driver_status`, `status`, `estimated_delivery_time`
 
 - [ ] Required point_of_sale table columns exist:
+
   - `id`, `name`, `address`
   - `latitude`, `longitude`
 
@@ -43,6 +48,7 @@ docker restart hurrypos-backend
 ```
 
 **Verification:**
+
 ```bash
 # Check if backend is running (adjust port if needed)
 curl http://localhost:3000/api/health
@@ -95,6 +101,7 @@ psql -U youruser -d yourdatabase -c \
 ## Step 4: Mobile App Frontend Testing
 
 ### Test 1: Single Driver with Multiple Orders
+
 1. Assign multiple orders to driver ID 89 (or test driver ID)
 2. Open mobile app as driver
 3. Navigate to map screen
@@ -107,6 +114,7 @@ psql -U youruser -d yourdatabase -c \
    - ✅ ETA calculated for each stop
 
 ### Test 2: Error Handling
+
 1. Stop backend server temporarily
 2. Open map in mobile app
 3. Verify:
@@ -117,6 +125,7 @@ psql -U youruser -d yourdatabase -c \
 6. Verify multi-stop route appears
 
 ### Test 3: Route Optimization
+
 1. Assign 5+ orders to single driver
 2. Check map performance:
    - ✅ Renders within 2 seconds
@@ -126,6 +135,7 @@ psql -U youruser -d yourdatabase -c \
 ## Step 5: Monitoring & Validation
 
 ### Backend Logs
+
 ```bash
 # Check for errors in backend logs
 tail -100f logs/backend.log | grep -i "error\|active-orders"
@@ -137,18 +147,20 @@ tail -100f logs/backend.log | grep -i "error\|active-orders"
 ```
 
 ### Database Performance
+
 ```bash
 # Check query performance
 psql -U youruser -d yourdatabase -c \
   "EXPLAIN ANALYZE
-   SELECT COUNT(*) FROM orders 
-   WHERE driver_id = 89 
+   SELECT COUNT(*) FROM orders
+   WHERE driver_id = 89
    AND status NOT IN ('closed', 'cancelled');"
 
 # Should return <50ms for typical restaurant database
 ```
 
 ### Mobile App Analytics
+
 - Monitor for crashes on map screen
 - Track API response times
 - Log any 404 or 500 errors from multi-stop endpoint
@@ -156,31 +168,41 @@ psql -U youruser -d yourdatabase -c \
 ## Troubleshooting
 
 ### Issue: 404 Error on `/api/drivers/:id/active-orders`
+
 **Solution:**
+
 - Verify backend restarted: `curl http://localhost:3000/api/health`
 - Check route exists: `grep -n "active-orders" routes/drivers.js`
 - Restart backend again if needed
 
 ### Issue: Empty array returned (no orders)
+
 **Solution:**
+
 - Verify orders exist: `psql -c "SELECT COUNT(*) FROM orders WHERE driver_id = 89;"`
 - Check status filtering: `SELECT DISTINCT status FROM orders;`
 - Ensure orders have `driver_status != 'delivered'`
 
 ### Issue: "deliveries" or "pos_location" is undefined
+
 **Solution:**
+
 - Verify point_of_sale table has data: `SELECT COUNT(*) FROM point_of_sale;`
 - Check JOIN is working: `psql -f migrations/verify_multi_stop_schema.sql`
 - Ensure `restaurant_id` foreign key is valid
 
 ### Issue: Map renders but no stops show
+
 **Solution:**
+
 - Check browser console for JavaScript errors
 - Verify `delivery_lat` and `delivery_lng` are valid numbers
 - Ensure `pos_location.latitude` and `pos_location.longitude` exist
 
 ### Issue: Slow map rendering (>3 seconds)
+
 **Solution:**
+
 - Run database indexes: `psql -f migrations/add_multi_stop_indexes.sql`
 - Check indexes exist: `psql -c "SELECT * FROM pg_indexes WHERE tablename='orders';"`
 - Monitor database query time: `EXPLAIN ANALYZE` on test query
@@ -191,7 +213,7 @@ If multi-stop causes issues:
 
 1. **Immediate**: Stop using multi-stop by setting `multiStopMode={false}` in MapModal props
 2. **Quick Fix**: Restart backend to clear any cached connections
-3. **Full Rollback**: 
+3. **Full Rollback**:
    - Comment out GET /:id/active-orders in routes/drivers.js
    - Remove database indexes (optional): `DROP INDEX idx_orders_driver_status;`
    - Restart backend
@@ -199,6 +221,7 @@ If multi-stop causes issues:
 ## Success Criteria
 
 ✅ Multi-Stop Deployment is COMPLETE when:
+
 - [ ] Backend endpoint responds with valid JSON
 - [ ] Mobile app displays multiple order stops on map
 - [ ] Driver name visible in map popups
@@ -217,6 +240,7 @@ If multi-stop causes issues:
 ---
 
 **Need Help?**
+
 - Check `MULTI_STOP_DRIVER_ROUTES.md` for technical details
 - Review `verify_multi_stop_schema.sql` for database diagnostics
 - See `MULTI_STOP_QUICKSTART.md` for quick reference

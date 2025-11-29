@@ -32,8 +32,8 @@ Fetches all active and pending orders assigned to a specific driver, formatted f
     "estimated_arrival": 15,
     "pos_name": "Main Restaurant",
     "pos_location": "Restaurant Address, Istanbul",
-    "pos_location_lat": 41.0150,
-    "pos_location_lng": 28.9700,
+    "pos_location_lat": 41.015,
+    "pos_location_lng": 28.97,
     "restaurant_id": 1,
     "created_at": "2025-01-15T10:30:00Z"
   },
@@ -43,16 +43,16 @@ Fetches all active and pending orders assigned to a specific driver, formatted f
     "customer_name": "Jane Smith",
     "customer_address": "789 Park Rd, Istanbul",
     "delivery_address": "999 River St, Istanbul",
-    "delivery_lat": 41.0200,
-    "delivery_lng": 28.9850,
+    "delivery_lat": 41.02,
+    "delivery_lng": 28.985,
     "driver_id": 89,
     "driver_status": null,
     "status": "pending",
     "estimated_arrival": 22,
     "pos_name": "Main Restaurant",
     "pos_location": "Restaurant Address, Istanbul",
-    "pos_location_lat": 41.0150,
-    "pos_location_lng": 28.9700,
+    "pos_location_lat": 41.015,
+    "pos_location_lng": 28.97,
     "restaurant_id": 1,
     "created_at": "2025-01-15T10:35:00Z"
   }
@@ -108,7 +108,7 @@ useEffect(() => {
 ### Usage Example
 
 ```tsx
-import { MapModal, MapModalRef } from './src/components/MapModal';
+import { MapModal, MapModalRef } from "./src/components/MapModal";
 
 // In your driver screen component
 const mapRef = useRef<MapModalRef>(null);
@@ -122,7 +122,7 @@ const mapRef = useRef<MapModalRef>(null);
   driverName={currentDriver.name}
   orderId={null}
   // Route will be fetched automatically from backend
-/>
+/>;
 ```
 
 ## Data Flow Diagram
@@ -154,6 +154,7 @@ Displays multi-stop route on map
 The endpoint assumes the following table structure:
 
 ### orders table
+
 - `id` - Order ID
 - `restaurant_id` - Foreign key to restaurant
 - `driver_id` - Assigned driver
@@ -169,6 +170,7 @@ The endpoint assumes the following table structure:
 - `created_at` - Order creation time
 
 ### point_of_sale table
+
 - `id` - POS ID
 - `name` - Restaurant name
 - `latitude` - Restaurant latitude
@@ -205,12 +207,14 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 For high-volume scenarios:
 
 1. **Add database indexes**:
+
    ```sql
    CREATE INDEX idx_driver_id_status ON orders(driver_id, status, driver_status);
    CREATE INDEX idx_restaurant_driver ON orders(restaurant_id, driver_id);
    ```
 
 2. **Cache active routes** (optional):
+
    ```javascript
    // Use Redis to cache active routes per driver
    const cacheKey = `driver:${driverId}:active-orders`;
@@ -229,6 +233,7 @@ For high-volume scenarios:
 ### Issue: Empty orders returned
 
 **Check:**
+
 1. Orders exist in database for the driver
 2. Orders are not marked as `closed` or `cancelled`
 3. Orders don't have `driver_status = 'delivered'`
@@ -237,6 +242,7 @@ For high-volume scenarios:
 ### Issue: 404 Not Found
 
 **Check:**
+
 1. Endpoint is registered in `routes/drivers.js`
 2. Path parameter `:id` is correctly formatted
 3. Backend server is running and accessible
@@ -244,6 +250,7 @@ For high-volume scenarios:
 ### Issue: Missing pickup location info
 
 **Check:**
+
 1. `point_of_sale` table is populated
 2. Orders have valid `restaurant_id`
 3. Point of sale records exist for the restaurant
@@ -262,4 +269,3 @@ For high-volume scenarios:
 - **Frontend**: `/src/components/MapModal.tsx` - Displays multi-stop routes
 - **Backend**: `/routes/drivers.js` - Endpoint implementation
 - **Types**: `/src/types/delivery.ts` - TypeScript interfaces
-
