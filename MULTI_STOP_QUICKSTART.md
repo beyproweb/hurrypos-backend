@@ -9,6 +9,7 @@ A new backend endpoint that enables the mobile app to display and manage multipl
 ### Backend
 
 1. **New endpoint**: `GET /api/drivers/:id/active-orders` in `/routes/drivers.js`
+
    - Fetches all active orders assigned to a driver
    - Returns pickup location (restaurant) + delivery addresses
    - Includes estimated arrival times
@@ -21,6 +22,7 @@ A new backend endpoint that enables the mobile app to display and manage multipl
 ### Frontend
 
 Already supports multi-stop routes via:
+
 - `src/components/MapModal.tsx` - Displays multi-stop routes
 - `src/utils/deliveryRouteService.ts` - Handles API calls
 
@@ -103,6 +105,7 @@ curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
 Make sure your `orders` and `point_of_sale` tables have:
 
 **orders table:**
+
 ```
 - id, restaurant_id, driver_id
 - customer_name, customer_address
@@ -112,6 +115,7 @@ Make sure your `orders` and `point_of_sale` tables have:
 ```
 
 **point_of_sale table:**
+
 ```
 - id, restaurant_id, name
 - latitude, longitude, address
@@ -143,7 +147,7 @@ Make sure your `orders` and `point_of_sale` tables have:
 ### Using Multi-Stop Routes in Your Screen
 
 ```tsx
-import { MapModal, MapModalRef } from './src/components/MapModal';
+import { MapModal, MapModalRef } from "./src/components/MapModal";
 
 export function DriverMapScreen({ driverId, driverName }) {
   const mapRef = useRef<MapModalRef>(null);
@@ -176,13 +180,13 @@ export function DriverMapScreen({ driverId, driverName }) {
 
 ## File Locations
 
-| File | Purpose |
-|------|---------|
-| `/routes/drivers.js` | Backend endpoint |
-| `/migrations/add_multi_stop_indexes.sql` | Database optimization |
-| `MULTI_STOP_DRIVER_ROUTES.md` | Complete documentation |
-| `src/components/MapModal.tsx` | Frontend map display |
-| `src/utils/deliveryRouteService.ts` | API integration |
+| File                                     | Purpose                |
+| ---------------------------------------- | ---------------------- |
+| `/routes/drivers.js`                     | Backend endpoint       |
+| `/migrations/add_multi_stop_indexes.sql` | Database optimization  |
+| `MULTI_STOP_DRIVER_ROUTES.md`            | Complete documentation |
+| `src/components/MapModal.tsx`            | Frontend map display   |
+| `src/utils/deliveryRouteService.ts`      | API integration        |
 
 ## Support
 
@@ -192,4 +196,3 @@ For issues or questions:
 2. Review endpoint response format
 3. Verify database query with `EXPLAIN ANALYZE`
 4. Check mobile app console logs for errors
-

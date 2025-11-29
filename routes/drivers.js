@@ -342,7 +342,7 @@ router.get("/location/:driver_id", async (req, res) => {
   });
 
   router.get("/google-directions", async (req, res) => {
-    const { origin, destination, waypoints } = req.query;
+    const { origin, destination, waypoints, language } = req.query;
     if (!origin || !destination)
       return res.status(400).json({ error: "Missing origin/destination" });
     const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -352,6 +352,7 @@ router.get("/location/:driver_id", async (req, res) => {
       destination
     )}&mode=driving&key=${GOOGLE_API_KEY}`;
     if (waypoints) url += `&waypoints=${encodeURIComponent(waypoints)}`;
+    if (language) url += `&language=${encodeURIComponent(language)}`;
     try {
       const result = await fetch(url);
       const data = await result.json();
