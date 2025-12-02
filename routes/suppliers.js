@@ -119,7 +119,7 @@ module.exports = (io) => {
 router.post("/transactions", upload.array("receipt"), async (req, res) => {
   try {
     const restaurantId = req.user.restaurant_id;
-    let { supplier_id, rows, payment_method } = req.body;
+    let { supplier_id, rows, payment_method, amount_paid } = req.body;
 
     if (!rows) return res.status(400).json({ error: "No rows provided" });
     rows = JSON.parse(rows); // expect array of { ingredient, quantity, unit, total_cost }
@@ -164,7 +164,12 @@ router.post("/transactions", upload.array("receipt"), async (req, res) => {
       return res.status(404).json({ error: "Supplier not found" });
 
     let currentDue = parseFloat(supplierRes.rows[0].total_due) || 0;
-    const newDue = currentDue + totalCost;
+    
+    // Parse amount_paid from request (default to 0 if not provided)
+    const paidAmount = parseFloat(amount_paid) || 0;
+    
+    // Calculate new due: current_due + total_cost - amount_paid
+    const newDue = Math.max(0, currentDue + totalCost - paidAmount);
 
     // 🔹 Optional receipt upload
     const receiptUrl = req.files?.[0]
@@ -175,12 +180,13 @@ router.post("/transactions", upload.array("receipt"), async (req, res) => {
     const result = await pool.query(
       `INSERT INTO transactions
        (restaurant_id, supplier_id, ingredient, quantity, unit, total_cost, amount_paid, due_after, payment_method, delivery_date, expiry_date, receipt_url, items)
-       VALUES ($1,$2,'Compiled Receipt',0,NULL,$3,0,$4,$5,NOW(),$6,$7,$8)
+       VALUES ($1,$2,'Compiled Receipt',0,NULL,$3,$4,$5,$6,NOW(),$7,$8,$9)
        RETURNING *`,
       [
         restaurantId,
         supplier_id,
         totalCost,
+        paidAmount,
         newDue,
         payment_method || "Due",
         earliestExpiry,
