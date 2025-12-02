@@ -78,31 +78,7 @@ router.get("/summary", async (req, res) => {
     const endDate = to || today;
     const restaurantId = req.user.restaurant_id;
 
-    // 🔹 1️⃣ Daily Sales (receipt_methods if available, fallback to orders)
-    let dailySalesRes;
-    try {
-      dailySalesRes = await client.query(`
-        SELECT COALESCE(SUM(rm.amount), 0) AS daily_sales
-        FROM receipt_methods rm
-        JOIN orders o ON rm.receipt_id = o.receipt_id
-        WHERE o.restaurant_id = $1
-          AND rm.created_at >= $2::date
-          AND rm.created_at < ($3::date + INTERVAL '1 day')
-      `, [restaurantId, startDate, endDate]);
-    } catch (err) {
-      console.warn(`⚠️ receipt_methods query failed, using orders fallback:`, err.message);
-      dailySalesRes = await client.query(`
-        SELECT COALESCE(SUM(total), 0) AS daily_sales
-        FROM orders
-        WHERE restaurant_id = $1
-          AND is_paid = true
-          AND created_at >= $2::date
-          AND created_at < ($3::date + INTERVAL '1 day')
-      `, [restaurantId, startDate, endDate]);
-    }
-    const dailySales = parseFloat(dailySalesRes.rows[0]?.daily_sales || 0);
-
-    // 🔹 2️⃣ Gross Sales (orders)
+    // 🔹 1️⃣ Gross Sales (orders)
     const grossSalesRes = await client.query(`
       SELECT COALESCE(SUM(total), 0) AS gross_sales
       FROM orders
@@ -113,7 +89,11 @@ router.get("/summary", async (req, res) => {
     `, [restaurantId, startDate, endDate]);
     const grossSales = parseFloat(grossSalesRes.rows[0]?.gross_sales || 0);
 
-    // 🔹 3️⃣ Net Sales (after discount)
+    // 🔹 1b️⃣ Daily Sales (same as gross_sales for consistency)
+    // Receipt methods can be unreliable, so we use gross_sales as the source of truth
+    const dailySales = grossSales;
+
+    // 🔹 2️⃣ Net Sales (after discount)
     const netSalesRes = await client.query(`
       SELECT COALESCE(SUM(o.total - COALESCE(p.discount_value, 0)), 0) AS net_sales
       FROM orders o
