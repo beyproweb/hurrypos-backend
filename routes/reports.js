@@ -78,16 +78,29 @@ router.get("/summary", async (req, res) => {
     const endDate = to || today;
     const restaurantId = req.user.restaurant_id;
 
-    // 🔹 1️⃣ Daily Sales (receipt_methods)
-    const dailySalesRes = await client.query(`
-      SELECT COALESCE(SUM(rm.amount), 0) AS daily_sales
-      FROM receipt_methods rm
-      JOIN orders o ON rm.receipt_id = o.receipt_id
-      WHERE o.restaurant_id = $1
-        AND rm.created_at >= $2::date
-        AND rm.created_at < ($3::date + INTERVAL '1 day')
-    `, [restaurantId, startDate, endDate]);
-    const dailySales = parseFloat(dailySalesRes.rows[0].daily_sales);
+    // 🔹 1️⃣ Daily Sales (receipt_methods if available, fallback to orders)
+    let dailySalesRes;
+    try {
+      dailySalesRes = await client.query(`
+        SELECT COALESCE(SUM(rm.amount), 0) AS daily_sales
+        FROM receipt_methods rm
+        JOIN orders o ON rm.receipt_id = o.receipt_id
+        WHERE o.restaurant_id = $1
+          AND rm.created_at >= $2::date
+          AND rm.created_at < ($3::date + INTERVAL '1 day')
+      `, [restaurantId, startDate, endDate]);
+    } catch (err) {
+      console.warn(`⚠️ receipt_methods query failed, using orders fallback:`, err.message);
+      dailySalesRes = await client.query(`
+        SELECT COALESCE(SUM(total), 0) AS daily_sales
+        FROM orders
+        WHERE restaurant_id = $1
+          AND is_paid = true
+          AND created_at >= $2::date
+          AND created_at < ($3::date + INTERVAL '1 day')
+      `, [restaurantId, startDate, endDate]);
+    }
+    const dailySales = parseFloat(dailySalesRes.rows[0]?.daily_sales || 0);
 
     // 🔹 2️⃣ Gross Sales (orders)
     const grossSalesRes = await client.query(`
@@ -98,20 +111,21 @@ router.get("/summary", async (req, res) => {
         AND created_at >= $2::date
         AND created_at < ($3::date + INTERVAL '1 day')
     `, [restaurantId, startDate, endDate]);
-    const grossSales = parseFloat(grossSalesRes.rows[0].gross_sales);
+    const grossSales = parseFloat(grossSalesRes.rows[0]?.gross_sales || 0);
 
     // 🔹 3️⃣ Net Sales (after discount)
     const netSalesRes = await client.query(`
-      SELECT COALESCE(SUM(o.total - p.discount_value), 0) AS net_sales
+      SELECT COALESCE(SUM(o.total - COALESCE(p.discount_value, 0)), 0) AS net_sales
       FROM orders o
-      JOIN order_items oi ON o.id = oi.order_id
-      JOIN products p ON oi.product_id = p.id
+      LEFT JOIN order_items oi ON o.id = oi.order_id
+      LEFT JOIN products p ON oi.product_id = p.id
       WHERE o.restaurant_id = $1
         AND o.status IN ('paid', 'closed')
         AND o.created_at >= $2::date
         AND o.created_at < ($3::date + INTERVAL '1 day')
+      GROUP BY o.id
     `, [restaurantId, startDate, endDate]);
-    const netSales = parseFloat(netSalesRes.rows[0].net_sales);
+    const netSales = parseFloat(netSalesRes.rows[0]?.net_sales || 0);
 
     // 🔹 4️⃣ Expenses (supplier + staff + tracked expenses)
     const [supplierRes, staffRes, trackedExpensesRes] = await Promise.all([
@@ -139,9 +153,9 @@ router.get("/summary", async (req, res) => {
       `, [restaurantId, startDate, endDate])
     ]);
     const expensesToday =
-      parseFloat(supplierRes.rows[0].total) + 
-      parseFloat(staffRes.rows[0].total) + 
-      parseFloat(trackedExpensesRes.rows[0].total);
+      parseFloat(supplierRes.rows[0]?.total || 0) + 
+      parseFloat(staffRes.rows[0]?.total || 0) + 
+      parseFloat(trackedExpensesRes.rows[0]?.total || 0);
 
     // 🔹 5️⃣ Profit
     const profit = netSales - expensesToday;
@@ -156,8 +170,8 @@ router.get("/summary", async (req, res) => {
         AND created_at < ($3::date + INTERVAL '1 day')
     `, [restaurantId, startDate, endDate]);
 
-    const orderCount = parseInt(avgRes.rows[0].order_count, 10);
-    const totalSum = parseFloat(avgRes.rows[0].total_sum);
+    const orderCount = parseInt(avgRes.rows[0]?.order_count || 0, 10);
+    const totalSum = parseFloat(avgRes.rows[0]?.total_sum || 0);
     const avgOrderValue = orderCount > 0 ? totalSum / orderCount : 0;
 
     res.json({
