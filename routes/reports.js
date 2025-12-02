@@ -113,8 +113,8 @@ router.get("/summary", async (req, res) => {
     `, [restaurantId, startDate, endDate]);
     const netSales = parseFloat(netSalesRes.rows[0].net_sales);
 
-    // 🔹 4️⃣ Expenses (supplier + staff)
-    const [supplierRes, staffRes] = await Promise.all([
+    // 🔹 4️⃣ Expenses (supplier + staff + tracked expenses)
+    const [supplierRes, staffRes, trackedExpensesRes] = await Promise.all([
       client.query(`
         SELECT COALESCE(SUM(amount_paid), 0) AS total
         FROM transactions
@@ -129,10 +129,19 @@ router.get("/summary", async (req, res) => {
         WHERE restaurant_id = $1
           AND created_at >= $2::date
           AND created_at < ($3::date + INTERVAL '1 day')
+      `, [restaurantId, startDate, endDate]),
+      client.query(`
+        SELECT COALESCE(SUM(amount), 0) AS total
+        FROM expenses
+        WHERE restaurant_id = $1
+          AND created_at >= $2::date
+          AND created_at < ($3::date + INTERVAL '1 day')
       `, [restaurantId, startDate, endDate])
     ]);
     const expensesToday =
-      parseFloat(supplierRes.rows[0].total) + parseFloat(staffRes.rows[0].total);
+      parseFloat(supplierRes.rows[0].total) + 
+      parseFloat(staffRes.rows[0].total) + 
+      parseFloat(trackedExpensesRes.rows[0].total);
 
     // 🔹 5️⃣ Profit
     const profit = netSales - expensesToday;
