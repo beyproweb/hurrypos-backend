@@ -14,14 +14,15 @@ const authMiddleware = require("../middleware/authMiddleware");
 
 async function ensureSettingsColumn() {
   try {
-    const { rows } = await pool.query(
+    // Check if settings column exists
+    const settingsCheck = await pool.query(
       `
       SELECT column_name
       FROM information_schema.columns
       WHERE table_name = 'user_settings' AND column_name = 'settings'
       `
     );
-    if (!rows.length) {
+    if (!settingsCheck.rows.length) {
       await pool.query(
         `
         ALTER TABLE user_settings
@@ -30,8 +31,41 @@ async function ensureSettingsColumn() {
       );
       console.log("✅ Added missing user_settings.settings column");
     }
+
+    // Check if section column exists
+    const sectionCheck = await pool.query(
+      `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'user_settings' AND column_name = 'section'
+      `
+    );
+    if (!sectionCheck.rows.length) {
+      await pool.query(
+        `
+        ALTER TABLE user_settings
+        ADD COLUMN section VARCHAR(50) DEFAULT 'general'
+        `
+      );
+      console.log("✅ Added missing user_settings.section column");
+    }
+
+    // Ensure unique constraint on (restaurant_id, section)
+    try {
+      await pool.query(
+        `
+        CREATE UNIQUE INDEX IF NOT EXISTS user_settings_restaurant_section_idx
+        ON user_settings (restaurant_id, section)
+        `
+      );
+      console.log("✅ Ensured unique constraint on user_settings (restaurant_id, section)");
+    } catch (constraintErr) {
+      // Constraint might already exist, ignore
+    }
+
+    console.log("✅ Database schema verified for printer settings");
   } catch (err) {
-    console.warn("⚠️ Could not ensure user_settings.settings column:", err.message);
+    console.warn("⚠️ Could not ensure user_settings columns:", err.message);
   }
 }
 
