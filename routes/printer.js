@@ -50,17 +50,23 @@ async function ensureSettingsColumn() {
       console.log("✅ Added missing user_settings.section column");
     }
 
-    // Ensure unique constraint on (restaurant_id, section)
+    // Ensure unique constraint on (user_id, restaurant_id, section)
     try {
       await pool.query(
         `
-        CREATE UNIQUE INDEX IF NOT EXISTS user_settings_restaurant_section_idx
-        ON user_settings (restaurant_id, section)
+        DROP INDEX IF EXISTS user_settings_restaurant_section_idx
         `
       );
-      console.log("✅ Ensured unique constraint on user_settings (restaurant_id, section)");
+      await pool.query(
+        `
+        CREATE UNIQUE INDEX IF NOT EXISTS user_settings_user_restaurant_section_idx
+        ON user_settings (user_id, restaurant_id, section)
+        WHERE user_id IS NOT NULL
+        `
+      );
+      console.log("✅ Ensured unique constraint on user_settings (user_id, restaurant_id, section)");
     } catch (constraintErr) {
-      // Constraint might already exist, ignore
+      console.error("⚠️ Could not create unique index:", constraintErr.message);
     }
 
     console.log("✅ Database schema verified for printer settings");
@@ -481,8 +487,8 @@ router.post("/sync", authMiddleware, async (req, res) => {
       `
       INSERT INTO user_settings (user_id, restaurant_id, section, settings)
       VALUES ($1, $2, 'printers', $3)
-      ON CONFLICT (restaurant_id, section)
-      DO UPDATE SET settings = EXCLUDED.settings
+      ON CONFLICT (user_id, restaurant_id, section)
+      DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()
       `,
       [userId, restaurantId, JSON.stringify(settings)]
     );
@@ -490,7 +496,8 @@ router.post("/sync", authMiddleware, async (req, res) => {
     res.json({ ok: true, settings });
   } catch (err) {
     console.error("❌ Failed to save printer settings:", err);
-    res.status(500).json({ ok: false, error: "Failed to save printer settings" });
+    console.error("Error details:", err.message);
+    res.status(500).json({ ok: false, error: "Failed to save printer settings", details: err.message });
   }
 });
 
