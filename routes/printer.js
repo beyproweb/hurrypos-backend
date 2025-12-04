@@ -82,6 +82,49 @@ router.get("/status", (req, res) => {
   res.json({ ok: true, message: "Printer routes alive" });
 });
 
+// Quick network printer discovery (tries common default gateway subnet)
+// GET /api/printer-settings/discover-network
+router.get("/discover-network", async (req, res) => {
+  try {
+    // Attempt to detect local subnet from common patterns
+    // In production, you'd want to detect this from the server's network interface
+    const defaultSubnets = [
+      "192.168.1",    // Most common home/small business
+      "192.168.0",    // Alternative home network
+      "10.0.0",       // Large private network
+      "172.16.0",     // Another common range
+    ];
+
+    const results = {};
+    
+    for (const subnet of defaultSubnets) {
+      const hosts = [];
+      // Scan first 50 addresses (configurable, but avoid full scans)
+      for (let i = 1; i <= 50; i++) {
+        hosts.push(`${subnet}.${i}`);
+      }
+      
+      const probes = await Promise.all(
+        hosts.map(host => probeTcpWithFingerprint(host, { port: 9100, timeout: 800 }))
+      );
+      
+      const found = probes.filter(p => p.ok && p.isEscpos);
+      if (found.length > 0) {
+        results[subnet] = found;
+      }
+    }
+
+    res.json({
+      ok: true,
+      discovered: Object.values(results).flat(),
+      subnetsScanned: defaultSubnets,
+      message: `Scanned ${defaultSubnets.length} subnets`,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: cleanErr(err) });
+  }
+});
+
 function serializeUsb(p, idx, now) {
   return {
     id: `usb-${idx}`,
@@ -210,6 +253,85 @@ router.post("/print", async (req, res) => {
   });
 });
 
+// Enhanced TCP probe with ESC/POS fingerprinting
+async function probeTcpWithFingerprint(host, { port = 9100, timeout = 1200 } = {}) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    const started = Date.now();
+    let done = false;
+    let responseReceived = false;
+
+    const finish = (ok, error, details = {}) => {
+      if (done) return;
+      done = true;
+      try { socket.destroy(); } catch {}
+      resolve({
+        host,
+        port,
+        ok,
+        latency: Date.now() - started,
+        error,
+        manufacturer: details.manufacturer || null,
+        model: details.model || null,
+        isEscpos: details.isEscpos || false,
+      });
+    };
+
+    socket.setTimeout(timeout, () => {
+      if (!responseReceived) {
+        finish(false, "timeout - no ESC/POS response");
+      }
+    });
+
+    socket.once("error", (err) => {
+      finish(false, err?.message || "socket error");
+    });
+
+    socket.connect(port, host, () => {
+      // Send ESC/POS status query command (0x1D 0x72 0x01)
+      // Most ESC/POS printers respond to this within 200ms
+      const statusQuery = Buffer.from([0x1d, 0x72, 0x01]);
+
+      socket.write(statusQuery, (err) => {
+        if (err) {
+          return finish(false, err.message);
+        }
+
+        // Set a listener for data response
+        const dataHandler = (data) => {
+          responseReceived = true;
+          // If we receive any data, it's likely responding to ESC/POS command
+          const isLikelyEscpos = data && data.length > 0;
+          finish(isLikelyEscpos, null, {
+            isEscpos: isLikelyEscpos,
+            manufacturer: "Network ESC/POS Printer",
+            model: `Thermal Printer (${host}:${port})`,
+          });
+        };
+
+        socket.once("data", dataHandler);
+
+        // If no response within 500ms, consider it not ESC/POS
+        const responseTimeout = setTimeout(() => {
+          if (!responseReceived) {
+            socket.removeListener("data", dataHandler);
+            // Port is open but no ESC/POS response - might be different protocol
+            finish(true, null, {
+              isEscpos: false,
+              manufacturer: "Unknown (port open)",
+              model: `Device on ${host}:${port}`,
+            });
+          }
+        }, 500);
+
+        // Clear timeout if we get response
+        socket.once("data", () => clearTimeout(responseTimeout));
+      });
+    });
+  });
+}
+
+// Legacy function for backward compatibility (TCP connectivity check only)
 function probeTcp(host, { port = 9100, timeout = 1200 } = {}) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
@@ -236,6 +358,7 @@ router.post("/lan-scan", async (req, res) => {
       to = 254,
       port = 9100,
       timeout = 1200,
+      fingerprint = true, // NEW: enable ESC/POS fingerprinting by default
     } = req.body || {};
 
     const explicitHosts = Array.isArray(hosts)
@@ -259,8 +382,10 @@ router.post("/lan-scan", async (req, res) => {
       return res.status(400).json({ error: "Provide hosts[] or base range" });
     }
 
+    // Use fingerprinting if enabled, otherwise just check TCP connectivity
+    const probeFn = fingerprint ? probeTcpWithFingerprint : probeTcp;
     const probes = await Promise.all(
-      allHosts.map(host => probeTcp(host, { port: Number(port) || 9100, timeout }))
+      allHosts.map(host => probeFn(host, { port: Number(port) || 9100, timeout }))
     );
 
     res.json({ ok: true, printers: probes });
