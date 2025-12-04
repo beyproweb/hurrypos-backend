@@ -52,21 +52,55 @@ async function ensureSettingsColumn() {
 
     // Ensure unique constraint on (user_id, restaurant_id, section)
     try {
+      // Drop old index if it exists
       await pool.query(
         `
         DROP INDEX IF EXISTS user_settings_restaurant_section_idx
         `
       );
-      await pool.query(
+      
+      // Check if the primary key is composite
+      const pkCheck = await pool.query(
         `
-        CREATE UNIQUE INDEX IF NOT EXISTS user_settings_user_restaurant_section_idx
-        ON user_settings (user_id, restaurant_id, section)
-        WHERE user_id IS NOT NULL
+        SELECT constraint_name
+        FROM information_schema.table_constraints
+        WHERE table_name = 'user_settings' 
+          AND constraint_type = 'PRIMARY KEY'
+          AND constraint_name = 'user_settings_pkey'
         `
       );
-      console.log("✅ Ensured unique constraint on user_settings (user_id, restaurant_id, section)");
+      
+      if (pkCheck.rows.length > 0) {
+        // Try to check if it's composite
+        const pkCols = await pool.query(
+          `
+          SELECT COUNT(*) as col_count
+          FROM information_schema.key_column_usage
+          WHERE table_name = 'user_settings'
+            AND constraint_name = 'user_settings_pkey'
+          `
+        );
+        
+        if (pkCols.rows[0].col_count === 1) {
+          // Primary key is only on user_id, need to fix it
+          console.log("⚠️ Fixing user_settings primary key to be composite...");
+          await pool.query(
+            `
+            ALTER TABLE user_settings 
+            DROP CONSTRAINT user_settings_pkey
+            `
+          );
+          await pool.query(
+            `
+            ALTER TABLE user_settings
+            ADD CONSTRAINT user_settings_pkey PRIMARY KEY (user_id, restaurant_id, section)
+            `
+          );
+          console.log("✅ Updated user_settings primary key to (user_id, restaurant_id, section)");
+        }
+      }
     } catch (constraintErr) {
-      console.error("⚠️ Could not create unique index:", constraintErr.message);
+      console.error("⚠️ Could not update primary key:", constraintErr.message);
     }
 
     // Check if updated_at column exists
