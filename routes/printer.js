@@ -69,6 +69,31 @@ async function ensureSettingsColumn() {
       console.error("⚠️ Could not create unique index:", constraintErr.message);
     }
 
+    // Check if updated_at column exists
+    const updatedAtCheck = await pool.query(
+      `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'user_settings' AND column_name = 'updated_at'
+      `
+    );
+    if (!updatedAtCheck.rows.length) {
+      await pool.query(
+        `
+        ALTER TABLE user_settings
+        ADD COLUMN updated_at TIMESTAMP DEFAULT NOW()
+        `
+      );
+      // Create index for faster queries
+      await pool.query(
+        `
+        CREATE INDEX IF NOT EXISTS user_settings_updated_at_idx 
+        ON user_settings(updated_at DESC)
+        `
+      );
+      console.log("✅ Added missing user_settings.updated_at column");
+    }
+
     console.log("✅ Database schema verified for printer settings");
   } catch (err) {
     console.warn("⚠️ Could not ensure user_settings columns:", err.message);
