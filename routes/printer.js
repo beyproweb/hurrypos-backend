@@ -294,11 +294,13 @@ async function probeTcpWithFingerprint(host, { port = 9100, timeout = 1200 } = {
     const started = Date.now();
     let done = false;
     let responseReceived = false;
+    let responseTimeout; // Track timeout for cleanup
 
     const finish = (ok, error, details = {}) => {
       if (done) return;
       done = true;
       try { socket.destroy(); } catch {}
+      if (responseTimeout) clearTimeout(responseTimeout);
       resolve({
         host,
         port,
@@ -311,10 +313,9 @@ async function probeTcpWithFingerprint(host, { port = 9100, timeout = 1200 } = {
       });
     };
 
+    // Overall socket timeout
     socket.setTimeout(timeout, () => {
-      if (!responseReceived) {
-        finish(false, "timeout - no ESC/POS response");
-      }
+      finish(false, `timeout (${timeout}ms) - no connection or response`);
     });
 
     socket.once("error", (err) => {
@@ -322,8 +323,7 @@ async function probeTcpWithFingerprint(host, { port = 9100, timeout = 1200 } = {
     });
 
     socket.connect(port, host, () => {
-      // Send ESC/POS status query command (0x1D 0x72 0x01)
-      // Most ESC/POS printers respond to this within 200ms
+      // Connection successful - now send ESC/POS status query (0x1D 0x72 0x01)
       const statusQuery = Buffer.from([0x1d, 0x72, 0x01]);
 
       socket.write(statusQuery, (err) => {
@@ -334,6 +334,7 @@ async function probeTcpWithFingerprint(host, { port = 9100, timeout = 1200 } = {
         // Set a listener for data response
         const dataHandler = (data) => {
           responseReceived = true;
+          if (responseTimeout) clearTimeout(responseTimeout);
           // If we receive any data, it's likely responding to ESC/POS command
           const isLikelyEscpos = data && data.length > 0;
           finish(isLikelyEscpos, null, {
@@ -345,9 +346,9 @@ async function probeTcpWithFingerprint(host, { port = 9100, timeout = 1200 } = {
 
         socket.once("data", dataHandler);
 
-        // If no response within 500ms, consider it not ESC/POS
-        const responseTimeout = setTimeout(() => {
-          if (!responseReceived) {
+        // If no response within 800ms after command sent, assume port open but not ESC/POS
+        responseTimeout = setTimeout(() => {
+          if (!responseReceived && !done) {
             socket.removeListener("data", dataHandler);
             // Port is open but no ESC/POS response - might be different protocol
             finish(true, null, {
@@ -356,10 +357,7 @@ async function probeTcpWithFingerprint(host, { port = 9100, timeout = 1200 } = {
               model: `Device on ${host}:${port}`,
             });
           }
-        }, 500);
-
-        // Clear timeout if we get response
-        socket.once("data", () => clearTimeout(responseTimeout));
+        }, 800);
       });
     });
   });
@@ -455,12 +453,17 @@ router.get("/sync", authMiddleware, async (req, res) => {
 
 router.post("/sync", authMiddleware, async (req, res) => {
   const restaurantId = req.user?.restaurant_id;
+  const userId = req.user?.id; // Extract user_id from auth context
   const payload = req.body || {};
   const layoutOverride =
     payload.layout && typeof payload.layout === "object" ? payload.layout : {};
 
   if (!restaurantId) {
     return res.status(400).json({ ok: false, error: "restaurant_id is required" });
+  }
+
+  if (!userId) {
+    return res.status(400).json({ ok: false, error: "user_id is required" });
   }
 
   const settings = {
@@ -476,12 +479,12 @@ router.post("/sync", authMiddleware, async (req, res) => {
   try {
     await pool.query(
       `
-      INSERT INTO user_settings (restaurant_id, section, settings)
-      VALUES ($1, 'printers', $2)
+      INSERT INTO user_settings (user_id, restaurant_id, section, settings)
+      VALUES ($1, $2, 'printers', $3)
       ON CONFLICT (restaurant_id, section)
       DO UPDATE SET settings = EXCLUDED.settings
       `,
-      [restaurantId, JSON.stringify(settings)]
+      [userId, restaurantId, JSON.stringify(settings)]
     );
 
     res.json({ ok: true, settings });
