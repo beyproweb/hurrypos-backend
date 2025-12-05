@@ -1223,13 +1223,22 @@ router.post("/:id/print", async (req, res) => {
     return;
   }
 
-  const { items = [] } = req.body;
-
   try {
-    // Verify order exists and belongs to this restaurant
+    // Fetch complete order from database with all details
     const { rows: orderRows } = await pool.query(
-      `SELECT id, table_number, total, status FROM orders
-       WHERE id = $1 AND restaurant_id = $2`,
+      `SELECT 
+        o.id, 
+        o.table_number, 
+        o.total, 
+        o.status,
+        o.tax_value,
+        o.discount_value,
+        o.payment_method,
+        o.created_at,
+        o.customer_name,
+        o.customer_phone
+       FROM orders o
+       WHERE o.id = $1 AND o.restaurant_id = $2`,
       [id, restaurantId]
     );
 
@@ -1240,12 +1249,66 @@ router.post("/:id/print", async (req, res) => {
 
     const order = orderRows[0];
 
+    // Fetch all order items with their details
+    const { rows: itemRows } = await pool.query(
+      `SELECT 
+        oi.id,
+        oi.product_id,
+        oi.quantity,
+        oi.unit_price,
+        oi.line_total,
+        p.name as product_name,
+        oi.extras,
+        oi.note
+       FROM order_items oi
+       LEFT JOIN products p ON oi.product_id = p.id
+       WHERE oi.order_id = $1
+       ORDER BY oi.created_at ASC`,
+      [id]
+    );
+
+    // Format items for receipt printer
+    const items = itemRows.map(item => {
+      let extras = [];
+      try {
+        if (item.extras) {
+          extras = typeof item.extras === 'string' ? JSON.parse(item.extras) : item.extras;
+        }
+      } catch (e) {
+        console.warn(`Failed to parse extras for item ${item.id}:`, e);
+      }
+
+      return {
+        id: item.id,
+        product_id: item.product_id,
+        name: item.product_name || "Unknown Item",
+        quantity: item.quantity,
+        unit_price: item.unit_price,
+        price: item.unit_price, // For backward compatibility
+        line_total: item.line_total,
+        total: item.line_total,
+        extras: extras,
+        note: item.note,
+      };
+    });
+
+    console.log(`🖨️  [PRINT] Fetched ${items.length} items for order ${id}`);
+
     // Prepare print data for Electron app
     const printData = {
       orderId: order.id,
+      id: order.id, // For compatibility
       tableNumber: order.table_number,
+      table_number: order.table_number,
       total: order.total,
-      items: items || [],
+      tax_value: order.tax_value,
+      discount_value: order.discount_value,
+      payment_method: order.payment_method,
+      status: order.status,
+      created_at: order.created_at,
+      customer_name: order.customer_name,
+      customer_phone: order.customer_phone,
+      items: items,
       timestamp: new Date().toISOString(),
     };
 
