@@ -218,6 +218,7 @@ router.get("/history", async (req, res) => {
 // GET /reports/sales-by-payment-method
 router.get("/sales-by-payment-method", async (req, res) => {
   const { from, to } = req.query;
+  const restaurantId = req.user.restaurant_id;
   let dateFilter = "";
 
   if (from && to) {
@@ -228,10 +229,13 @@ router.get("/sales-by-payment-method", async (req, res) => {
     const result = await pool.query(`
       SELECT payment_method, SUM(total) AS value
       FROM orders
-      WHERE is_paid = true AND payment_method IS NOT NULL AND payment_method != ''
+      WHERE restaurant_id = $1
+        AND is_paid = true
+        AND payment_method IS NOT NULL
+        AND payment_method != ''
       ${dateFilter}
       GROUP BY payment_method
-    `);
+    `, [restaurantId]);
 
     const formatted = result.rows.map((row) => ({
       method: row.payment_method,
@@ -248,6 +252,7 @@ router.get("/sales-by-payment-method", async (req, res) => {
 // GET /reports/sales-by-payment-method-detailed
 router.get("/sales-by-payment-method-detailed", async (req, res) => {
   const { from, to } = req.query;
+  const restaurantId = req.user.restaurant_id;
   let dateFilter = "";
 
   if (from && to) {
@@ -268,10 +273,11 @@ router.get("/sales-by-payment-method-detailed", async (req, res) => {
         FROM receipt_methods
         GROUP BY receipt_id
       ) sub ON rm.receipt_id = sub.receipt_id
-      WHERE o.status = 'closed' ${dateFilter}
+      WHERE o.restaurant_id = $1
+        AND o.status = 'closed' ${dateFilter}
       GROUP BY rm.payment_method
       ORDER BY total DESC
-    `);
+    `, [restaurantId]);
 
     const formatted = result.rows.map(r => ({
       method: r.payment_method,
@@ -479,6 +485,7 @@ router.get("/daily-cash-expenses", async (req, res) => {
 // GET /reports/sales-trends
 router.get("/sales-trends", async (req, res) => {
   const { type = "daily" } = req.query;
+  const restaurantId = req.user.restaurant_id;
 
   let groupBy, labelFormat;
   switch (type) {
@@ -508,10 +515,12 @@ router.get("/sales-trends", async (req, res) => {
         ${labelFormat} AS label,
         SUM(total) AS sales
       FROM orders
-      WHERE is_paid = true
+      WHERE restaurant_id = $1
+        AND is_paid = true
       GROUP BY ${groupBy}
       ORDER BY ${groupBy} ASC
-      `
+      `,
+      [restaurantId]
     );
 
     res.json(result.rows);
@@ -524,6 +533,7 @@ router.get("/sales-trends", async (req, res) => {
 // GET /reports/sales-by-category?from=2025-05-01&to=2025-05-13
 router.get("/sales-by-category", async (req, res) => {
   const { from, to } = req.query;
+  const restaurantId = req.user.restaurant_id;
 
   const fromDate = from || "2000-01-01";
   const toDate = to || "2100-01-01";
@@ -534,12 +544,13 @@ router.get("/sales-by-category", async (req, res) => {
       FROM order_items oi
       JOIN products p ON oi.product_id = p.id
       JOIN orders o ON oi.order_id = o.id
-      WHERE o.is_paid = true
-        AND o.created_at >= $1
-        AND o.created_at < ($2::date + INTERVAL '1 day')
+      WHERE o.restaurant_id = $1
+        AND o.is_paid = true
+        AND o.created_at >= $2
+        AND o.created_at < ($3::date + INTERVAL '1 day')
       GROUP BY p.category
       ORDER BY total_sales DESC
-    `, [fromDate, toDate]);
+    `, [restaurantId, fromDate, toDate]);
 
     const formatted = result.rows.map(row => ({
       category: row.category || "Uncategorized",
@@ -556,6 +567,7 @@ router.get("/sales-by-category", async (req, res) => {
 // GET /reports/sales-by-category-detailed?from=YYYY-MM-DD&to=YYYY-MM-DD
 router.get("/sales-by-category-detailed", async (req, res) => {
   const { from, to } = req.query;
+  const restaurantId = req.user.restaurant_id;
 
   const fromDate = from || "2000-01-01";
   const toDate = to || "2100-01-01";
@@ -570,12 +582,13 @@ router.get("/sales-by-category-detailed", async (req, res) => {
       FROM order_items oi
       JOIN products p ON oi.product_id = p.id
       JOIN orders o ON oi.order_id = o.id
-      WHERE o.is_paid = true
-        AND o.created_at >= $1
-        AND o.created_at < ($2::date + INTERVAL '1 day')
+      WHERE o.restaurant_id = $1
+        AND o.is_paid = true
+        AND o.created_at >= $2
+        AND o.created_at < ($3::date + INTERVAL '1 day')
       GROUP BY p.category, p.name
       ORDER BY p.category, total DESC
-    `, [fromDate, toDate]);
+    `, [restaurantId, fromDate, toDate]);
 
     const grouped = {};
     for (const row of result.rows) {
@@ -599,6 +612,7 @@ router.get("/sales-by-category-detailed", async (req, res) => {
 // GET /reports/category-trends?from=YYYY-MM-DD&to=YYYY-MM-DD
 router.get("/category-trends", async (req, res) => {
   const { from, to } = req.query;
+  const restaurantId = req.user.restaurant_id;
   const fromDate = from || "2000-01-01";
   const toDate   = to   || "2100-01-01";
 
@@ -611,12 +625,13 @@ router.get("/category-trends", async (req, res) => {
       FROM order_items oi
       JOIN products p ON oi.product_id = p.id
       JOIN orders o   ON oi.order_id   = o.id
-      WHERE o.is_paid = true
-        AND o.created_at >= $1::date
-        AND o.created_at <  ($2::date + INTERVAL '1 day')
+      WHERE o.restaurant_id = $1
+        AND o.is_paid = true
+        AND o.created_at >= $2::date
+        AND o.created_at <  ($3::date + INTERVAL '1 day')
       GROUP BY date, p.category
       ORDER BY date ASC
-    `, [fromDate, toDate]);
+    `, [restaurantId, fromDate, toDate]);
 
     // pivot into [{ date, CatA: 123, CatB: 456, … }, …]
     const map = {};
@@ -799,6 +814,7 @@ router.get("/cash-register-trends", async (req, res) => {
 router.get("/order-items", async (req, res) => {
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: "Missing date range" });
+  const restaurantId = req.user.restaurant_id;
 
   try {
     const result = await pool.query(`
@@ -806,10 +822,11 @@ router.get("/order-items", async (req, res) => {
       FROM order_items oi
       JOIN orders o ON oi.order_id = o.id
       JOIN products p ON oi.product_id = p.id
-      WHERE o.created_at >= $1::date AND o.created_at < ($2::date + INTERVAL '1 day')
-
+      WHERE o.restaurant_id = $1
+        AND o.created_at >= $2::date
+        AND o.created_at < ($3::date + INTERVAL '1 day')
         AND o.is_paid = true
-    `, [from, to]);
+    `, [restaurantId, from, to]);
 
     res.json(result.rows);
   } catch (err) {
