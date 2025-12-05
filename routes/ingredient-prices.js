@@ -122,7 +122,8 @@ module.exports = (io) => {
             LEFT JOIN LATERAL (
               SELECT price AS price_per_unit
               FROM ingredient_price_history
-              WHERE LOWER(ingredient_name) = LOWER(s.name) AND unit = s.unit
+              WHERE restaurant_id = s.restaurant_id
+                AND LOWER(ingredient_name) = LOWER(s.name) AND unit = s.unit
               ORDER BY changed_at DESC
               LIMIT 1
             ) ip1 ON true
