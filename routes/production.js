@@ -208,7 +208,7 @@ router.get("/recipes", async (req, res) => {
     let recipeQuery = `SELECT * FROM recipes`;
     const params = [];
     if (restaurant_id) {
-      recipeQuery += ` WHERE restaurant_id = $1 OR restaurant_id IS NULL`;
+      recipeQuery += ` WHERE restaurant_id = $1`;
       params.push(restaurant_id);
     }
     recipeQuery += ` ORDER BY id`;
