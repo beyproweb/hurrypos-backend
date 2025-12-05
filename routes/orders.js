@@ -1212,6 +1212,63 @@ router.put("/:id/status", async (req, res) => {
 });
 
 
+// POST /api/orders/:id/print - Send print request to Electron app
+// Phone → Backend → Electron (Restaurant) → Printer
+router.post("/:id/print", async (req, res) => {
+  console.log(`🖨️  [PRINT] Incoming request for order ${req.params.id}`);
+  const { id } = req.params;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) {
+    console.log(`🖨️  [PRINT] Failed to get restaurantId`);
+    return;
+  }
+
+  const { items = [] } = req.body;
+
+  try {
+    // Verify order exists and belongs to this restaurant
+    const { rows: orderRows } = await pool.query(
+      `SELECT id, table_number, total, status FROM orders
+       WHERE id = $1 AND restaurant_id = $2`,
+      [id, restaurantId]
+    );
+
+    if (!orderRows.length) {
+      console.log(`🖨️  [PRINT] Order ${id} not found for restaurant ${restaurantId}`);
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const order = orderRows[0];
+
+    // Prepare print data for Electron app
+    const printData = {
+      orderId: order.id,
+      tableNumber: order.table_number,
+      total: order.total,
+      items: items || [],
+      timestamp: new Date().toISOString(),
+    };
+
+    // 🔔 Emit to Electron app for this restaurant
+    // The Electron app will listen for 'print_request' on its restaurant socket
+    io.to(`restaurant_${restaurantId}`).emit("print_request", {
+      ...printData,
+      restaurantId,
+    });
+
+    console.log(`🖨️  [PRINT] Print request sent for order ${id} at restaurant ${restaurantId}`);
+
+    res.json({
+      success: true,
+      message: "Print request sent to restaurant printer",
+      orderId: id,
+    });
+  } catch (err) {
+    console.error("❌ [PRINT] Failed to send print request:", err);
+    res.status(500).json({ error: "Failed to send print request" });
+  }
+});
+
 
 // GET /api/driver-report?driver_id=1&date=YYYY-MM-DD
 router.get("/driver-report", async (req, res) => {
