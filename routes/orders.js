@@ -1255,15 +1255,15 @@ router.post("/:id/print", async (req, res) => {
         oi.id,
         oi.product_id,
         oi.quantity,
-        oi.unit_price,
-        oi.line_total,
+        oi.price,
+        oi.price * oi.quantity as line_total,
         p.name as product_name,
         oi.extras,
         oi.note
        FROM order_items oi
        LEFT JOIN products p ON oi.product_id = p.id
        WHERE oi.order_id = $1
-       ORDER BY oi.created_at ASC`,
+       ORDER BY oi.updated_at DESC`,
       [id]
     );
 
@@ -1283,10 +1283,10 @@ router.post("/:id/print", async (req, res) => {
         product_id: item.product_id,
         name: item.product_name || "Unknown Item",
         quantity: item.quantity,
-        unit_price: item.unit_price,
-        price: item.unit_price, // For backward compatibility
-        line_total: item.line_total,
-        total: item.line_total,
+        unit_price: item.price,
+        price: item.price,
+        line_total: parseFloat(item.line_total),
+        total: parseFloat(item.line_total),
         extras: extras,
         note: item.note,
       };
