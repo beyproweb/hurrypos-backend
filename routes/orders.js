@@ -3846,5 +3846,91 @@ router.delete("/reservations/:id", async (req, res) => {
   }
 });
 
+// ✅ POST /orders/:id/reservations - Mobile app route to create reservation for an order
+router.post("/:id/reservations", async (req, res) => {
+  const { id } = req.params;
+  const { reservation_date, reservation_time, reservation_clients, reservation_notes } = req.body;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  try {
+    if (!reservation_date || !reservation_time) {
+      return res.status(400).json({ error: "Reservation date and time are required" });
+    }
+
+    const clientCount = parseInt(reservation_clients) || 0;
+    const notes = (reservation_notes || "").trim();
+    const dateStr = String(reservation_date).trim();
+    const timeStr = String(reservation_time).trim();
+
+    const result = await pool.query(
+      `UPDATE orders 
+       SET reservation_date = $1, 
+           reservation_time = $2, 
+           reservation_clients = $3, 
+           reservation_notes = $4,
+           updated_at = NOW()
+       WHERE id = $5 AND restaurant_id = $6
+       RETURNING id, reservation_date, reservation_time, reservation_clients, reservation_notes`,
+      [dateStr, timeStr, clientCount, notes, id, restaurantId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    res.json({
+      message: "✅ Reservation created",
+      reservation: result.rows[0],
+    });
+  } catch (err) {
+    console.error("❌ Error creating reservation:", err);
+    res.status(500).json({ error: "Failed to create reservation" });
+  }
+});
+
+// ✅ PUT /orders/:id/reservations - Mobile app route to update reservation for an order
+router.put("/:id/reservations", async (req, res) => {
+  const { id } = req.params;
+  const { reservation_date, reservation_time, reservation_clients, reservation_notes } = req.body;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  try {
+    if (!reservation_date || !reservation_time) {
+      return res.status(400).json({ error: "Reservation date and time are required" });
+    }
+
+    const clientCount = parseInt(reservation_clients) || 0;
+    const notes = (reservation_notes || "").trim();
+    const dateStr = String(reservation_date).trim();
+    const timeStr = String(reservation_time).trim();
+
+    const result = await pool.query(
+      `UPDATE orders 
+       SET reservation_date = $1, 
+           reservation_time = $2, 
+           reservation_clients = $3, 
+           reservation_notes = $4,
+           updated_at = NOW()
+       WHERE id = $5 AND restaurant_id = $6
+       RETURNING id, reservation_date, reservation_time, reservation_clients, reservation_notes`,
+      [dateStr, timeStr, clientCount, notes, id, restaurantId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    res.json({
+      message: "✅ Reservation updated",
+      reservation: result.rows[0],
+    });
+  } catch (err) {
+    console.error("❌ Error updating reservation:", err);
+    res.status(500).json({ error: "Failed to update reservation" });
+  }
+});
+
 return router;
 };
