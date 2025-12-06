@@ -1,4 +1,5 @@
 # Database Schema Verification & Fix Report
+
 **Date:** December 5, 2025  
 **Issue:** Print endpoint failing with "column o.tax_value does not exist"  
 **Status:** ✅ RESOLVED
@@ -8,19 +9,22 @@
 ## Problem Analysis
 
 ### Initial Issue
+
 The backend print endpoint (`POST /api/orders/:id/print`) was attempting to fetch order data with the following query:
+
 ```sql
-SELECT 
+SELECT
   o.id, o.table_number, o.total, o.status,
   o.tax_value,        -- ❌ MISSING
   o.discount_value,   -- ❌ MISSING
-  o.payment_method, o.created_at, 
+  o.payment_method, o.created_at,
   o.customer_name, o.customer_phone
 FROM orders o
 WHERE o.id = $1 AND o.restaurant_id = $2
 ```
 
 **Error Message:**
+
 ```
 ERROR 42703: column o.tax_value does not exist
 ERROR 42703: column o.discount_value does not exist
@@ -31,22 +35,27 @@ ERROR 42703: column o.discount_value does not exist
 ## Solution Implemented
 
 ### 1. Database Schema Verification
+
 Created `check-db-schema.js` to inspect the database schema:
 
 **Before Migration:**
+
 - Total columns in orders table: **37**
 - `tax_value`: ❌ MISSING
 - `discount_value`: ❌ MISSING
 
 **After Migration:**
+
 - Total columns in orders table: **39** ✅
 - `tax_value`: ✅ EXISTS (NUMERIC(10,2), DEFAULT 0)
 - `discount_value`: ✅ EXISTS (NUMERIC(10,2), DEFAULT 0)
 
 ### 2. Database Migration Created
+
 **File:** `migrations/add_tax_discount_columns.js`
 
 **What it does:**
+
 - Checks if columns already exist (idempotent)
 - Adds `tax_value` column as `NUMERIC(10, 2)` with DEFAULT 0
 - Adds `discount_value` column as `NUMERIC(10, 2)` with DEFAULT 0
@@ -54,6 +63,7 @@ Created `check-db-schema.js` to inspect the database schema:
 - Handles both local and production (Render) database connections
 
 **Migration Status:**
+
 ```
 ✅ Added tax_value column (NUMERIC(10,2), DEFAULT 0)
 ✅ Added discount_value column (NUMERIC(10,2), DEFAULT 0)
@@ -62,7 +72,9 @@ Created `check-db-schema.js` to inspect the database schema:
 ```
 
 ### 3. Verification
+
 Ran `check-db-schema.js` to confirm:
+
 - ✅ Both columns exist in the orders table
 - ✅ Sample order data includes new columns with proper defaults
 - ✅ Print endpoint query will now execute without errors
@@ -71,33 +83,35 @@ Ran `check-db-schema.js` to confirm:
 
 ## Orders Table Schema (Complete)
 
-| Column Name | Data Type | Nullable | New |
-|---|---|---|---|
-| id | integer | NOT NULL | |
-| status | text | Yes | |
-| order_type | text | Yes | |
-| table_number | integer | Yes | |
-| customer_name | text | Yes | |
-| customer_phone | text | Yes | |
-| payment_method | text | Yes | |
-| total | numeric | Yes | |
-| created_at | timestamp | Yes | |
-| restaurant_id | integer | Yes | |
-| **tax_value** | **numeric(10,2)** | **Yes** | **✅ NEW** |
-| **discount_value** | **numeric(10,2)** | **Yes** | **✅ NEW** |
-| ... (27 other columns) | ... | ... | |
+| Column Name            | Data Type         | Nullable | New        |
+| ---------------------- | ----------------- | -------- | ---------- |
+| id                     | integer           | NOT NULL |            |
+| status                 | text              | Yes      |            |
+| order_type             | text              | Yes      |            |
+| table_number           | integer           | Yes      |            |
+| customer_name          | text              | Yes      |            |
+| customer_phone         | text              | Yes      |            |
+| payment_method         | text              | Yes      |            |
+| total                  | numeric           | Yes      |            |
+| created_at             | timestamp         | Yes      |            |
+| restaurant_id          | integer           | Yes      |            |
+| **tax_value**          | **numeric(10,2)** | **Yes**  | **✅ NEW** |
+| **discount_value**     | **numeric(10,2)** | **Yes**  | **✅ NEW** |
+| ... (27 other columns) | ...               | ...      |            |
 
 ---
 
 ## Print Endpoint Status
 
 ### Before Fix
+
 ```
 ❌ Print endpoint fails with 500 error
    └─ Root cause: Missing database columns
 ```
 
 ### After Fix
+
 ```
 ✅ Print endpoint can fetch order data successfully
 ✅ Query will complete without database errors
@@ -105,6 +119,7 @@ Ran `check-db-schema.js` to confirm:
 ```
 
 ### Print Flow (Now Working)
+
 ```
 📱 Mobile App (Print Button)
     ↓
@@ -160,6 +175,7 @@ curl -X POST http://localhost:5000/api/orders/1/print \
 ## Environment Variables Used
 
 From `.env`:
+
 ```
 DB_USER=postgres
 DB_PASS=1234

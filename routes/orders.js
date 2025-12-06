@@ -3532,5 +3532,319 @@ router.patch("/merge-by-customer", async (req, res) => {
   }
 });
 
+// ✅ POST /reservations - Create a new reservation
+// Creates or updates a reservation with date, time, client count, and notes
+router.post("/reservations", async (req, res) => {
+  const { reservation_date, reservation_time, reservation_clients, reservation_notes, order_id, table_number } = req.body;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  try {
+    // Validate required fields
+    if (!reservation_date || !reservation_time) {
+      return res.status(400).json({ error: "Reservation date and time are required" });
+    }
+
+    const clientCount = parseInt(reservation_clients) || 0;
+    const notes = (reservation_notes || "").trim();
+
+    // If order_id provided, update that order with reservation fields
+    if (order_id) {
+      const result = await pool.query(
+        `UPDATE orders
+         SET reservation_date = $1,
+             reservation_time = $2,
+             reservation_clients = $3,
+             reservation_notes = $4,
+             status = CASE WHEN status = 'confirmed' THEN 'reserved' ELSE status END,
+             updated_at = NOW()
+         WHERE restaurant_id = $5 AND id = $6
+         RETURNING *`,
+        [reservation_date, reservation_time, clientCount, notes, restaurantId, order_id]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: "Order not found" });
+      }
+
+      // Emit update to frontend
+      io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+      io.to(`restaurant_${restaurantId}`).emit("reservation_created", {
+        reservation_id: result.rows[0].id,
+        order_id: order_id,
+        reservation_date,
+        reservation_time,
+        reservation_clients: clientCount,
+      });
+
+      return res.json({
+        success: true,
+        message: "✅ Reservation created and order updated",
+        reservation: result.rows[0],
+      });
+    }
+
+    // If table_number provided, create a standalone reservation (new order)
+    if (table_number) {
+      const newOrderResult = await pool.query(
+        `INSERT INTO orders (
+          restaurant_id,
+          table_number,
+          status,
+          total,
+          order_type,
+          reservation_date,
+          reservation_time,
+          reservation_clients,
+          reservation_notes,
+          created_at
+        )
+        VALUES ($1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, NOW())
+        RETURNING *`,
+        [restaurantId, table_number, reservation_date, reservation_time, clientCount, notes]
+      );
+
+      const reservation = newOrderResult.rows[0];
+
+      io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+      io.to(`restaurant_${restaurantId}`).emit("reservation_created", {
+        reservation_id: reservation.id,
+        table_number,
+        reservation_date,
+        reservation_time,
+        reservation_clients: clientCount,
+      });
+
+      return res.json({
+        success: true,
+        message: "✅ Reservation created for table",
+        reservation,
+      });
+    }
+
+    return res.status(400).json({ error: "Either order_id or table_number is required" });
+  } catch (err) {
+    console.error("❌ Error creating reservation:", err);
+    res.status(500).json({ error: "Failed to create reservation" });
+  }
+});
+
+// ✅ GET /reservations - List all reservations for a restaurant
+// Supports filtering by date range: ?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+router.get("/reservations", async (req, res) => {
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  const { start_date, end_date, table_number } = req.query;
+
+  try {
+    let query = `
+      SELECT
+        id,
+        table_number,
+        reservation_date,
+        reservation_time,
+        reservation_clients,
+        reservation_notes,
+        status,
+        order_type,
+        total,
+        customer_name,
+        customer_phone,
+        created_at,
+        updated_at
+      FROM orders
+      WHERE restaurant_id = $1 AND (status = 'reserved' OR reservation_date IS NOT NULL)
+    `;
+    const params = [restaurantId];
+    let paramIdx = 2;
+
+    // Filter by date range if provided
+    if (start_date) {
+      query += ` AND reservation_date >= $${paramIdx++}`;
+      params.push(start_date);
+    }
+
+    if (end_date) {
+      query += ` AND reservation_date <= $${paramIdx++}`;
+      params.push(end_date);
+    }
+
+    // Filter by table number if provided
+    if (table_number) {
+      query += ` AND table_number = $${paramIdx++}`;
+      params.push(parseInt(table_number));
+    }
+
+    query += ` ORDER BY reservation_date ASC, reservation_time ASC`;
+
+    const result = await pool.query(query, params);
+
+    res.json({
+      success: true,
+      count: result.rowCount,
+      reservations: result.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching reservations:", err);
+    res.status(500).json({ error: "Failed to fetch reservations" });
+  }
+});
+
+// ✅ PUT /reservations/:id - Update an existing reservation
+router.put("/reservations/:id", async (req, res) => {
+  const { id } = req.params;
+  const { reservation_date, reservation_time, reservation_clients, reservation_notes } = req.body;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  try {
+    // Build dynamic UPDATE query
+    const updates = [];
+    const params = [];
+    let paramIdx = 1;
+
+    if (reservation_date) {
+      updates.push(`reservation_date = $${paramIdx++}`);
+      params.push(reservation_date);
+    }
+
+    if (reservation_time) {
+      updates.push(`reservation_time = $${paramIdx++}`);
+      params.push(reservation_time);
+    }
+
+    if (reservation_clients !== undefined) {
+      updates.push(`reservation_clients = $${paramIdx++}`);
+      params.push(parseInt(reservation_clients) || 0);
+    }
+
+    if (reservation_notes !== undefined) {
+      updates.push(`reservation_notes = $${paramIdx++}`);
+      params.push((reservation_notes || "").trim());
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No fields to update" });
+    }
+
+    // Add WHERE clause
+    updates.push(`updated_at = NOW()`);
+    params.push(restaurantId);
+    params.push(id);
+
+    const query = `
+      UPDATE orders
+      SET ${updates.join(", ")}
+      WHERE restaurant_id = $${paramIdx + 1} AND id = $${paramIdx + 2}
+      RETURNING *
+    `;
+
+    const result = await pool.query(query, params);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Reservation not found" });
+    }
+
+    // Emit update to frontend
+    io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+    io.to(`restaurant_${restaurantId}`).emit("reservation_updated", {
+      reservation_id: result.rows[0].id,
+      changes: req.body,
+    });
+
+    res.json({
+      success: true,
+      message: "✅ Reservation updated",
+      reservation: result.rows[0],
+    });
+  } catch (err) {
+    console.error("❌ Error updating reservation:", err);
+    res.status(500).json({ error: "Failed to update reservation" });
+  }
+});
+
+// ✅ GET /reservations/:id - Get single reservation details
+router.get("/reservations/:id", async (req, res) => {
+  const { id } = req.params;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  try {
+    const result = await pool.query(
+      `SELECT
+        id,
+        table_number,
+        reservation_date,
+        reservation_time,
+        reservation_clients,
+        reservation_notes,
+        status,
+        order_type,
+        total,
+        customer_name,
+        customer_phone,
+        created_at,
+        updated_at
+      FROM orders
+      WHERE restaurant_id = $1 AND id = $2`,
+      [restaurantId, id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Reservation not found" });
+    }
+
+    res.json({
+      success: true,
+      reservation: result.rows[0],
+    });
+  } catch (err) {
+    console.error("❌ Error fetching reservation:", err);
+    res.status(500).json({ error: "Failed to fetch reservation" });
+  }
+});
+
+// ✅ DELETE /reservations/:id - Cancel a reservation
+router.delete("/reservations/:id", async (req, res) => {
+  const { id } = req.params;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  try {
+    const result = await pool.query(
+      `UPDATE orders
+       SET status = 'cancelled',
+           reservation_date = NULL,
+           reservation_time = NULL,
+           reservation_clients = NULL,
+           reservation_notes = NULL,
+           updated_at = NOW()
+       WHERE restaurant_id = $1 AND id = $2 AND (status = 'reserved' OR order_type = 'reservation')
+       RETURNING id`,
+      [restaurantId, id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Reservation not found or cannot be cancelled" });
+    }
+
+    // Emit cancellation to frontend
+    io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+    io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", {
+      reservation_id: id,
+    });
+
+    res.json({
+      success: true,
+      message: "✅ Reservation cancelled",
+      reservation_id: id,
+    });
+  } catch (err) {
+    console.error("❌ Error cancelling reservation:", err);
+    res.status(500).json({ error: "Failed to cancel reservation" });
+  }
+});
+
 return router;
 };
