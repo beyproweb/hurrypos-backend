@@ -102,6 +102,8 @@ router.post('/schedule', async (req, res) => {
 // ✅ Fetch all active staff for the current tenant
 router.get('/', async (req, res) => {
   const restaurantId = req.user.restaurant_id; // tenant scope from middleware
+  console.log('📥 GET /staff called for restaurant_id:', restaurantId);
+  
   try {
     const result = await pool.query(
       `SELECT id, name, role, phone, address, salary, email, created_at,
@@ -111,6 +113,8 @@ router.get('/', async (req, res) => {
        ORDER BY id`,
       [restaurantId]
     );
+    console.log('✅ Staff fetched, count:', result.rows.length);
+    console.log('📊 Staff data:', result.rows);
     res.json(result.rows);
   } catch (err) {
     console.error('❌ Error fetching staff:', err);
@@ -428,23 +432,29 @@ const formatHours = (rawHours) => {
 
 // Update an existing staff schedule
 router.put('/schedule/:id', async (req, res) => {
+  const restaurantId = req.user.restaurant_id; // tenant scope
   const { id } = req.params;
   const { shift_start, shift_end, status, days, salary, salary_model, hourly_rate } = req.body;
   logRequest(`/api/staff/schedule/${id}`, 'PUT', req.body);
 
   try {
+    // 🧩 Normalize 'days' into an array if needed
+    const daysArray = Array.isArray(days)
+      ? days
+      : (days || '').split(',').map(d => d.trim()).filter(Boolean);
+
     const result = await pool.query(
       `UPDATE staff_schedule
        SET shift_start = $1,
            shift_end = $2,
            status = $3,
-           days = $4,
+           days = $4::text[],
            salary = $5,
            salary_model = $6,
            hourly_rate = $7
-       WHERE restaurant_id = $1 AND id = $8
+       WHERE restaurant_id = $8 AND id = $9
        RETURNING *`,
-      [shift_start, shift_end, status, days, salary, salary_model, hourly_rate, id]
+      [shift_start, shift_end, status, daysArray, salary, salary_model, hourly_rate, restaurantId, id]
     );
 
     if (result.rowCount === 0) {

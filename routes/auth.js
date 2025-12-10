@@ -95,48 +95,177 @@ router.post("/login", async (req, res) => {
 
     console.log(`✅ ${source} login success:`, user.email);
 
-    // ✅ Fetch role permissions (MERGED from both users + global)
+    // ✅ Fetch role permissions (prefer new user_settings table, fallback to legacy settings)
     let permissions = [];
     const roleKey = user.role?.toLowerCase();
+    console.log("🔍 Looking for role permissions for roleKey:", roleKey);
 
+    let mergedRoles = {};
+    let overridePermissions = null;
+    let hasModernConfig = false;
+
+    // 1) Try the modern user_settings table first
     try {
-      const result = await pool.query(
-        `SELECT key, value, users
-         FROM settings
-         WHERE restaurant_id = $1
-           AND key IN ('users', 'global')`,
+      const modernResult = await pool.query(
+        `SELECT settings
+         FROM user_settings
+         WHERE restaurant_id = $1 AND section = 'users'
+         LIMIT 1`,
         [user.restaurant_id]
       );
 
-      let valueConfig = {};
-      let usersConfig = {};
+      if (modernResult.rows.length > 0) {
+        const modernSettings = modernResult.rows[0].settings || {};
+        const modernKeys = Object.keys(modernSettings || {});
+        console.log("🆕 user_settings payload keys:", modernKeys);
 
-      for (const row of result.rows) {
-        if (row.key === "users" && row.value) valueConfig = row.value;
-        if (row.key === "global" && row.users) usersConfig = row.users;
+        if (modernSettings.roles && typeof modernSettings.roles === "object" && Object.keys(modernSettings.roles).length > 0) {
+          hasModernConfig = true;
+          const normalizedModernRoles = Object.entries(modernSettings.roles).reduce(
+            (acc, [key, value]) => {
+              if (Array.isArray(value)) {
+                acc[key.toLowerCase()] = value.map((perm) => String(perm).toLowerCase());
+              }
+              return acc;
+            },
+            {}
+          );
+
+          mergedRoles = { ...mergedRoles, ...normalizedModernRoles };
+          console.log(
+            "🆕 Loaded role definitions from user_settings:",
+            Object.keys(normalizedModernRoles)
+          );
+        }
+
+        // Optional: handle per-user overrides if present
+        const overrideContainers = [
+          modernSettings.users,
+          modernSettings.overrides,
+          modernSettings.individual,
+          modernSettings.staff,
+        ].filter(Boolean)[0];
+
+        if (overrideContainers && typeof overrideContainers === "object") {
+          const normalizedOverrides = Object.entries(overrideContainers).reduce(
+            (acc, [key, value]) => {
+              const lowerKey = String(key).toLowerCase();
+              let perms = [];
+
+              if (Array.isArray(value)) {
+                perms = value;
+              } else if (value && Array.isArray(value.permissions)) {
+                perms = value.permissions;
+              }
+
+              if (perms.length > 0) {
+                acc[lowerKey] = perms.map((perm) => String(perm).toLowerCase());
+              }
+
+              return acc;
+            },
+            {}
+          );
+
+          const userIdKey = user.id != null ? String(user.id) : null;
+          const emailKey = user.email ? user.email.toLowerCase() : null;
+
+          const overrideSource =
+            (userIdKey && normalizedOverrides[userIdKey]) ||
+            (emailKey && normalizedOverrides[emailKey]) ||
+            null;
+
+          if (overrideSource && Array.isArray(overrideSource) && overrideSource.length > 0) {
+            overridePermissions = overrideSource;
+            console.log(
+              "✅ Applying individual permission override from user_settings:",
+              overridePermissions
+            );
+          }
+        }
       }
-
-      // 🧩 Merge both configs safely
-      const merged = {
-        roles: {
-          ...(usersConfig.roles || {}),
-          ...(valueConfig.roles || {}), // value overwrites same roles
-        },
-      };
-
-      if (merged.roles?.[roleKey]) {
-        permissions = merged.roles[roleKey];
-      } else if (merged.roles?.boss) {
-        permissions = merged.roles.boss;
-      } else if (roleKey === "boss" && merged.roles?.admin) {
-        permissions = merged.roles.admin;
-      }
-
-      console.log("🔎 Merged Roles:", merged.roles);
-      console.log(`✅ Final permissions for ${roleKey}:`, permissions);
     } catch (err) {
-      console.error("⚠️ Error loading permissions:", err);
+      console.error("⚠️ Error loading permissions from user_settings:", err);
     }
+
+    // 2) Only use legacy settings if NO modern config exists
+    if (!hasModernConfig) {
+      try {
+        const legacyResult = await pool.query(
+          `SELECT key, value, users
+           FROM settings
+           WHERE restaurant_id = $1
+             AND key IN ('users', 'global')`,
+          [user.restaurant_id]
+        );
+
+        console.log("📊 Legacy settings rows:", legacyResult.rows.length, "rows");
+        legacyResult.rows.forEach((row) => {
+          console.log(`  - legacy key: ${row.key}, has value: ${!!row.value}, has users: ${!!row.users}`);
+        });
+
+        let valueConfig = {};
+        let usersConfig = {};
+
+        for (const row of legacyResult.rows) {
+          if (row.key === "users" && row.value) valueConfig = row.value;
+          if (row.key === "global" && row.users) usersConfig = row.users;
+        }
+
+        const legacyMerged = {
+          roles: {
+            ...(usersConfig.roles || {}),
+            ...(valueConfig.roles || {}),
+          },
+        };
+
+        const normalizedLegacyRoles = Object.entries(legacyMerged.roles || {}).reduce(
+          (acc, [key, value]) => {
+            if (Array.isArray(value)) {
+              acc[key.toLowerCase()] = value.map((perm) => String(perm).toLowerCase());
+            }
+            return acc;
+          },
+          {}
+        );
+
+        mergedRoles = { ...normalizedLegacyRoles, ...mergedRoles };
+        console.log("🔎 Using legacy settings (no modern config found):", Object.keys(mergedRoles));
+      } catch (err) {
+        console.error("⚠️ Error loading permissions from legacy settings:", err);
+      }
+    } else {
+      console.log("✅ Modern config exists - skipping legacy settings. Roles:", Object.keys(mergedRoles));
+    }
+
+    const availableRoles = Object.keys(mergedRoles || {});
+    let resolvedPermissions = [];
+
+    if (overridePermissions && overridePermissions.length > 0) {
+      resolvedPermissions = overridePermissions;
+      console.log("✅ Using individual override permissions:", resolvedPermissions);
+    } else if (roleKey && mergedRoles?.[roleKey]) {
+      resolvedPermissions = mergedRoles[roleKey];
+      console.log(`✅ Found role permissions for '${roleKey}':`, resolvedPermissions);
+    } else if (mergedRoles?.boss) {
+      resolvedPermissions = mergedRoles.boss;
+      console.log(`✅ Role '${roleKey}' not found, using boss role:`, resolvedPermissions);
+    } else if (roleKey === "boss" && mergedRoles?.admin) {
+      resolvedPermissions = mergedRoles.admin;
+      console.log("✅ Boss role maps to admin:", resolvedPermissions);
+    } else {
+      console.warn(
+        `⚠️ No permissions found for role '${roleKey}', available roles:`,
+        availableRoles
+      );
+    }
+
+    permissions = Array.from(new Set((resolvedPermissions || []).map((perm) => {
+      // Normalize: convert hyphens to dots for consistency with mobile app
+      // e.g., "staff-checkin" -> "staff.checkin"
+      return String(perm).toLowerCase().replace(/-/g, ".");
+    })));
+    console.log(`✅ Final permissions for ${roleKey}:`, permissions);
 
     // ✅ Respond with token and normalized user data
     res.json({
