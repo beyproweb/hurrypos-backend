@@ -1,5 +1,11 @@
 // server.js
 require("dotenv").config();
+
+// ✅ Environment detection
+const NODE_ENV = process.env.NODE_ENV || "development";
+const isDev = NODE_ENV !== "production";
+
+console.log(`\n🚀 Starting backend in ${isDev ? "DEVELOPMENT" : "PRODUCTION"} mode`);
 console.log("🔐 JWT_SECRET loaded =", process.env.JWT_SECRET ? "✅ OK" : "❌ MISSING");
 console.log("🟣 YS_SECRET is:", process.env.YS_SECRET);
 
@@ -10,16 +16,28 @@ const cors = require("cors");
 
 // ✅ Unified CORS setup — supports web, dev, and Electron
 const allowedOrigins = [
-  "http://localhost:5173",
-  "http://localhost:8081",  // Expo web dev server
-  "http://localhost:3000",  // Common dev port
-  "http://10.55.189.102:8081", // Local network dev server
+  // ✅ DEVELOPMENT - Local development servers
+  ...(isDev ? [
+    "http://localhost:5173",      // Vite dev server
+    "http://localhost:5174",      // Vite alternate port
+    "http://localhost:8081",      // Expo web dev server
+    "http://localhost:3000",      // React dev server
+    "http://localhost:3001",      // Alternate React port
+    "http://10.55.189.102:8081",  // Local network dev server
+    "http://127.0.0.1:5173",      // Localhost alt
+    "http://127.0.0.1:8081",      // Localhost alt
+  ] : []),
+  
+  // ✅ PRODUCTION - Public domains
   "https://pos.beypro.com",
   "https://www.pos.beypro.com",
   "https://hurrypos-frontend.onrender.com",
   "https://beypro.com",
   "https://www.beypro.com",
 ];
+
+console.log(`📍 Allowed CORS origins (${isDev ? "DEV" : "PROD"}):`);
+allowedOrigins.forEach(origin => console.log(`   - ${origin}`));
 
 app.use(
   cors({
@@ -290,7 +308,13 @@ app.use((err, req, res, next) => {
 // Start server
 const PORT = process.env.PORT || 5000;
 http.listen(PORT, "0.0.0.0", () => {
-  console.log(`Backend is running on port ${PORT} and accessible from LAN`);
+  const url = isDev 
+    ? `http://localhost:${PORT}` 
+    : `https://pos.beypro.com`;
+  console.log(`\n✅ Backend running on ${url}`);
+  console.log(`   Environment: ${isDev ? "🔧 DEVELOPMENT" : "🚀 PRODUCTION"}`);
+  console.log(`   Port: ${PORT}`);
+  console.log(`   LAN accessible: http://0.0.0.0:${PORT}\n`);
 });
 
 module.exports = { app, pool };
