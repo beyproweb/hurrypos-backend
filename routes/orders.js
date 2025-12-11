@@ -2274,13 +2274,21 @@ async function updateStockForOrder(orderItems, restaurantId) {
   for (const item of orderItems) {
     const quantityMultiplier = parseInt(item.quantity) || 1;
 
-    let ingredients = Array.isArray(item.ingredients)
-      ? item.ingredients
-      : JSON.parse(item.ingredients || "[]");
+    const safeParseList = (value) => {
+      if (Array.isArray(value)) return value;
+      if (value === null || value === undefined || value === "") return [];
+      if (typeof value === "object") return [value].flat().filter(Boolean);
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch (err) {
+        console.warn("⚠️ Could not parse ingredients/extras JSON:", err?.message || err);
+        return [];
+      }
+    };
 
-    const extras = Array.isArray(item.extras)
-      ? item.extras
-      : JSON.parse(item.extras || "[]");
+    const ingredients = safeParseList(item.ingredients);
+    const extras = safeParseList(item.extras);
 
     // 🚑 Fallback: fetch recipe ingredients from DB if none provided
     if ((!ingredients || ingredients.length === 0) && item.product_id) {
