@@ -318,10 +318,13 @@ router.post("/print", async (req, res) => {
     align = "lt",
     cut = true,
     cashdraw = false,
+    dataBase64,
   } = req.body || {};
 
-  if (!content || typeof content !== "string") {
-    return res.status(400).json({ ok: false, error: "Missing 'content' string." });
+  const hasRaw = typeof dataBase64 === "string" && dataBase64.trim().length > 0;
+
+  if (!hasRaw && (!content || typeof content !== "string")) {
+    return res.status(400).json({ ok: false, error: "Missing printable content." });
   }
 
   let device;
@@ -337,12 +340,17 @@ router.post("/print", async (req, res) => {
     try {
       const printer = new escpos.Printer(device, { encoding });
 
-      // Basic print
-      printer.align(align).style("a").size(1, 1);
-      printer.text(content.endsWith("\n") ? content : content + "\n");
-
-      if (cashdraw) printer.cashdraw(2); // pin 2 is common
-      if (cut) printer.cut();
+      if (hasRaw) {
+        // Raw ESC/POS bytes (already include alignment/cut/logo/QR)
+        const raw = Buffer.from(dataBase64, "base64");
+        printer.raw(raw);
+      } else {
+        // Basic text fallback
+        printer.align(align).style("a").size(1, 1);
+        printer.text(content.endsWith("\n") ? content : content + "\n");
+        if (cashdraw) printer.cashdraw(2); // pin 2 is common
+        if (cut) printer.cut();
+      }
 
       printer.close(); // this also closes the device
       return res.json({ ok: true });
