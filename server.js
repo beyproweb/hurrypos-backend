@@ -27,13 +27,15 @@ const allowedOrigins = [
     "http://127.0.0.1:5173",      // Localhost alt
     "http://127.0.0.1:8081",      // Localhost alt
   ] : []),
-  
+
   // ✅ PRODUCTION - Public domains
   "https://pos.beypro.com",
   "https://www.pos.beypro.com",
   "https://hurrypos-frontend.onrender.com",
   "https://beypro.com",
   "https://www.beypro.com",
+  // ✅ Always allow local Electron/Expo during testing
+  "http://localhost:8081",
 ];
 
 console.log(`📍 Allowed CORS origins (${isDev ? "DEV" : "PROD"}):`);
