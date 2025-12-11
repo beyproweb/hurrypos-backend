@@ -148,6 +148,8 @@ const DEFAULT_RECEIPT_LAYOUT = {
   qrText: "Scan for feedback",
   qrUrl: "https://hurrybey.com/feedback",
   alignment: "left",
+  shopAddress: "",
+  shopAddressFontSize: 11,
   paperWidth: "80mm",
   spacing: 1.25,
   showTaxes: true,

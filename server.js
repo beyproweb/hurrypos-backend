@@ -202,8 +202,54 @@ app.use("/api/auth", authRoutes); // public login/register
 app.use("/api/public", require("./routes/publicQR"));
 
 const authMiddleware = require("./middleware/authMiddleware");
-app.get("/api/me", authMiddleware, (req, res) => {
-  res.json(req.user); // ✅ returns current user info
+app.get("/api/me", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.full_name,
+        u.email,
+        u.phone,
+        u.role,
+        u.restaurant_id,
+        r.name AS restaurant_name,
+        r.pos_location,
+        r.pos_location_lat,
+        r.pos_location_lng,
+        r.plan,
+        r.billing_cycle
+      FROM users u
+      LEFT JOIN restaurants r ON r.id = u.restaurant_id
+      WHERE u.id = $1
+      `,
+      [userId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const row = result.rows[0];
+    res.json({
+      id: row.id,
+      full_name: row.full_name,
+      email: row.email,
+      phone: row.phone,
+      role: row.role,
+      restaurant_id: row.restaurant_id,
+      restaurant_name: row.restaurant_name,
+      pos_location: row.pos_location || "",
+      pos_location_lat: row.pos_location_lat,
+      pos_location_lng: row.pos_location_lng,
+      plan: row.plan,
+      billing_cycle: row.billing_cycle,
+    });
+  } catch (err) {
+    console.error("❌ /api/me failed:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 // Settings, Printers
 app.use("/api/user-settings", require("./routes/userSettings"));
