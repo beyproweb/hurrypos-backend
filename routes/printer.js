@@ -321,7 +321,26 @@ router.post("/print", async (req, res) => {
     cut = true,
     cashdraw = false,
     dataBase64,
+    jobKey,
   } = req.body || {};
+
+  // In-memory de-dupe by jobKey to avoid duplicate prints from different clients
+  const now = Date.now();
+  const dedupeTtlMs = 10000;
+  if (!global.__beyproRecentPrints) global.__beyproRecentPrints = new Map();
+  if (jobKey) {
+    const last = global.__beyproRecentPrints.get(jobKey);
+    if (last && now - last < dedupeTtlMs) {
+      return res.json({ ok: true, deduped: true });
+    }
+    global.__beyproRecentPrints.set(jobKey, now);
+    // prune occasionally
+    if (global.__beyproRecentPrints.size > 500) {
+      for (const [k, ts] of global.__beyproRecentPrints.entries()) {
+        if (now - ts > dedupeTtlMs) global.__beyproRecentPrints.delete(k);
+      }
+    }
+  }
 
   const hasRaw = typeof dataBase64 === "string" && dataBase64.trim().length > 0;
 
