@@ -342,7 +342,7 @@ router.get("/location/:driver_id", async (req, res) => {
   });
 
   router.get("/google-directions", async (req, res) => {
-    const { origin, destination, waypoints, language } = req.query;
+    const { origin, destination, waypoints, language, traffic } = req.query;
     if (!origin || !destination)
       return res.status(400).json({ error: "Missing origin/destination" });
     const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -353,6 +353,14 @@ router.get("/location/:driver_id", async (req, res) => {
     )}&mode=driving&key=${GOOGLE_API_KEY}`;
     if (waypoints) url += `&waypoints=${encodeURIComponent(waypoints)}`;
     if (language) url += `&language=${encodeURIComponent(language)}`;
+
+    // If traffic param is truthy, request traffic-aware ETA by setting departure_time and traffic_model
+    // departure_time expects seconds since epoch
+    if (String(traffic).toLowerCase() === "true") {
+      const departure = Math.floor(Date.now() / 1000);
+      url += `&departure_time=${departure}&traffic_model=best_guess`;
+    }
+
     try {
       const result = await fetch(url);
       const data = await result.json();
