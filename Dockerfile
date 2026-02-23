@@ -1,4 +1,4 @@
-FROM node:18-bullseye
+FROM node:20-bullseye
 
 # Install python + tesseract + language packs (Turkish + English)
 RUN apt-get update \
