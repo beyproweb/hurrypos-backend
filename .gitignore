@@ -14,3 +14,8 @@ public/bridge/
 .env*
 *.env
 *.bak
+
+# secrets / env backups
+.env*
+*.env
+*.bak
