@@ -9,3 +9,8 @@ public/uploads
 bridge/dist/
 tmp_bridge_*
 public/bridge/
+
+# secrets / env backups
+.env*
+*.env
+*.bak
