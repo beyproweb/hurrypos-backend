@@ -5,7 +5,20 @@ const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 const jwt = require("jsonwebtoken");
 
-const JWT_SECRET = process.env.JWT_SECRET || "beypro_secret_2025";
+const PRIMARY_JWT_SECRET = process.env.JWT_SECRET || "beypro_secret_2025";
+const LEGACY_JWT_SECRET =
+  process.env.NODE_ENV !== "production" ? process.env.JWT_SECRET_LEGACY : "";
+
+const verifyJwt = (token) => {
+  try {
+    return jwt.verify(token, PRIMARY_JWT_SECRET);
+  } catch (err) {
+    if (LEGACY_JWT_SECRET && LEGACY_JWT_SECRET !== PRIMARY_JWT_SECRET) {
+      return jwt.verify(token, LEGACY_JWT_SECRET);
+    }
+    throw err;
+  }
+};
 
 const decodeOptionalAuth = (req) => {
   const authHeader = req.headers.authorization;
@@ -16,7 +29,7 @@ const decodeOptionalAuth = (req) => {
 
   try {
     const token = authHeader.slice(7).trim();
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = verifyJwt(token);
     if (!decoded?.restaurant_id) {
       return { user: null, error: "Token missing restaurant_id" };
     }

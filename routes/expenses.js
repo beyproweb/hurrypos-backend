@@ -2,8 +2,37 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
 
-router.post("/expenses", authMiddleware, async (req, res) => {
+// Store expense receipts alongside supplier receipts (already served at /uploads/receipts)
+const uploadDir = path.join(__dirname, "..", "uploads", "receipts");
+fs.mkdirSync(uploadDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: uploadDir,
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname);
+    cb(null, "expense-receipt-" + uniqueSuffix + ext);
+  },
+});
+const upload = multer({ storage });
+
+let ensuredReceiptColumn = false;
+async function ensureReceiptColumn() {
+  if (ensuredReceiptColumn) return;
+  ensuredReceiptColumn = true;
+  try {
+    await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS receipt_url TEXT`);
+  } catch (err) {
+    console.warn("⚠️ Failed to ensure expenses.receipt_url column:", err?.message || err);
+  }
+}
+
+router.post("/expenses", authMiddleware, upload.single("receipt"), async (req, res) => {
+  await ensureReceiptColumn();
   const { type, amount, note, payment_method, created_by } = req.body;
 
   if (!type || !amount || isNaN(parseFloat(amount))) {
@@ -15,21 +44,43 @@ router.post("/expenses", authMiddleware, async (req, res) => {
     return res.status(400).json({ error: "Invalid payment method" });
   }
 
+  const receiptUrl = req.file ? `/uploads/receipts/${req.file.filename}` : null;
+
   try {
-    const result = await pool.query(
-      `INSERT INTO expenses (restaurant_id, type, amount, note, payment_method, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [
-        req.user.restaurant_id,
-        type.trim(),
-        parseFloat(amount),
-        note?.trim() || null,
-        payment_method || null,
-        created_by || null,
-      ]
-    );
-    res.json({ success: true, expense: result.rows[0] });
+    try {
+      const result = await pool.query(
+        `INSERT INTO expenses (restaurant_id, type, amount, note, payment_method, created_by, receipt_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [
+          req.user.restaurant_id,
+          type.trim(),
+          parseFloat(amount),
+          note?.trim() || null,
+          payment_method || null,
+          created_by || null,
+          receiptUrl,
+        ]
+      );
+      return res.json({ success: true, expense: result.rows[0] });
+    } catch (err) {
+      // Backward compatibility if DB schema hasn't been updated yet.
+      if (err?.code !== "42703") throw err; // undefined_column
+      const result = await pool.query(
+        `INSERT INTO expenses (restaurant_id, type, amount, note, payment_method, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING *`,
+        [
+          req.user.restaurant_id,
+          type.trim(),
+          parseFloat(amount),
+          note?.trim() || null,
+          payment_method || null,
+          created_by || null,
+        ]
+      );
+      return res.json({ success: true, expense: result.rows[0] });
+    }
   } catch (err) {
     console.error("❌ Failed to insert expense:", err);
     res.status(500).json({ error: "Failed to save expense" });

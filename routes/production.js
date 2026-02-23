@@ -25,6 +25,40 @@ const convertQuantity = (value, fromUnit, toUnit) => {
   return value * factor;
 };
 
+const ensureRecipeMetaTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS recipe_meta (
+      recipe_id integer PRIMARY KEY,
+      expiry_date date NULL
+    )
+    `
+  );
+};
+
+let recipesExpiryColumnCache = { value: null, checkedAt: 0 };
+const recipesTableHasExpiryDate = async (client) => {
+  const now = Date.now();
+  if (recipesExpiryColumnCache.value !== null && now - recipesExpiryColumnCache.checkedAt < 5 * 60 * 1000) {
+    return recipesExpiryColumnCache.value;
+  }
+
+  const res = await client.query(
+    `
+    SELECT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'recipes'
+        AND column_name = 'expiry_date'
+    ) AS exists
+    `
+  );
+  const exists = Boolean(res.rows?.[0]?.exists);
+  recipesExpiryColumnCache = { value: exists, checkedAt: now };
+  return exists;
+};
+
 // Legacy stub for backward compatibility
 router.post("/production-log", (req, res) => {
   console.info("[production-log] Compatibility endpoint hit", {
@@ -216,8 +250,29 @@ router.get("/recipes", async (req, res) => {
     const recipesRes = await pool.query(recipeQuery, params);
     const ingredientsRes = await pool.query(`SELECT * FROM recipe_ingredients`);
 
+    // Optional legacy fallback: if recipes table doesn't have expiry_date,
+    // store it in recipe_meta and attach it here.
+    let expiryByRecipeId = new Map();
+    try {
+      const metaRes = await pool.query(
+        `SELECT recipe_id, expiry_date FROM recipe_meta`
+      );
+      expiryByRecipeId = new Map(
+        (Array.isArray(metaRes.rows) ? metaRes.rows : []).map((r) => [
+          r.recipe_id,
+          r.expiry_date,
+        ])
+      );
+    } catch {
+      expiryByRecipeId = new Map();
+    }
+
     const recipes = recipesRes.rows.map((r) => ({
       ...r,
+      expiry_date:
+        r.expiry_date !== undefined && r.expiry_date !== null
+          ? r.expiry_date
+          : expiryByRecipeId.get(r.id) || null,
       ingredients: ingredientsRes.rows
         .filter((i) => i.recipe_id === r.id)
         .map((i) => ({
@@ -236,18 +291,32 @@ router.get("/recipes", async (req, res) => {
 
 // ✅ POST /production/recipes
 router.post("/recipes", async (req, res) => {
-  const { name, emoji, base_quantity, output_unit, ingredients, restaurant_id } =
+  const { name, emoji, base_quantity, output_unit, ingredients, restaurant_id, expiry_date } =
     req.body;
+
+  // Best-effort: keep this outside the main tx so schema issues don't abort recipe creation.
+  try {
+    await ensureRecipeMetaTable();
+  } catch {
+    /* ignore */
+  }
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    const recipeRes = await client.query(
-      `INSERT INTO recipes (name, emoji, base_quantity, output_unit, restaurant_id)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [name, emoji, base_quantity, output_unit, restaurant_id || null]
-    );
+    const hasExpiryColumn = await recipesTableHasExpiryDate(client);
+    const recipeRes = hasExpiryColumn
+      ? await client.query(
+          `INSERT INTO recipes (name, emoji, base_quantity, output_unit, restaurant_id, expiry_date)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+          [name, emoji, base_quantity, output_unit, restaurant_id || null, expiry_date || null]
+        )
+      : await client.query(
+          `INSERT INTO recipes (name, emoji, base_quantity, output_unit, restaurant_id)
+           VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+          [name, emoji, base_quantity, output_unit, restaurant_id || null]
+        );
     const recipeId = recipeRes.rows[0].id;
 
     for (const ing of ingredients) {
@@ -259,6 +328,27 @@ router.post("/recipes", async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    // If recipes table doesn't support expiry_date, store it in recipe_meta after commit.
+    if (expiry_date) {
+      try {
+        const hasExpiryColumn = await recipesTableHasExpiryDate(client);
+        if (!hasExpiryColumn) {
+          await pool.query(
+            `
+            INSERT INTO recipe_meta (recipe_id, expiry_date)
+            VALUES ($1, $2)
+            ON CONFLICT (recipe_id)
+            DO UPDATE SET expiry_date = EXCLUDED.expiry_date
+            `,
+            [recipeId, expiry_date]
+          );
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
     res.status(200).json({ message: "Recipe created." });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -271,8 +361,15 @@ router.post("/recipes", async (req, res) => {
 
 router.put("/recipes/:id", async (req, res) => {
   const recipeId = parseInt(req.params.id, 10);
-  const { name, emoji, base_quantity, output_unit, ingredients, restaurant_id } =
+  const { name, emoji, base_quantity, output_unit, ingredients, restaurant_id, expiry_date } =
     req.body;
+
+  // Best-effort: keep this outside the main tx so schema issues don't abort updates.
+  try {
+    await ensureRecipeMetaTable();
+  } catch {
+    /* ignore */
+  }
 
   const client = await pool.connect();
   try {
@@ -283,14 +380,25 @@ router.put("/recipes/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid recipe payload." });
     }
 
-    const updateValues = [name, emoji || null, base_quantity, output_unit, recipeId];
-    let updateQuery = `
-      UPDATE recipes
-      SET name = $1, emoji = $2, base_quantity = $3, output_unit = $4
-      WHERE id = $5
-    `;
+    const hasExpiryColumn = await recipesTableHasExpiryDate(client);
+    const updateValues = hasExpiryColumn
+      ? [name, emoji || null, base_quantity, output_unit, expiry_date || null, recipeId]
+      : [name, emoji || null, base_quantity, output_unit, recipeId];
+    let updateQuery = hasExpiryColumn
+      ? `
+        UPDATE recipes
+        SET name = $1, emoji = $2, base_quantity = $3, output_unit = $4, expiry_date = $5
+        WHERE id = $6
+      `
+      : `
+        UPDATE recipes
+        SET name = $1, emoji = $2, base_quantity = $3, output_unit = $4
+        WHERE id = $5
+      `;
     if (restaurant_id) {
-      updateQuery += ` AND (restaurant_id = $6 OR restaurant_id IS NULL)`;
+      updateQuery += hasExpiryColumn
+        ? ` AND (restaurant_id = $7 OR restaurant_id IS NULL)`
+        : ` AND (restaurant_id = $6 OR restaurant_id IS NULL)`;
       updateValues.push(restaurant_id);
     }
 
@@ -313,6 +421,28 @@ router.put("/recipes/:id", async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    // If recipes table doesn't support expiry_date, store it in recipe_meta after commit.
+    try {
+      if (!hasExpiryColumn) {
+        if (expiry_date) {
+          await pool.query(
+            `
+            INSERT INTO recipe_meta (recipe_id, expiry_date)
+            VALUES ($1, $2)
+            ON CONFLICT (recipe_id)
+            DO UPDATE SET expiry_date = EXCLUDED.expiry_date
+            `,
+            [recipeId, expiry_date]
+          );
+        } else {
+          await pool.query(`DELETE FROM recipe_meta WHERE recipe_id = $1`, [recipeId]);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
     res.status(200).json({ message: "Recipe updated." });
   } catch (err) {
     await client.query("ROLLBACK");

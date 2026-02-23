@@ -2,16 +2,68 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { attachAllowedModules } = require("../middleware/moduleGuard");
 const { ensureCashLogColumns } = require("../utils/registerLogColumns");
+const { generateUniqueRestaurantSlug, isMissingRestaurantSlug } = require("../utils/restaurantSlug");
 
 // ✅ protect all setting
 // ✅ protect all settings routes with tenant-safe auth
 router.use(authMiddleware);
+const standaloneQrAllowed = new Set([
+  "/qr-link",
+  "/qr-token",
+  "/qr-menu-disabled",
+  "/qr-menu-customization",
+  "/qr-menu-delivery",
+]);
+const standaloneStaffAllowed = new Set([
+  "/users",
+]);
+router.use(async (req, res, next) => {
+  const allowed = await attachAllowedModules(req);
+  if (Array.isArray(allowed) && !allowed.includes("pos_core")) {
+    const isStaffAllowed =
+      allowed.includes("staff") &&
+      (standaloneStaffAllowed.has(req.path) || req.path.startsWith("/roles"));
+    if (!standaloneQrAllowed.has(req.path) && !isStaffAllowed) {
+      return res.status(403).json({ error: "MODULE_NOT_ALLOWED" });
+    }
+  }
+  return next();
+});
 // Allowed setting sections
 const allowedSections = [
-  "notifications", "appearance", "payments", "register",
-  "users", "subscription", "integrations", "log_files" ,"localization"
+  "notifications",
+  "appearance",
+  "payments",
+  "register",
+  "users",
+  "subscription",
+  "integrations",
+  "log_files",
+  "localization",
+  "transactions",
+  "tables",
 ];
+const DEFAULT_TRANSACTIONS = {
+  autoCloseTableAfterPay: false,
+  autoClosePacketAfterPay: false,
+  presetNotes: ["No ketchup", "Extra spicy", "Sauce on side", "Well done"],
+  disableAutoPrintTable: false,
+  disableAutoPrintPacket: false,
+};
+
+async function ensureTransactionsColumn() {
+  await pool.query(
+    "ALTER TABLE settings ADD COLUMN IF NOT EXISTS transactions jsonb DEFAULT '{}'::jsonb"
+  );
+}
+
+async function ensureTablesColumn() {
+  await pool.query(
+    "ALTER TABLE settings ADD COLUMN IF NOT EXISTS tables jsonb DEFAULT '{}'::jsonb"
+  );
+}
 
 
 // inside settings.js
@@ -24,7 +76,13 @@ router.post("/qr-token", async (req, res) => {
     const restaurantSlug = req.body.slug || "default";
 
     const token = jwt.sign(
-      { restaurant_id: restaurantId, slug: restaurantSlug },
+      {
+        token_type: "qr",
+        role: "qr",
+        restaurant_id: restaurantId,
+        slug: restaurantSlug,
+        allowed_modules: ["qr_kitchen"],
+      },
       process.env.JWT_SECRET,
       { expiresIn: "180d" } // valid for 6 months
     );
@@ -47,18 +105,31 @@ router.get("/qr-link", async (req, res) => {
   try {
     const restaurantId = req.user.restaurant_id;
     const { rows } = await pool.query(
-      "SELECT id, slug, qr_token, qr_code_id FROM restaurants WHERE id = $1",
+      "SELECT id, name, slug, qr_token, qr_code_id FROM restaurants WHERE id = $1",
       [restaurantId]
     );
     if (!rows.length) return res.status(404).json({ error: "Restaurant not found" });
 
-    let { id, slug, qr_token, qr_code_id } = rows[0];
+    let { id, name, slug, qr_token, qr_code_id } = rows[0];
     const jwt = require("jsonwebtoken");
+
+    // ⚙️ Ensure slug exists (fixes legacy rows where slug is NULL → /qr-menu/null/...)
+    if (isMissingRestaurantSlug(slug)) {
+      const nextSlug = await generateUniqueRestaurantSlug(pool, name || `restaurant-${id}`);
+      await pool.query("UPDATE restaurants SET slug = $1 WHERE id = $2", [nextSlug, restaurantId]);
+      slug = nextSlug;
+    }
 
     // ⚙️ Generate token if missing
     if (!qr_token) {
       const token = jwt.sign(
-        { restaurant_id: restaurantId, slug },
+        {
+          token_type: "qr",
+          role: "qr",
+          restaurant_id: restaurantId,
+          slug,
+          allowed_modules: ["qr_kitchen"],
+        },
         process.env.JWT_SECRET,
         { expiresIn: "180d" }
       );
@@ -74,8 +145,8 @@ router.get("/qr-link", async (req, res) => {
       console.log(`✅ Generated new short QR id: ${shortid}`);
     }
 
-    // ✅ Final short link (no JWT exposed)
-    const link = `https://pos.beypro.com/qr-menu/${slug}/${qr_code_id}`;
+    // ✅ Final short link (easy to share/print)
+    const link = `https://pos.beypro.com/${slug}`;
 
     res.json({ success: true, link });
   } catch (err) {
@@ -618,6 +689,8 @@ router.get("/qr-menu-customization", async (req, res) => {
       loyalty_reward_text: "Free Menu Item",
       loyalty_color: "#F59E0B",
       delivery_enabled: true,
+      table_geo_enabled: false,
+      table_geo_radius_meters: 150,
     };
 
     res.json({
@@ -723,6 +796,12 @@ router.get("/:section", async (req, res) => {
   }
 
   try {
+    if (section === "transactions") {
+      await ensureTransactionsColumn();
+    }
+    if (section === "tables") {
+      await ensureTablesColumn();
+    }
 
     const restaurantId = req.user.restaurant_id;
 const result = await pool.query(
@@ -749,10 +828,10 @@ const result = await pool.query(
         stock_restocked: "ding",
         driver_assigned: "horn",
         order_delayed: "alarm",
-        driver_arrived: "horn",
-      },
-    }
-  };
+      driver_arrived: "horn",
+    },
+  }
+};
 
     const merged = section === "notifications"
       ? {
@@ -763,7 +842,15 @@ const result = await pool.query(
             ...(raw?.eventSounds || {}),
           },
         }
-      : raw;
+      : section === "transactions"
+        ? {
+            ...DEFAULT_TRANSACTIONS,
+            ...raw,
+            presetNotes: Array.isArray(raw?.presetNotes)
+              ? raw.presetNotes
+              : DEFAULT_TRANSACTIONS.presetNotes,
+          }
+        : raw;
 
     res.json(merged);
   } catch (err) {
@@ -781,6 +868,24 @@ router.post("/:section", async (req, res) => {
   if (!allowedSections.includes(section)) {
     console.warn(`⚠️ Invalid POST section: ${section}`);
     return res.status(400).json({ error: "Invalid section" });
+  }
+
+  if (section === "transactions") {
+    newData = {
+      ...DEFAULT_TRANSACTIONS,
+      ...newData,
+      presetNotes: Array.isArray(newData?.presetNotes)
+        ? newData.presetNotes
+        : DEFAULT_TRANSACTIONS.presetNotes,
+    };
+  }
+
+  if (section === "tables") {
+    newData = {
+      tableLabelText: "",
+      showAreas: true,
+      ...newData,
+    };
   }
 
   // 🔹 Merge defaults for notifications (keeps all expected fields)
@@ -817,6 +922,9 @@ router.post("/:section", async (req, res) => {
 
   try {
     const restaurantId = req.user.restaurant_id;
+    if (section === "transactions") {
+      await ensureTransactionsColumn();
+    }
 
     // ✅ Upsert (INSERT or UPDATE) tenant-safe JSON section
     await pool.query(
@@ -829,10 +937,139 @@ router.post("/:section", async (req, res) => {
       [restaurantId, JSON.stringify(newData)]
     );
 
+    // ✅ Keep restaurants.external_remote_id in sync with Yemeksepeti remoteId
+    // Rule: integrations.yemeksepeti.remoteId -> restaurants.external_remote_id
+    if (section === "integrations") {
+      const remoteIdRaw =
+        newData?.yemeksepeti?.remoteId ??
+        newData?.integrations?.yemeksepeti?.remoteId;
+
+      if (remoteIdRaw !== undefined) {
+        const remoteIdNormalized = String(remoteIdRaw || "").trim() || null;
+        await pool.query(
+          "UPDATE restaurants SET external_remote_id = $1 WHERE id = $2",
+          [remoteIdNormalized, restaurantId]
+        );
+      }
+    }
+
     res.json({ success: true, [section]: newData });
   } catch (err) {
     console.error(`❌ Failed to save ${section} settings:`, err);
     res.status(500).json({ error: "Failed to save settings" });
+  }
+});
+
+// =========================================================
+// RESTAURANT EXTERNAL IDS API
+// =========================================================
+
+/**
+ * GET /api/settings/restaurants/:id/external-ids
+ * Fetch external integration remote IDs for a restaurant
+ */
+router.get("/restaurants/:id/external-ids", async (req, res) => {
+  try {
+    const restaurantId = Number.parseInt(req.params.id, 10);
+    const userRestaurantId = req.user?.restaurant_id;
+
+    if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+      return res.status(400).json({ error: "Invalid restaurant ID" });
+    }
+
+    // Ensure user can only access their own restaurant
+    if (userRestaurantId && userRestaurantId !== restaurantId) {
+      return res.status(403).json({ error: "Access denied to this restaurant" });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT external_migros_remote_id, external_remote_id 
+       FROM restaurants 
+       WHERE id = $1 
+       LIMIT 1`,
+      [restaurantId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    res.json({
+      migrosRemoteId: rows[0].external_migros_remote_id || "",
+      yemeksepetiRemoteId: rows[0].external_remote_id || "",
+    });
+  } catch (err) {
+    console.error("❌ Failed to fetch external IDs:", err);
+    res.status(500).json({ error: "Failed to fetch external IDs" });
+  }
+});
+
+/**
+ * POST /api/settings/restaurants/:id/external-ids
+ * Update external integration remote IDs for a restaurant
+ */
+router.post("/restaurants/:id/external-ids", async (req, res) => {
+  try {
+    const restaurantId = Number.parseInt(req.params.id, 10);
+    const userRestaurantId = req.user?.restaurant_id;
+
+    if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+      return res.status(400).json({ error: "Invalid restaurant ID" });
+    }
+
+    // Ensure user can only update their own restaurant
+    if (userRestaurantId && userRestaurantId !== restaurantId) {
+      return res.status(403).json({ error: "Access denied to this restaurant" });
+    }
+
+    const { migrosRemoteId } = req.body;
+
+    if (migrosRemoteId !== undefined && typeof migrosRemoteId !== "string") {
+      return res.status(400).json({ error: "migrosRemoteId must be a string" });
+    }
+
+    const normalizedMigrosRemoteId = (migrosRemoteId || "").trim() || null;
+
+    // Check uniqueness if non-empty
+    if (normalizedMigrosRemoteId) {
+      const { rows: existing } = await pool.query(
+        `SELECT id FROM restaurants 
+         WHERE external_migros_remote_id = $1 
+         AND id != $2 
+         LIMIT 1`,
+        [normalizedMigrosRemoteId, restaurantId]
+      );
+
+      if (existing.length > 0) {
+        return res.status(409).json({
+          error: "DUPLICATE_MIGROS_REMOTE_ID",
+          message: "This Migros Remote ID is already used by another restaurant",
+        });
+      }
+    }
+
+    // Update the restaurant
+    const { rows } = await pool.query(
+      `UPDATE restaurants 
+       SET external_migros_remote_id = $1 
+       WHERE id = $2 
+       RETURNING id, external_migros_remote_id`,
+      [normalizedMigrosRemoteId, restaurantId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    console.log(`✅ Updated Migros Remote ID for restaurant ${restaurantId}: ${normalizedMigrosRemoteId || "(cleared)"}`);
+
+    res.json({
+      success: true,
+      migrosRemoteId: rows[0].external_migros_remote_id || "",
+    });
+  } catch (err) {
+    console.error("❌ Failed to update external IDs:", err);
+    res.status(500).json({ error: "Failed to update external IDs" });
   }
 });
 

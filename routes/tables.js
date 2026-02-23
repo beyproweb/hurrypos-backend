@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const authMiddleware = require("../middleware/authMiddleware");
+const { attachAllowedModules } = require("../middleware/moduleGuard");
 const { pool } = require("../db");
 const jwt = require("jsonwebtoken");
 
@@ -11,6 +12,20 @@ const TABLE_QR_SECRET =
   "table_qr_secret_2025";
 
 router.use(authMiddleware);
+router.use(async (req, res, next) => {
+  const allowed = await attachAllowedModules(req);
+  if (Array.isArray(allowed) && !allowed.includes("pos_core")) {
+    const isAllowed =
+      req.method === "GET" &&
+      (req.path === "/" || /^\/\d+\/qr-token\/?$/.test(req.path || ""));
+    const isAllowedWrite =
+      req.method === "PUT" && /^\/count\/?$/.test(req.path || "");
+    if (!isAllowed && !isAllowedWrite) {
+      return res.status(403).json({ error: "MODULE_NOT_ALLOWED" });
+    }
+  }
+  return next();
+});
 
 async function ensureTableColumns() {
   try {
@@ -20,7 +35,8 @@ async function ensureTableColumns() {
         ADD COLUMN IF NOT EXISTS label TEXT,
         ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE,
         ADD COLUMN IF NOT EXISTS seats INTEGER,
-        ADD COLUMN IF NOT EXISTS area TEXT
+        ADD COLUMN IF NOT EXISTS area TEXT,
+        ADD COLUMN IF NOT EXISTS guests INTEGER
     `);
   } catch (err) {
     console.warn("⚠️ Could not ensure tables columns:", err.message);
@@ -41,18 +57,24 @@ async function ensureTableColumns() {
 router.get("/", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   await ensureTableColumns();
+  const activeOnly =
+    req.query.active === "true" ||
+    (Array.isArray(req.allowed_modules) && !req.allowed_modules.includes("pos_core"));
+
   try {
     const { rows } = await pool.query(
-  `SELECT number,
-          COALESCE(active, TRUE) AS active,
-          color, label,
-          seats,
-          area
-   FROM tables
-   WHERE restaurant_id = $1
-   ORDER BY number ASC`,
-  [restaurantId]
-);
+      `SELECT number,
+              COALESCE(active, TRUE) AS active,
+              color, label,
+              seats,
+              area,
+              guests
+       FROM tables
+       WHERE restaurant_id = $1
+         ${activeOnly ? "AND COALESCE(active, TRUE) = TRUE" : ""}
+       ORDER BY number ASC`,
+      [restaurantId]
+    );
 
     res.json(rows);
   } catch (err) {
@@ -144,6 +166,16 @@ router.get("/:number/qr-token", async (req, res) => {
       { expiresIn: "7d" }
     );
 
+    const restaurantRes = await pool.query(
+      "SELECT slug, qr_code_id FROM restaurants WHERE id = $1 LIMIT 1",
+      [restaurantId]
+    );
+    const restaurant = restaurantRes.rows[0] || {};
+    const identifier =
+      restaurant.slug ||
+      restaurant.qr_code_id ||
+      String(restaurantId);
+
     const base =
       process.env.PUBLIC_QR_BASE_URL ||
       process.env.QR_BASE_URL ||
@@ -152,7 +184,7 @@ router.get("/:number/qr-token", async (req, res) => {
 
     const url = `${cleanBase}/qr?mode=table&table=${encodeURIComponent(
       number
-    )}&token=${encodeURIComponent(token)}`;
+    )}&token=${encodeURIComponent(token)}&identifier=${encodeURIComponent(identifier)}`;
 
     res.json({ success: true, token, url });
   } catch (err) {
@@ -171,11 +203,24 @@ router.patch("/:number", async (req, res) => {
   }
 
   // Now receiving new fields:
-  const { color, label, active, seats, area } = req.body || {};
+  const { color, label, active, seats, area, guests } = req.body || {};
 
   await ensureTableColumns();
 
   try {
+    let guestsValue = undefined;
+    if (guests !== undefined) {
+      if (guests === null || guests === "") {
+        guestsValue = null;
+      } else {
+        const guestsNum = Number(guests);
+        if (!Number.isFinite(guestsNum) || guestsNum < 0 || guestsNum > 500) {
+          return res.status(400).json({ error: "Invalid guests" });
+        }
+        guestsValue = Math.trunc(guestsNum);
+      }
+    }
+
     // Does table exist?
     const { rows } = await pool.query(
       `SELECT number FROM tables 
@@ -209,6 +254,10 @@ router.patch("/:number", async (req, res) => {
         fields.push(`area = $${idx++}`);
         params.push(area);
       }
+      if (guestsValue !== undefined) {
+        fields.push(`guests = $${idx++}`);
+        params.push(guestsValue);
+      }
 
       // Nothing to update
       if (fields.length === 0) {
@@ -228,8 +277,8 @@ router.patch("/:number", async (req, res) => {
       // === INSERT NEW ENTRY ===
       await pool.query(
         `INSERT INTO tables 
-           (restaurant_id, number, color, label, active, seats, area)
-         VALUES ($1, $2, $3, $4, COALESCE($5, TRUE), $6, $7)`,
+           (restaurant_id, number, color, label, active, seats, area, guests)
+         VALUES ($1, $2, $3, $4, COALESCE($5, TRUE), $6, $7, $8)`,
         [
           restaurantId,
           number,
@@ -238,6 +287,7 @@ router.patch("/:number", async (req, res) => {
           active,
           seats || null,
           area || null,
+          guestsValue === undefined ? null : guestsValue,
         ]
       );
     }

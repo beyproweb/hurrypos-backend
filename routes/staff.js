@@ -2,10 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { sendEmail, sendPushNotification } = require('../utils/notifications');
+const { emitReportsRefresh } = require("../utils/realtime");
 const bcrypt = require("bcrypt");
 const authMiddleware = require("../middleware/authMiddleware");
+const jwt = require("jsonwebtoken");
 
-router.use(authMiddleware);
 // Helper function to log requests
 const logRequest = (route, method, data) => {
   console.log(`➡️ ${method} request to ${route}`);
@@ -51,6 +52,282 @@ const loadUserSettings = async (restaurantId) => {
   );
   return result.rows[0]?.users || {};
 };
+
+const loadRolePermissions = async (restaurantId, role) => {
+  const roleKey = String(role || "").toLowerCase();
+  let permissions = [];
+
+  try {
+    const settingsRes = await pool.query(
+      `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'users' LIMIT 1`,
+      [restaurantId]
+    );
+    let config = settingsRes.rows[0]?.value || null;
+    if (typeof config === "string") {
+      try {
+        config = JSON.parse(config);
+      } catch {
+        config = null;
+      }
+    }
+    if (config?.roles?.[roleKey]) {
+      permissions = config.roles[roleKey];
+    }
+  } catch {}
+
+  if (!permissions || permissions.length === 0) {
+    try {
+      const globalRes = await pool.query(
+        `SELECT users FROM settings WHERE restaurant_id = $1 AND key = 'global' LIMIT 1`,
+        [restaurantId]
+      );
+      const globalUsers = globalRes.rows[0]?.users || {};
+      if (globalUsers?.roles?.[roleKey]) {
+        permissions = globalUsers.roles[roleKey];
+      }
+    } catch {}
+  }
+
+  return Array.isArray(permissions) ? permissions : [];
+};
+
+const parseGeoValue = (value) => {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+
+const haversineMeters = (lat1, lng1, lat2, lng2) => {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return 6371000 * c;
+};
+
+// ========== PUBLIC ROUTES (No Authentication Required) ==========
+
+// Login endpoint - must be public
+router.post('/login', async (req, res) => {
+  const { email, password, pin } = req.body;
+  console.log('🔑 Login Debug');
+  console.log('📥 Request body:', { email: email ? '***' : undefined, password: password ? '***' : undefined, pin: pin ? `${pin} (type: ${typeof pin})` : undefined });
+  
+  try {
+    // 1️⃣ PIN-ONLY LOGIN (for staff)
+    if (pin && !email) {
+      console.log(`🔢 PIN-only login attempt with PIN: ${pin} (type: ${typeof pin})`);
+      
+      // 🔒 TENANT SAFETY: Require restaurant_id to prevent cross-tenant PIN access
+      const { restaurant_id } = req.body;
+      if (!restaurant_id) {
+        console.warn(`❌ PIN login blocked: No restaurant_id provided`);
+        return res.status(400).json({
+          success: false,
+          error: 'Restaurant ID required for PIN login',
+        });
+      }
+      
+      const restaurantId = Number(restaurant_id);
+      if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+        console.warn(`❌ PIN login blocked: Invalid restaurant_id: ${restaurant_id}`);
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid restaurant ID',
+        });
+      }
+      
+      console.log(`🏢 PIN login for restaurant: ${restaurantId}`);
+      
+      // Check if PIN is required in user settings
+      const userSettings = await loadUserSettings(restaurantId);
+      const pinRequired = userSettings.pinRequired !== false; // Default to true
+      
+      if (!pinRequired) {
+        console.log(`🔓 PIN requirement is disabled for restaurant ${restaurantId}`);
+        return res.status(401).json({
+          success: false,
+          error: 'PIN login is disabled. Please use email and password.',
+        });
+      }
+      
+      const staffRes = await pool.query(
+        `SELECT id, name, email, role, pin, restaurant_id, status
+         FROM staff
+         WHERE pin = $1 AND restaurant_id = $2 AND status = 'active'
+         LIMIT 1`,
+        [String(pin), restaurantId]
+      );
+
+      console.log(`📊 Staff query result: ${staffRes.rowCount} rows found`);
+      if (staffRes.rowCount > 0) {
+        console.log(`🔍 Found staff: ${staffRes.rows[0].name}, PIN in DB: ${staffRes.rows[0].pin} (type: ${typeof staffRes.rows[0].pin})`);
+      }
+
+      const staff = staffRes.rows[0];
+      if (staff) {
+        console.log(`✅ Staff PIN login success: ${staff.name} (${staff.role})`);
+
+        // 🧩 Fetch permissions for staff role
+        // Default permissions for common roles
+        const defaultPermissions = {
+          admin: ['all'],
+          manager: ['all'],
+          cashier: ['tables', 'orders', 'payments', 'kitchen', 'products'],
+          driver: ['delivery', 'orders', 'tables'],
+          kitchen: ['kitchen', 'orders'],
+          waiter: ['tables', 'orders'],
+        };
+
+        let permissions = [];
+        permissions = await loadRolePermissions(staff.restaurant_id, staff.role);
+        if (permissions.length) {
+          console.log(`📋 Permissions from settings for ${staff.role}:`, permissions);
+        }
+
+        // If no permissions found in settings, use defaults
+        if (!permissions || permissions.length === 0) {
+          permissions = defaultPermissions[staff.role?.toLowerCase()] || ['tables'];
+          console.log(`⚙️ Using default permissions for ${staff.role}:`, permissions);
+        }
+
+        console.log(`✅ Final permissions for ${staff.name}:`, permissions);
+
+        // 🧾 Sign JWT
+        const token = jwt.sign(
+          { id: staff.id, role: staff.role, restaurant_id: staff.restaurant_id },
+          process.env.JWT_SECRET || "beypro_secret_2025",
+          { expiresIn: "7d" }
+        );
+
+        return res.json({
+          success: true,
+          type: "staff",
+          staff: {
+            id: staff.id,
+            name: staff.name,
+            email: staff.email,
+            role: staff.role,
+            restaurant_id: staff.restaurant_id,
+            permissions,
+          },
+          token,
+        });
+      }
+
+      // Invalid PIN
+      console.warn(`❌ Invalid PIN: ${pin} - No matching staff found`);
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid PIN',
+      });
+    }
+
+    // 2️⃣ EMAIL + PASSWORD LOGIN (for admins/users)
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    console.log(`➡️ Incoming email: ${email}`);
+    console.log(`➡️ Normalized email: ${normalizedEmail}`);
+    
+    console.log('🛠️ Querying users table…');
+    const userRes = await pool.query(
+      `SELECT id, full_name, email, role, password_hash, restaurant_id
+       FROM users
+       WHERE LOWER(TRIM(email)) = $1`,
+      [normalizedEmail]
+    );
+
+    const user = userRes.rows[0];
+    if (user && await bcrypt.compare(password || '', user.password_hash)) {
+      console.log(`✅ Admin login success: ${user.full_name}`);
+
+      // 🔐 Fetch permissions for admin role
+      let permissions = [];
+      permissions = await loadRolePermissions(user.restaurant_id, user.role);
+
+      // 🧾 Sign JWT
+      const token = jwt.sign(
+        { id: user.id, role: user.role, restaurant_id: user.restaurant_id },
+        process.env.JWT_SECRET || "beypro_secret_2025",
+        { expiresIn: "7d" }
+      );
+
+      return res.json({
+        success: true,
+        type: "user",
+        user: {
+          id: user.id,
+          name: user.full_name,
+          email: user.email,
+          role: user.role,
+          restaurant_id: user.restaurant_id,
+          permissions,
+        },
+        token,
+      });
+    }
+
+    // 3️⃣ Try STAFF with EMAIL + PIN/PASSWORD (legacy support)
+    console.log('🛠️ Querying staff table with email…');
+    const staffRes = await pool.query(
+      `SELECT id, name, email, role, pin, restaurant_id, status
+       FROM staff
+       WHERE LOWER(TRIM(email)) = $1 AND status = 'active'`,
+      [normalizedEmail]
+    );
+
+    const staff = staffRes.rows[0];
+    if (staff && (staff.pin === pin || staff.pin === password)) {
+      console.log(`✅ Staff login success: ${staff.name} (${staff.role})`);
+
+      // 🧩 Fetch permissions for staff role
+      let permissions = [];
+      permissions = await loadRolePermissions(staff.restaurant_id, staff.role);
+
+      // 🧾 Sign JWT
+      const token = jwt.sign(
+        { id: staff.id, role: staff.role, restaurant_id: staff.restaurant_id },
+        process.env.JWT_SECRET || "beypro_secret_2025",
+        { expiresIn: "7d" }
+      );
+
+      return res.json({
+        success: true,
+        type: "staff",
+        staff: {
+          id: staff.id,
+          name: staff.name,
+          email: staff.email,
+          role: staff.role,
+          restaurant_id: staff.restaurant_id,
+          permissions,
+        },
+        token,
+      });
+    }
+
+    // 3️⃣ No match found
+    console.warn('❌ Invalid credentials');
+    return res.status(401).json({
+      success: false,
+      error: 'Invalid credentials',
+    });
+  } catch (err) {
+    console.error('🔥 Login error:', err.stack || err);
+    return res.status(500).json({
+      success: false,
+      error: 'Server error during login',
+    });
+  }
+});
+
+// ========== PROTECTED ROUTES (Authentication Required) ==========
+// Apply authentication middleware to all routes below
+router.use(authMiddleware);
 
 // Add a new staff schedule
 // ✅ Add or update a staff schedule (tenant-safe)
@@ -174,6 +451,24 @@ router.post('/checkin', async (req, res) => {
       return res.status(404).json({ status: 'error', message: 'Staff not found' });
     }
 
+    // ✅ Require an active schedule for today (Istanbul time)
+    const todayKey = new Date().toLocaleDateString("en-CA", {
+      timeZone: "Europe/Istanbul",
+    });
+    const scheduleCheck = await pool.query(
+      `SELECT 1 FROM staff_schedule
+       WHERE restaurant_id = $1 AND staff_id = $2 AND shift_date = $3
+       LIMIT 1`,
+      [restaurantId, staffId, todayKey]
+    );
+
+    if (scheduleCheck.rowCount === 0) {
+      return res.status(403).json({
+        status: "error",
+        message: "No schedule found for today. Check-in/out is not allowed.",
+      });
+    }
+
     const userSettings = await loadUserSettings(restaurantId);
     const rawWhitelist = Array.isArray(userSettings.allowedWifiIps)
       ? userSettings.allowedWifiIps
@@ -207,6 +502,55 @@ router.post('/checkin', async (req, res) => {
     }
 
     const wifiVerifiedFlag = hasWifiRestriction ? ipAllowed : true;
+
+    const geoEnabled =
+      userSettings?.staffCheckinGeoEnabled === true ||
+      userSettings?.staff_checkin_geo_enabled === true;
+    const radiusRaw =
+      userSettings?.staffCheckinGeoRadiusMeters ??
+      userSettings?.staff_checkin_geo_radius_meters ??
+      150;
+    const radiusMeters = Number.isFinite(Number(radiusRaw)) && Number(radiusRaw) > 0
+      ? Number(radiusRaw)
+      : 150;
+    if (geoEnabled) {
+      const lat =
+        parseGeoValue(req.body?.geo_lat) ??
+        parseGeoValue(req.body?.geoLat) ??
+        parseGeoValue(req.body?.lat);
+      const lng =
+        parseGeoValue(req.body?.geo_lng) ??
+        parseGeoValue(req.body?.geoLng) ??
+        parseGeoValue(req.body?.lng);
+
+      if (lat === null || lng === null) {
+        return res.status(403).json({
+          status: 'error',
+          error: 'Location is required for staff check-in/out. Please enable location services.',
+        });
+      }
+
+      const { rows: restaurantRows } = await pool.query(
+        "SELECT pos_location_lat, pos_location_lng FROM restaurants WHERE id = $1 LIMIT 1",
+        [restaurantId]
+      );
+      const restaurantLat = parseGeoValue(restaurantRows[0]?.pos_location_lat);
+      const restaurantLng = parseGeoValue(restaurantRows[0]?.pos_location_lng);
+      if (restaurantLat === null || restaurantLng === null) {
+        return res.status(400).json({
+          status: 'error',
+          error: 'Restaurant location is not configured for staff check-in.',
+        });
+      }
+
+      const distance = haversineMeters(lat, lng, restaurantLat, restaurantLng);
+      if (distance > radiusMeters) {
+        return res.status(403).json({
+          status: 'error',
+          error: `Staff check-in/out is only allowed within ${Math.round(radiusMeters)} meters of the restaurant.`,
+        });
+      }
+    }
 
     // 🕓 Current Istanbul time
     const now = new Date().toLocaleString("en-US", { timeZone: "Europe/Istanbul" });
@@ -515,12 +859,10 @@ router.put('/attendance/archive/:id', async (req, res) => {
 
 
 // Add a new staff member
-// Add a new staff member
 // ✅ Add a new staff member (tenant-safe)
 router.post('/', async (req, res) => {
   const restaurantId = req.user.restaurant_id; // tenant isolation
   const {
-    id,
     name,
     role,
     phone,
@@ -532,14 +874,15 @@ router.post('/', async (req, res) => {
     weekly_salary,
     monthly_salary,
     payment_type,
-    pin
+    pin,
+    avatar
   } = req.body;
 
   logRequest('/api/staff', 'POST', req.body);
 
   // 🔎 Validate required fields
   if (
-    !id || !name || !role || !phone || !address || !salary ||
+    !name || !role || !phone || !address || !salary ||
     !email || !payment_type || !salary_model || !pin
   ) {
     return res.status(400).json({
@@ -549,34 +892,20 @@ router.post('/', async (req, res) => {
   }
 
   try {
-    // 🧩 Prevent duplicate ID within tenant
-    const existingStaff = await pool.query(
-      `SELECT id FROM staff WHERE restaurant_id = $1 AND id = $2`,
-      [restaurantId, id]
-    );
-
-    if (existingStaff.rowCount > 0) {
-      return res.status(409).json({
-        status: 'error',
-        message: 'Staff ID already exists'
-      });
-    }
-
-    // 💾 Insert new staff
+    // 💾 Insert new staff (ID auto-generated by database)
     const result = await pool.query(
       `INSERT INTO staff (
-        restaurant_id, id, name, role, phone, address, salary,
+        restaurant_id, name, role, phone, address, salary,
         email, payment_type, salary_model,
-        hourly_rate, weekly_salary, monthly_salary, pin
+        hourly_rate, weekly_salary, monthly_salary, pin, avatar, status
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7,
-        $8, $9, $10,
-        $11, $12, $13, $14
+        $1, $2, $3, $4, $5, $6,
+        $7, $8, $9,
+        $10, $11, $12, $13, $14, 'active'
       )
       RETURNING *`,
       [
         restaurantId,
-        id,
         name,
         role,
         phone,
@@ -588,7 +917,8 @@ router.post('/', async (req, res) => {
         salary_model === 'hourly' ? hourly_rate : null,
         salary_model === 'fixed' && payment_type === 'weekly' ? weekly_salary : null,
         salary_model === 'fixed' && payment_type === 'monthly' ? monthly_salary : null,
-        pin
+        pin,
+        avatar || null
       ]
     );
 
@@ -602,7 +932,7 @@ router.post('/', async (req, res) => {
     console.error('❌ Server error while adding staff:', err);
     res.status(500).json({
       status: 'error',
-      message: 'Server error'
+      message: 'Server error: ' + err.message
     });
   }
 });
@@ -1316,18 +1646,18 @@ router.get('/:staffId/payroll', async (req, res) => {
       return `${prefix}${hours}h ${mins}min`;
     };
 
-    // ✅ Determine salary based on model
-    let totalSalaryDue = 0;
-    if (staff.salary_model === "hourly") {
-      totalSalaryDue = (staff.hourly_rate || 0) * totalHours;
-    } else if (staff.payment_type === "daily") {
-      // 8 hours per day baseline
-      totalSalaryDue = (staff.salary || 0) * (totalHours / 8);
-    } else if (staff.payment_type === "weekly") {
-      totalSalaryDue = staff.weekly_salary || staff.salary || 0;
-    } else if (staff.payment_type === "monthly") {
-      totalSalaryDue = staff.monthly_salary || staff.salary || 0;
-    }
+	    // ✅ Determine salary based on model
+	    let totalSalaryDue = 0;
+	    if (staff.salary_model === "hourly") {
+	      totalSalaryDue = (Number(staff.hourly_rate) || 0) * totalHours;
+	    } else if (staff.payment_type === "daily") {
+	      // 8 hours per day baseline
+	      totalSalaryDue = (Number(staff.salary) || 0) * (totalHours / 8);
+	    } else if (staff.payment_type === "weekly") {
+	      totalSalaryDue = Number(staff.weekly_salary || staff.salary || 0) || 0;
+	    } else if (staff.payment_type === "monthly") {
+	      totalSalaryDue = Number(staff.monthly_salary || staff.salary || 0) || 0;
+	    }
 
     const salaryDifference = Number(totalSalaryDue) - totalPaid;
     const salaryDue = salaryDifference > 0 ? salaryDifference : 0;
@@ -1342,12 +1672,12 @@ router.get('/:staffId/payroll', async (req, res) => {
       payroll: {
         totalHours: totalHours.toFixed(2),
         totalMinutes: totalActualMinutes,
-        totalMinutesThisWeek: totalActualMinutes,
-        salaryPaid: totalPaid,
-        totalSalaryDue: Number(totalSalaryDue.toFixed(2)),
-        salaryDue: Number(salaryDue.toFixed(2)),
-        attendanceCount: attendanceRows.length,
-        weeklyHours: Number(weeklyHours.toFixed(2)),
+	        totalMinutesThisWeek: totalActualMinutes,
+	        salaryPaid: totalPaid,
+	        totalSalaryDue: Number((Number(totalSalaryDue) || 0).toFixed(2)),
+	        salaryDue: Number(salaryDue.toFixed(2)),
+	        attendanceCount: attendanceRows.length,
+	        weeklyHours: Number(weeklyHours.toFixed(2)),
         earlyCheckoutMinutes: totalEarlyCheckoutMinutes,
         timeDifferenceMinutes,
         timeDifferenceFormatted: formatDifference(timeDifferenceMinutes),
@@ -1472,8 +1802,20 @@ router.post('/:staffId/payments', async (req, res) => {
     }
 
     amount = parseFloat(amount);
-    if ((amount === undefined || isNaN(amount)) || (amount === 0 && !auto)) {
+    if (amount === undefined || isNaN(amount)) {
       return res.status(400).json({ status: "error", message: "Invalid or missing amount" });
+    }
+    if (!auto && amount === 0) {
+      return res.status(400).json({ status: "error", message: "Invalid or missing amount" });
+    }
+
+    if (auto) {
+      if (!scheduled_date) {
+        return res.status(400).json({ status: "error", message: "scheduled_date is required for auto payments" });
+      }
+      if (!repeat_type || repeat_type === "none" || !repeat_time) {
+        return res.status(400).json({ status: "error", message: "repeat_type and repeat_time are required for auto payments" });
+      }
     }
 
     // ✅ Step 3: Insert payment
@@ -1501,6 +1843,14 @@ router.post('/:staffId/payments', async (req, res) => {
     );
 
     console.log(`✅ Payment saved for staff ${staffId}: ${amount} (${payment_method})`);
+    try {
+      emitReportsRefresh(req.app.get("io"), restaurantId, {
+        source: "staff_payment",
+        staffId,
+        amount,
+        payment_method,
+      });
+    } catch (_) {}
 
     // 🔁 Step 4: Create or update auto payroll if applicable
     if (auto && repeat_type && repeat_time) {
@@ -1832,131 +2182,5 @@ router.put('/:id/role', async (req, res) => {
     res.status(500).json({ status: 'error', message: 'Failed to update staff role' });
   }
 });
-
-
-
-// ----------------- LOGIN (Users + Staff) -----------------
-// ✅ Unified login for both users (admin/manager) and staff (PIN-based)
-router.post('/login', async (req, res) => {
-  const { email, password, pin } = req.body;
-  console.log('🔑 Login Debug');
-  console.log(`➡️ Incoming email: ${email}`);
-
-  try {
-    // 1️⃣ Try ADMIN / USER (password login)
-    console.log('🛠️ Querying users table…');
-    const userRes = await pool.query(
-      `SELECT id, full_name, email, role, password_hash, restaurant_id
-       FROM users
-       WHERE email = $1`,
-      [email]
-    );
-
-    const user = userRes.rows[0];
-    if (user && await bcrypt.compare(password || '', user.password_hash)) {
-      console.log(`✅ Admin login success: ${user.full_name}`);
-
-      // 🔐 Fetch permissions for admin role
-      const settingsRes = await pool.query(
-        `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'users'`,
-        [user.restaurant_id]
-      );
-
-      let permissions = [];
-      if (settingsRes.rows.length > 0) {
-        const config = settingsRes.rows[0].value;
-        permissions = config?.roles?.[user.role?.toLowerCase()] || [];
-      }
-
-      // 🧾 Sign JWT
-     const token = jwt.sign(
-  { id: user.id, role: user.role, restaurant_id: user.restaurant_id },
-  process.env.JWT_SECRET || "beypro_secret_2025",
-  { expiresIn: "7d" }
-);
-
-
-      return res.json({
-        success: true,
-        type: "user",
-        user: {
-          id: user.id,
-          name: user.full_name,
-          email: user.email,
-          role: user.role,
-          restaurant_id: user.restaurant_id,
-          permissions, // ✅ include permissions
-        },
-        token,
-      });
-    }
-
-    // 2️⃣ Try STAFF (PIN login)
-    console.log('🛠️ Querying staff table…');
-    const staffRes = await pool.query(
-      `SELECT id, name, email, role, pin, restaurant_id
-       FROM staff
-       WHERE email = $1`,
-      [email]
-    );
-
-    const staff = staffRes.rows[0];
-    if (staff && (staff.pin === pin || staff.pin === password)) {
-      console.log(`✅ Staff login success: ${staff.name} (${staff.role})`);
-
-      // 🧩 Fetch permissions for staff role
-      const settingsRes = await pool.query(
-        `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'users'`,
-        [staff.restaurant_id]
-      );
-
-      let permissions = [];
-      if (settingsRes.rows.length > 0) {
-        const config = settingsRes.rows[0].value;
-        permissions = config?.roles?.[staff.role?.toLowerCase()] || [];
-      }
-
-      // 🧾 Sign JWT
- const token = jwt.sign(
-  { id: staff.id, role: staff.role, restaurant_id: staff.restaurant_id },
-  process.env.JWT_SECRET || "beypro_secret_2025",
-  { expiresIn: "7d" }
-);
-
-
-      return res.json({
-        success: true,
-        type: "staff",
-        staff: {
-          id: staff.id,
-          name: staff.name,
-          email: staff.email,
-          role: staff.role,
-          restaurant_id: staff.restaurant_id,
-          permissions, // ✅ include permissions
-        },
-        token,
-      });
-    }
-
-    // 3️⃣ No match found
-    console.warn('❌ Invalid credentials');
-    return res.status(401).json({
-      success: false,
-      error: 'Invalid credentials',
-    });
-  } catch (err) {
-    console.error('🔥 Login error:', err.stack || err);
-    return res.status(500).json({
-      success: false,
-      error: 'Server error during login',
-    });
-  }
-});
-
-
-
-
-
 
 module.exports = router;

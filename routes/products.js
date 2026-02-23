@@ -2,9 +2,24 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { attachAllowedModules } = require("../middleware/moduleGuard");
 const jwt = require("jsonwebtoken");
 
-const JWT_SECRET = process.env.JWT_SECRET || "beypro_secret_2025";
+const PRIMARY_JWT_SECRET = process.env.JWT_SECRET || "beypro_secret_2025";
+const LEGACY_JWT_SECRET =
+  process.env.NODE_ENV !== "production" ? process.env.JWT_SECRET_LEGACY : "";
+
+const verifyJwt = (token) => {
+  try {
+    return jwt.verify(token, PRIMARY_JWT_SECRET);
+  } catch (err) {
+    if (LEGACY_JWT_SECRET && LEGACY_JWT_SECRET !== PRIMARY_JWT_SECRET) {
+      return jwt.verify(token, LEGACY_JWT_SECRET);
+    }
+    throw err;
+  }
+};
+
 const decodeOptionalAuth = (req) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return { user: null, error: null };
@@ -14,7 +29,7 @@ const decodeOptionalAuth = (req) => {
 
   try {
     const token = authHeader.slice(7).trim();
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = verifyJwt(token);
     if (!decoded?.restaurant_id) {
       return { user: null, error: "Token missing restaurant_id" };
     }
@@ -67,23 +82,51 @@ if (r.rows.length === 0) {
     }
 
     // 3️⃣ Fetch products
+    // - Authenticated POS users: return full fields (needed for edit screens), include hidden items.
+    // - Public QR users: return a limited set and only visible items.
+    const isAuthed = !!user?.restaurant_id;
+
     const { rows } = await pool.query(
-      `SELECT
-         id,
-         name,
-         price,
-         category,
-         description,
-         image,
-         COALESCE(visible, true) AS visible,
-         COALESCE(show_add_to_cart_modal, true) AS show_add_to_cart_modal,
-         ingredients,
-         extras,
-         selected_extras_group
-       FROM products
-       WHERE restaurant_id = $1
-         AND COALESCE(visible, true) = true
-       ORDER BY category, name`,
+      isAuthed
+        ? `SELECT
+             id,
+             name,
+             price,
+             category,
+             preparation_time,
+             description,
+             discount_type,
+             discount_value,
+             COALESCE(visible, true) AS visible,
+             tags,
+             allergens,
+             promo_start,
+             promo_end,
+             image,
+             image_url,
+             COALESCE(show_add_to_cart_modal, true) AS show_add_to_cart_modal,
+             ingredients,
+             extras,
+             selected_extras_group
+           FROM products
+           WHERE restaurant_id = $1
+           ORDER BY category, name`
+        : `SELECT
+             id,
+             name,
+             price,
+             category,
+             description,
+             image,
+             COALESCE(visible, true) AS visible,
+             COALESCE(show_add_to_cart_modal, true) AS show_add_to_cart_modal,
+             ingredients,
+             extras,
+             selected_extras_group
+           FROM products
+           WHERE restaurant_id = $1
+             AND COALESCE(visible, true) = true
+           ORDER BY category, name`,
       [restaurantId]
     );
 
@@ -96,6 +139,16 @@ if (r.rows.length === 0) {
 
 // 🛡️ All other product routes remain protected
 router.use(authMiddleware);
+router.use(async (req, res, next) => {
+  const allowed = await attachAllowedModules(req);
+  if (Array.isArray(allowed) && !allowed.includes("pos_core")) {
+    const isAllowedWrite = req.method === "POST" && /^\/?$/.test(req.path || "");
+    if (!isAllowedWrite) {
+      return res.status(403).json({ error: "MODULE_NOT_ALLOWED" });
+    }
+  }
+  return next();
+});
 
 
 async function resolveRestaurantId(req) {
@@ -142,11 +195,33 @@ async function ensureCategoriesTable() {
 
 
 
+const parseJsonDeep = (value, fallback) => {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === "object") return value;
+  if (typeof value !== "string") return fallback;
+
+  const raw = value.trim();
+  if (!raw) return fallback;
+
+  try {
+    let parsed = JSON.parse(raw);
+    // Handle double-stringified payloads: "\"[ {...} ]\""
+    for (let i = 0; i < 2 && typeof parsed === "string"; i++) {
+      parsed = JSON.parse(parsed);
+    }
+    return parsed;
+  } catch {
+    return fallback;
+  }
+};
+
+const ensureArray = (value) => (Array.isArray(value) ? value : []);
+
 // ✅ Add new product
 // ✅ Add new product
-router.post("/", async (req, res) => {
-  const restaurantId = req.user.restaurant_id;
-  const {
+	router.post("/", async (req, res) => {
+	  const restaurantId = req.user.restaurant_id;
+	  const {
     name,
     category,
     price,
@@ -176,18 +251,39 @@ router.post("/", async (req, res) => {
     });
   }
 
-  // 🧩 Normalize promo date fields
-  const normalizedPromoStart =
-    promo_start && promo_start.trim() !== "" ? promo_start : null;
-  const normalizedPromoEnd =
-    promo_end && promo_end.trim() !== "" ? promo_end : null;
+	  // 🧩 Normalize promo date fields
+	  const normalizedPromoStart =
+	    promo_start && promo_start.trim() !== "" ? promo_start : null;
+	  const normalizedPromoEnd =
+	    promo_end && promo_end.trim() !== "" ? promo_end : null;
 
-  console.log("🛠️ Incoming product payload:", req.body);
+	  console.log("🛠️ Incoming product payload:", req.body);
 
-  try {
-    const result = await pool.query(
-      `
-      INSERT INTO products (
+	  const parsedIngredients = parseJsonDeep(ingredients, ingredients);
+	  const parsedExtras = parseJsonDeep(extras, extras);
+	  const parsedGroups = parseJsonDeep(selected_extras_group, selected_extras_group);
+
+	  const normalizedIngredients = ensureArray(parsedIngredients);
+	  const normalizedExtras = ensureArray(parsedExtras);
+	  const normalizedGroups = ensureArray(parsedGroups);
+
+	  if (
+	    (typeof ingredients === "string" && normalizedIngredients.length === 0 && ingredients.trim() !== "[]") ||
+	    (typeof extras === "string" && normalizedExtras.length === 0 && extras.trim() !== "[]") ||
+	    (typeof selected_extras_group === "string" &&
+	      normalizedGroups.length === 0 &&
+	      selected_extras_group.trim() !== "[]")
+	  ) {
+	    return res.status(400).json({
+	      status: "error",
+	      message: "Invalid JSON format for ingredients/extras/selected_extras_group",
+	    });
+	  }
+
+	  try {
+	    const result = await pool.query(
+	      `
+	      INSERT INTO products (
         restaurant_id, name, category, price, preparation_time,
         description, discount_type, discount_value, visible, tags, allergens,
         promo_start, promo_end, image, image_url, ingredients, extras, selected_extras_group,
@@ -197,29 +293,29 @@ router.post("/", async (req, res) => {
               $6,$7,$8,$9,$10,$11,
               $12,$13,$14,$15,$16,$17,$18,$19)
       RETURNING *
-      `,
-      [
-        restaurantId,
-        name,
-        category,
-        price,
-        preparation_time || null,
-        description || "",
-        discount_type || "none",
-        discount_value || 0,
-        visible !== false, // default true
-        tags || "",
-        allergens || "",
-        normalizedPromoStart, // ✅ safe timestamps
-        normalizedPromoEnd,   // ✅ safe timestamps
-        image || null,
-        image_url || null,
-        ingredients || [],
-        extras || [],
-        selected_extras_group || [], // ✅ mapped correctly now
-        showAddToCartModal,
-      ]
-    );
+	      `,
+	      [
+	        restaurantId,
+	        name,
+	        category,
+	        price,
+	        preparation_time || null,
+	        description || "",
+	        discount_type || "none",
+	        discount_value || 0,
+	        visible !== false, // default true
+	        tags || "",
+	        allergens || "",
+	        normalizedPromoStart, // ✅ safe timestamps
+	        normalizedPromoEnd,   // ✅ safe timestamps
+	        image || null,
+	        image_url || null,
+	        JSON.stringify(normalizedIngredients),
+	        JSON.stringify(normalizedExtras),
+	        JSON.stringify(normalizedGroups), // ✅ mapped correctly now
+	        showAddToCartModal,
+	      ]
+	    );
 
     res.json({
       status: "success",
@@ -234,10 +330,10 @@ router.post("/", async (req, res) => {
 
 
 // ✅ Update product
-router.put("/:id", async (req, res) => {
-  const restaurantId = req.user.restaurant_id;
-  const { id } = req.params;
-  const updates = req.body;
+		router.put("/:id(\\d+)", async (req, res) => {
+		  const restaurantId = req.user.restaurant_id;
+		  const { id } = req.params;
+		  const updates = req.body;
 
   const allowed = [
     "name",
@@ -268,19 +364,31 @@ router.put("/:id", async (req, res) => {
     });
   }
 
-  // ✅ Normalize timestamp fields before update
-  if (updates.promo_start === "") updates.promo_start = null;
-  if (updates.promo_end === "") updates.promo_end = null;
+	  // ✅ Normalize timestamp fields before update
+	  if (updates.promo_start === "") updates.promo_start = null;
+	  if (updates.promo_end === "") updates.promo_end = null;
 
-  // 🔑 Ensure JSON fields are properly stringified
-  ["ingredients", "extras", "selected_extras_group"].forEach((f) => {
-    if (updates[f] !== undefined && typeof updates[f] !== "string") {
-      updates[f] = JSON.stringify(updates[f]);
-    }
-  });
+	  // ✅ Normalize JSON fields (accept arrays/objects, or JSON strings)
+	  for (const f of ["ingredients", "extras", "selected_extras_group"]) {
+	    if (updates[f] === undefined) continue;
+	    if (typeof updates[f] === "string") {
+	      const parsed = parseJsonDeep(updates[f], null);
+	      if (parsed === null) {
+	        return res.status(400).json({
+	          status: "error",
+	          message: `Invalid JSON format for ${f}`,
+	        });
+	      }
+	      updates[f] = parsed;
+	    }
+	    // Ensure arrays for fields that are meant to be lists
+	    if (f === "ingredients" || f === "extras" || f === "selected_extras_group") {
+	      updates[f] = JSON.stringify(ensureArray(updates[f]));
+	    }
+	  }
 
-  const setClause = fields.map((f, i) => `${f} = $${i + 3}`).join(", ");
-  const values = [restaurantId, id, ...fields.map((f) => updates[f])];
+	  const setClause = fields.map((f, i) => `${f} = $${i + 3}`).join(", ");
+	  const values = [restaurantId, id, ...fields.map((f) => updates[f])];
 
   try {
     const result = await pool.query(
@@ -710,7 +818,7 @@ router.delete("/categories", authMiddleware, async (req, res) => {
 });
 
 
-router.get("/:id", async (req, res) => {
+router.get("/:id(\\d+)", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   const { id } = req.params;
 
@@ -788,7 +896,7 @@ router.get("/public/products", async (req, res) => {
 });
 
 // ✅ Delete product
-router.delete("/:id", async (req, res) => {
+router.delete("/:id(\\d+)", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   const { id } = req.params;
 

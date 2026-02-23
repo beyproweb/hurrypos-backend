@@ -7,6 +7,12 @@ module.exports = function(io) {
   const { v4: uuidv4 } = require("uuid");
   const { performance } = require("perf_hooks");
   const jwt = require("jsonwebtoken");
+  const moment = require("moment-timezone");
+  const {
+    getMiddlewareBearerForCallbackUrl,
+    clearMiddlewareBearerForCallbackUrl,
+  } = require("../utils/dhMiddlewareToken");
+  const { sendYsPartnerFulfillment } = require("../utils/ysPartnerFulfillment");
   const dlog = (...args) =>
     console.log(new Date().toISOString(), "[orders]", ...args);
   const authMiddleware = require("../middleware/authMiddleware");
@@ -15,6 +21,578 @@ module.exports = function(io) {
     increaseCustomerDebt,
     decreaseCustomerDebt,
   } = require("../utils/customerDebt");
+  const { emitAlert } = require("../utils/realtime");
+  const { updateStockForOrder } = require("../utils/orderStock");
+  const { attachAllowedModules } = require("../middleware/moduleGuard");
+  const DEFAULT_TZ = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
+
+  const getAuthHeaderForCallbackUrl = async (url) => {
+    try {
+      return await getMiddlewareBearerForCallbackUrl(url);
+    } catch (err) {
+      dlog("❌ Middleware login failed:", err.message);
+      return null;
+    }
+  };
+
+  const parseCallbackUrls = (value) => {
+    if (!value) return null;
+    if (typeof value === "object") return value;
+    if (typeof value === "string") {
+      try {
+        return JSON.parse(value);
+      } catch (err) {
+        console.warn("⚠️ Failed to parse external_callback_urls:", err.message);
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const resolveRejectUrl = (callbackUrls) => {
+    if (!callbackUrls || typeof callbackUrls !== "object") return null;
+    return (
+      callbackUrls.orderRejectedUrl ||
+      callbackUrls.order_rejected_url ||
+      callbackUrls.orderRejectedURL ||
+      callbackUrls.order_rejected ||
+      null
+    );
+  };
+
+  const resolveAcceptUrl = (callbackUrls) => {
+    if (!callbackUrls || typeof callbackUrls !== "object") return null;
+    return (
+      callbackUrls.orderAcceptedUrl ||
+      callbackUrls.order_accepted_url ||
+      callbackUrls.orderAcceptedURL ||
+      callbackUrls.order_accepted ||
+      null
+    );
+  };
+
+  const resolvePickedUpUrl = (callbackUrls) => {
+    if (!callbackUrls || typeof callbackUrls !== "object") return null;
+    return (
+      callbackUrls.orderPickedUpUrl ||
+      callbackUrls.order_picked_up_url ||
+      callbackUrls.orderPickedUpURL ||
+      callbackUrls.order_picked_up ||
+      null
+    );
+  };
+
+  const resolveDeliveredUrl = (callbackUrls) => {
+    if (!callbackUrls || typeof callbackUrls !== "object") return null;
+    return (
+      callbackUrls.orderDeliveredUrl ||
+      callbackUrls.order_delivered_url ||
+      callbackUrls.orderDeliveredURL ||
+      callbackUrls.order_delivered ||
+      null
+    );
+  };
+
+  const resolvePreparedUrl = (callbackUrls) => {
+    if (!callbackUrls || typeof callbackUrls !== "object") return null;
+    return (
+      callbackUrls.orderPreparedUpUrl ||
+      callbackUrls.orderPreparedUrl ||
+      callbackUrls.orderPreparedURL ||
+      callbackUrls.order_prepared_url ||
+      callbackUrls.order_prepared ||
+      null
+    );
+  };
+
+  const resolveStatusUrl = (callbackUrls) => {
+    if (!callbackUrls || typeof callbackUrls !== "object") return null;
+    return (
+      resolvePickedUpUrl(callbackUrls) ||
+      resolveAcceptUrl(callbackUrls) ||
+      resolveRejectUrl(callbackUrls) ||
+      null
+    );
+  };
+
+  const recordCancelSyncError = async (orderId, message) => {
+    if (!orderId) return;
+    try {
+      await pool.query(
+        "UPDATE orders SET cancel_sync_error = $1 WHERE id = $2",
+        [message || null, orderId]
+      );
+    } catch (err) {
+      console.warn("⚠️ Failed to record cancel sync error:", err.message);
+    }
+  };
+
+  const emitYsOrderStatus = (restaurantId, orderId, status, meta = {}) => {
+    if (!restaurantId || !orderId || !status) return;
+    const ioRef = getIO();
+    const normalizedStatus = String(status).toLowerCase();
+    const orderNumber = meta.order_number ?? meta.orderNumber ?? null;
+    const orderSuffix = orderNumber ? `#${orderNumber}` : `#${orderId}`;
+    const label = normalizedStatus.replace(/_/g, " ");
+    emitAlert(ioRef, restaurantId, `Yemeksepeti order ${orderSuffix} ${label}`, null, "order", {
+      event: `ys_order_${normalizedStatus}`,
+      orderId,
+      order_number: orderNumber,
+      source: "yemeksepeti",
+    });
+  };
+
+  const sendExternalOrderRejection = async ({ orderId, reason }) => {
+    if (!orderId) return { skipped: true, reason: "missing_order_id" };
+
+    const { rows } = await pool.query(
+      `SELECT restaurant_id, external_order_token, external_callback_urls, external_source, external_id
+         FROM orders
+        WHERE id = $1
+        LIMIT 1`,
+      [orderId]
+    );
+
+    if (!rows.length) {
+      return { skipped: true, reason: "order_not_found" };
+    }
+
+    const order = rows[0];
+    const isYsOrder = String(order.external_source || "").toLowerCase() === "yemeksepeti";
+    const isExternalOrder = Boolean(
+      order.external_source === "yemeksepeti" ||
+        order.external_order_token ||
+        order.external_callback_urls ||
+        order.external_id
+    );
+
+    if (!isExternalOrder) {
+      return { skipped: true, reason: "not_external" };
+    }
+
+    if (isYsOrder) {
+      emitYsOrderStatus(order.restaurant_id, orderId, "cancelled", {});
+    }
+
+    const callbackUrls = parseCallbackUrls(order.external_callback_urls);
+    const rejectUrl = resolveRejectUrl(callbackUrls);
+
+    if (!rejectUrl) {
+      dlog("⚠️ Missing orderRejectedUrl for external order", orderId);
+      return { skipped: true, reason: "missing_reject_url" };
+    }
+
+    const rejectionComment = reason || "cancelled_by_pos";
+    const payload = {
+      status: "order_rejected",
+      rejectionReason: {
+        code: "other",
+        comment: rejectionComment,
+      },
+      reason: rejectionComment,
+    };
+
+    dlog("📤 Sending external order_rejected:", rejectUrl, payload);
+
+    try {
+      let authHeader = await getAuthHeaderForCallbackUrl(rejectUrl);
+      let response = await fetch(rejectUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authHeader ? { Authorization: authHeader } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+      let responseBody = await response.text();
+
+      if (response.status === 401 && authHeader) {
+        clearMiddlewareBearerForCallbackUrl(rejectUrl);
+        authHeader = await getAuthHeaderForCallbackUrl(rejectUrl);
+        response = await fetch(rejectUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(authHeader ? { Authorization: authHeader } : {}),
+          },
+          body: JSON.stringify(payload),
+        });
+        responseBody = await response.text();
+      }
+
+      dlog(
+        "📥 External order_rejected response:",
+        rejectUrl,
+        response.status,
+        responseBody
+      );
+
+      if (!response.ok) {
+        await recordCancelSyncError(
+          orderId,
+          `External cancel failed (${response.status}): ${responseBody}`
+        );
+        return {
+          ok: false,
+          status: response.status,
+          body: responseBody,
+        };
+      }
+
+      await recordCancelSyncError(orderId, null);
+      return { ok: true, status: response.status, body: responseBody };
+    } catch (err) {
+      dlog("❌ External order_rejected request failed:", err.message);
+      await recordCancelSyncError(orderId, `External cancel error: ${err.message}`);
+      return { ok: false, error: err.message };
+    }
+  };
+
+  const sendExternalOrderAccepted = async ({ orderId }) => {
+    if (!orderId) return { skipped: true, reason: "missing_order_id" };
+
+    const { rows } = await pool.query(
+      `SELECT restaurant_id, external_callback_urls, external_source, external_id
+         FROM orders
+        WHERE id = $1
+        LIMIT 1`,
+      [orderId]
+    );
+
+    if (!rows.length) return { skipped: true, reason: "order_not_found" };
+
+    const order = rows[0];
+    const isExternalOrder = Boolean(
+      order.external_source === "yemeksepeti" ||
+        order.external_callback_urls ||
+        order.external_id
+    );
+
+    if (!isExternalOrder) return { skipped: true, reason: "not_external" };
+
+    const callbackUrls = parseCallbackUrls(order.external_callback_urls);
+    const acceptUrl = resolveAcceptUrl(callbackUrls);
+    if (!acceptUrl) {
+      dlog("⚠️ Missing orderAcceptedUrl for external order", orderId);
+      return { skipped: true, reason: "missing_accept_url" };
+    }
+
+    const payload = { status: "order_accepted" };
+    dlog("📤 Sending external order_accepted:", acceptUrl, payload);
+
+    try {
+      let authHeader = await getAuthHeaderForCallbackUrl(acceptUrl);
+      let response = await fetch(acceptUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authHeader ? { Authorization: authHeader } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+      let responseBody = await response.text();
+      if (response.status === 401 && authHeader) {
+        clearMiddlewareBearerForCallbackUrl(acceptUrl);
+        authHeader = await getAuthHeaderForCallbackUrl(acceptUrl);
+        response = await fetch(acceptUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(authHeader ? { Authorization: authHeader } : {}),
+          },
+          body: JSON.stringify(payload),
+        });
+        responseBody = await response.text();
+      }
+      dlog("📥 External order_accepted response:", acceptUrl, response.status, responseBody);
+
+      if (!response.ok) {
+        await recordCancelSyncError(
+          orderId,
+          `External accept failed (${response.status}): ${responseBody}`
+        );
+        return { ok: false, status: response.status, body: responseBody };
+      }
+
+      await recordCancelSyncError(orderId, null);
+      return { ok: true, status: response.status, body: responseBody };
+    } catch (err) {
+      dlog("❌ External order_accepted request failed:", err.message);
+      await recordCancelSyncError(orderId, `External accept error: ${err.message}`);
+      return { ok: false, error: err.message };
+    }
+  };
+
+  const sendExternalPreparationCompleted = async ({ orderId }) => {
+    if (!orderId) return { skipped: true, reason: "missing_order_id" };
+
+    const { rows } = await pool.query(
+      `SELECT restaurant_id, external_callback_urls, external_source, external_id
+         FROM orders
+        WHERE id = $1
+        LIMIT 1`,
+      [orderId]
+    );
+
+    if (!rows.length) {
+      dlog("⚠️ External prep-completed skipped (order not found):", orderId);
+      return { skipped: true, reason: "order_not_found" };
+    }
+
+    const order = rows[0];
+    const isExternalOrder = Boolean(
+      order.external_source === "yemeksepeti" ||
+        order.external_callback_urls ||
+        order.external_id
+    );
+
+    if (!isExternalOrder) {
+      dlog("ℹ️ External prep-completed skipped (not external):", orderId);
+      return { skipped: true, reason: "not_external" };
+    }
+
+    const callbackUrls = parseCallbackUrls(order.external_callback_urls);
+    const preparedUrl = resolvePreparedUrl(callbackUrls);
+    const pickedUpUrl = resolvePickedUpUrl(callbackUrls);
+    if (!preparedUrl && !pickedUpUrl) {
+      dlog(
+        "⚠️ External prep-completed skipped (missing prepared & picked_up urls):",
+        orderId,
+        callbackUrls
+      );
+      return { skipped: true, reason: "missing_prepared_url" };
+    }
+
+    if (!preparedUrl && pickedUpUrl) {
+      // Fallback for vendor-delivery platforms that don't expose a prep URL; send picked_up to move tracking forward.
+      dlog("↩️ No preparedUrl; sending order_picked_up as fallback:", pickedUpUrl);
+      return sendExternalOrderPickedUp({ orderId });
+    }
+
+    dlog("📤 Sending external preparation-completed:", preparedUrl);
+    try {
+      let authHeader = await getAuthHeaderForCallbackUrl(preparedUrl);
+      let response = await fetch(preparedUrl, {
+        method: "POST",
+        headers: {
+          ...(authHeader ? { Authorization: authHeader } : {}),
+        },
+      });
+      let responseBody = await response.text();
+      if (response.status === 401 && authHeader) {
+        clearMiddlewareBearerForCallbackUrl(preparedUrl);
+        authHeader = await getAuthHeaderForCallbackUrl(preparedUrl);
+        response = await fetch(preparedUrl, {
+          method: "POST",
+          headers: {
+            ...(authHeader ? { Authorization: authHeader } : {}),
+          },
+        });
+        responseBody = await response.text();
+      }
+      dlog(
+        "📥 External preparation-completed response:",
+        preparedUrl,
+        response.status,
+        responseBody
+      );
+
+      if (!response.ok) {
+        await recordCancelSyncError(
+          orderId,
+          `External prepared failed (${response.status}): ${responseBody}`
+        );
+        return { ok: false, status: response.status, body: responseBody };
+      }
+
+      await recordCancelSyncError(orderId, null);
+      return { ok: true, status: response.status, body: responseBody };
+    } catch (err) {
+      await recordCancelSyncError(orderId, `External prepared error: ${err.message}`);
+      return { ok: false, error: err.message };
+    }
+  };
+
+  const sendExternalOrderPickedUp = async ({ orderId }) => {
+    if (!orderId) return { skipped: true, reason: "missing_order_id" };
+
+    const { rows } = await pool.query(
+      `SELECT restaurant_id, external_callback_urls, external_source, external_id
+         FROM orders
+        WHERE id = $1
+        LIMIT 1`,
+      [orderId]
+    );
+
+    if (!rows.length) return { skipped: true, reason: "order_not_found" };
+
+    const order = rows[0];
+    const isExternalOrder = Boolean(
+      order.external_source === "yemeksepeti" ||
+        order.external_callback_urls ||
+        order.external_id
+    );
+
+    if (!isExternalOrder) {
+      dlog(`ℹ️  Order ${orderId} is not external (local order)`);
+      return { skipped: true, reason: "not_external" };
+    }
+
+    dlog(`📋 Order ${orderId} is external [${order.external_source}] - preparing to sync...`);
+    const callbackUrls = parseCallbackUrls(order.external_callback_urls);
+    const pickedUpUrl = resolvePickedUpUrl(callbackUrls);
+    if (!pickedUpUrl) {
+      dlog(`⚠️  No orderPickedUpUrl found in callback URLs for order ${orderId}`);
+      return { skipped: true, reason: "missing_picked_up_url" };
+    }
+
+    const payload = { status: "order_picked_up" };
+    dlog("📤 Sending external order_picked_up:", pickedUpUrl, payload);
+    try {
+      let authHeader = await getAuthHeaderForCallbackUrl(pickedUpUrl);
+      if (!authHeader) {
+        dlog(`⚠️  [CRITICAL] No auth header for Yemeksepeti sync - check DH_MW_USERNAME/DH_MW_PASSWORD in .env`);
+      }
+      let response = await fetch(pickedUpUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authHeader ? { Authorization: authHeader } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+      let responseBody = await response.text();
+      if (response.status === 401 && authHeader) {
+        clearMiddlewareBearerForCallbackUrl(pickedUpUrl);
+        authHeader = await getAuthHeaderForCallbackUrl(pickedUpUrl);
+        response = await fetch(pickedUpUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(authHeader ? { Authorization: authHeader } : {}),
+          },
+          body: JSON.stringify(payload),
+        });
+        responseBody = await response.text();
+      }
+      dlog("📥 External order_picked_up response:", pickedUpUrl, response.status, responseBody);
+
+      // Treat "already in that state" as OK for idempotency.
+      if (response.status === 409) {
+        await recordCancelSyncError(orderId, null);
+        return { ok: true, status: response.status, body: responseBody, conflict: true };
+      }
+
+      if (!response.ok) {
+        await recordCancelSyncError(
+          orderId,
+          `External picked_up failed (${response.status}): ${responseBody}`
+        );
+        dlog(`⚠️  FAILED TO SYNC order_picked_up - Yemeksepeti may not show delivery!`);
+        return { ok: false, status: response.status, body: responseBody };
+      }
+
+      await recordCancelSyncError(orderId, null);
+      dlog(`✅ SUCCESS: Yemeksepeti received order_picked_up status (delivery marked)`);
+      return { ok: true, status: response.status, body: responseBody };
+    } catch (err) {
+      await recordCancelSyncError(orderId, `External picked_up error: ${err.message}`);
+      return { ok: false, error: err.message };
+    }
+  };
+
+  const sendExternalOrderDelivered = async ({ orderId }) => {
+    if (!orderId) return { skipped: true, reason: "missing_order_id" };
+
+    const { rows } = await pool.query(
+      `SELECT restaurant_id, external_callback_urls, external_source, external_id
+         FROM orders
+        WHERE id = $1
+        LIMIT 1`,
+      [orderId]
+    );
+
+    if (!rows.length) {
+      dlog("⚠️ External order_delivered skipped (order not found):", orderId);
+      return { skipped: true, reason: "order_not_found" };
+    }
+
+    const order = rows[0];
+    const isExternalOrder = Boolean(
+      order.external_source === "yemeksepeti" ||
+        order.external_callback_urls ||
+        order.external_id
+    );
+
+    if (!isExternalOrder) {
+      dlog("ℹ️ External order_delivered skipped (not external):", orderId);
+      return { skipped: true, reason: "not_external" };
+    }
+
+    const callbackUrls = parseCallbackUrls(order.external_callback_urls);
+    const deliveredUrl = resolveDeliveredUrl(callbackUrls);
+    if (!deliveredUrl) {
+      // Delivery Hero middlewareExternalApi.yaml does not define an "order_delivered" status update for callbacks.
+      // Supported statuses: order_accepted / order_rejected / order_picked_up (+ preparation-completed endpoint).
+      // Without a dedicated delivered callback URL we should not attempt to "deliver" the order externally, as it
+      // can lead to confusing UX (200 responses that don't affect customer tracking).
+      dlog(
+        "⚠️ External order_delivered skipped (no orderDeliveredUrl in callbackUrls):",
+        orderId
+      );
+      return { skipped: true, reason: "unsupported_no_delivered_url" };
+    }
+
+    const primaryPayload = { status: "order_delivered" };
+    dlog("📤 Sending external order_delivered:", deliveredUrl, primaryPayload);
+
+    try {
+      let authHeader = await getAuthHeaderForCallbackUrl(deliveredUrl);
+      let response = await fetch(deliveredUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authHeader ? { Authorization: authHeader } : {}),
+        },
+        body: JSON.stringify(primaryPayload),
+      });
+      let responseBody = await response.text();
+      if (response.status === 401 && authHeader) {
+        clearMiddlewareBearerForCallbackUrl(deliveredUrl);
+        authHeader = await getAuthHeaderForCallbackUrl(deliveredUrl);
+        response = await fetch(deliveredUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(authHeader ? { Authorization: authHeader } : {}),
+          },
+          body: JSON.stringify(primaryPayload),
+        });
+        responseBody = await response.text();
+      }
+
+      dlog(
+        "📥 External order_delivered response:",
+        deliveredUrl,
+        response.status,
+        responseBody
+      );
+
+      if (!response.ok) {
+        await recordCancelSyncError(
+          orderId,
+          `External delivered failed (${response.status}): ${responseBody}`
+        );
+        return { ok: false, status: response.status, body: responseBody };
+      }
+
+      await recordCancelSyncError(orderId, null);
+      return { ok: true, status: response.status, body: responseBody };
+    } catch (err) {
+      await recordCancelSyncError(orderId, `External delivered error: ${err.message}`);
+      return { ok: false, error: err.message };
+    }
+  };
 
   const TABLE_QR_SECRET =
     process.env.TABLE_QR_SECRET ||
@@ -59,9 +637,53 @@ module.exports = function(io) {
     return hasPaymentChangeTracking;
   }
 
+  let hasPaymentMethodChangesTracking = null;
+  async function ensurePaymentMethodChangesTracking() {
+    if (hasPaymentMethodChangesTracking !== null) return hasPaymentMethodChangesTracking;
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS payment_method_changes (
+          id BIGSERIAL PRIMARY KEY,
+          order_id BIGINT NOT NULL,
+          old_method TEXT,
+          new_method TEXT,
+          changed_by TEXT,
+          changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(
+        `ALTER TABLE payment_method_changes
+           ADD COLUMN IF NOT EXISTS changed_at TIMESTAMPTZ`
+      );
+      await pool.query(
+        `ALTER TABLE payment_method_changes
+           ADD COLUMN IF NOT EXISTS changed_by TEXT`
+      );
+      await pool.query(
+        `ALTER TABLE payment_method_changes
+           ALTER COLUMN changed_at SET DEFAULT NOW()`
+      );
+      await pool.query(
+        `UPDATE payment_method_changes
+           SET changed_at = NOW()
+         WHERE changed_at IS NULL`
+      );
+      await pool.query(
+        `ALTER TABLE payment_method_changes
+           ALTER COLUMN changed_at SET NOT NULL`
+      );
+      hasPaymentMethodChangesTracking = true;
+    } catch (err) {
+      console.warn("⚠️ Unable to ensure payment_method_changes tracking table:", err.message);
+      hasPaymentMethodChangesTracking = false;
+    }
+    return hasPaymentMethodChangesTracking;
+  }
+
   ensureCustomerDebtColumn();
   ensureOrderDebtTracking();
   ensurePaymentChangeTracking();
+  ensurePaymentMethodChangesTracking();
 
   const toMoney = (value) => {
     const num = Number.parseFloat(value);
@@ -134,8 +756,57 @@ module.exports = function(io) {
       }
     }
 
-    // 3) Default: staff / backend tokens
-    return authMiddleware(req, res, next);
+    // 3) Public QR POST (identifier without auth) – allow standalone module
+    const identifier =
+      typeof req.query.identifier === "string"
+        ? req.query.identifier.trim()
+        : String(req.query.identifier || "").trim();
+    if (
+      req.method === "POST" &&
+      identifier &&
+      !(req.headers.authorization || "").startsWith("Bearer ")
+    ) {
+      return (async () => {
+        try {
+          const { rows } = await pool.query(
+            "SELECT id FROM restaurants WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1 LIMIT 1",
+            [identifier]
+          );
+          if (!rows.length) {
+            return res.status(404).json({ error: "Invalid restaurant" });
+          }
+          const restaurant_id = rows[0].id;
+          req.user = {
+            id: null,
+            name: "qr-guest",
+            role: "qr-guest",
+            restaurant_id,
+            allowed_modules: ["qr_kitchen"],
+          };
+          req.allowed_modules = ["qr_kitchen"];
+          return next();
+        } catch (err) {
+          console.error("❌ QR guest order auth failed:", err.message);
+          return res.status(500).json({ error: "Internal server error" });
+        }
+      })();
+    }
+
+    // 4) Default: staff / backend tokens
+    return authMiddleware(req, res, async () => {
+      const allowed = await attachAllowedModules(req);
+      if (Array.isArray(allowed) && !allowed.includes("pos_core")) {
+        if (allowed.includes("qr_kitchen")) {
+          return next();
+        }
+        const isAllowed =
+          req.method === "GET" && /^\/reservations\/[^/]+$/.test(req.path || "");
+        if (!isAllowed) {
+          return res.status(403).json({ error: "MODULE_NOT_ALLOWED" });
+        }
+      }
+      return next();
+    });
   });
 
 
@@ -151,7 +822,8 @@ async function resolveRestaurantId(req) {
         "SELECT id FROM restaurants WHERE slug = $1 OR qr_code_id = $1 LIMIT 1",
         [identifier]
       );
-      restaurant_id = result.rows[0]?.id;
+      // If identifier doesn't match, don't clobber an already-authenticated restaurant_id.
+      restaurant_id = result.rows[0]?.id ?? restaurant_id;
     }
   }
 
@@ -165,6 +837,155 @@ async function requireRestaurantId(req, res) {
     return null;
   }
   return restaurantId;
+}
+
+const OPEN_ORDER_MODES = Object.freeze({
+  packet: ["packet", "phone"],
+  kitchen: ["table", "phone", "packet", "takeaway"],
+  both: ["table", "phone", "packet", "takeaway"],
+});
+
+let openOrderBatchIndexesEnsured = false;
+async function ensureOpenOrderBatchIndexes() {
+  if (openOrderBatchIndexesEnsured) return true;
+  try {
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_orders_restaurant_status_type
+         ON orders(restaurant_id, status, order_type)`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_order_items_order_id
+         ON order_items(order_id)`
+    );
+    openOrderBatchIndexesEnsured = true;
+    return true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure open-order batch indexes:", err?.message || err);
+    return false;
+  }
+}
+
+async function closeStaleReservations(restaurantId) {
+  if (!restaurantId) return [];
+  try {
+    const { rows } = await pool.query(
+      `
+        UPDATE orders o
+           SET status = 'closed',
+               total = 0,
+               updated_at = NOW()
+         WHERE o.restaurant_id = $1
+           AND o.reservation_date IS NOT NULL
+           AND o.reservation_date < CURRENT_DATE
+           AND COALESCE(o.total, 0) = 0
+           AND LOWER(COALESCE(o.status, '')) NOT IN ('closed', 'cancelled', 'canceled')
+           AND (
+             LOWER(COALESCE(o.status, '')) = 'reserved'
+             OR LOWER(COALESCE(o.order_type, '')) = 'reservation'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM order_items oi WHERE oi.order_id = o.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM sub_orders so WHERE so.order_id = o.id
+           )
+         RETURNING o.id, o.table_number, o.reservation_date
+      `,
+      [restaurantId]
+    );
+    return rows || [];
+  } catch (err) {
+    console.warn("⚠️ Failed to close stale reservations:", err?.message || err);
+    return [];
+  }
+}
+
+function parseGeoValue(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+async function getQrMenuCustomization(restaurantId) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT qr_menu_customization, value
+       FROM settings
+       WHERE restaurant_id = $1 AND key = 'qr-menu-customization'
+       LIMIT 1`,
+      [restaurantId]
+    );
+    if (!rows.length) return {};
+    const raw = rows[0].qr_menu_customization ?? rows[0].value ?? {};
+    if (typeof raw === "string") {
+      return JSON.parse(raw);
+    }
+    return raw && typeof raw === "object" ? raw : {};
+  } catch (err) {
+    console.warn("⚠️ Failed to load QR menu customization:", err?.message || err);
+    return {};
+  }
+}
+
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return 6371000 * c;
+}
+
+async function enforceTableGeo(req, res, restaurantId) {
+  const config = await getQrMenuCustomization(restaurantId);
+  if (!config?.table_geo_enabled) return true;
+
+  const radiusRaw = Number(config?.table_geo_radius_meters);
+  const radiusMeters = Number.isFinite(radiusRaw) && radiusRaw > 0 ? radiusRaw : 150;
+
+  const lat =
+    parseGeoValue(req.body?.table_geo_lat) ??
+    parseGeoValue(req.body?.geo_lat) ??
+    parseGeoValue(req.body?.lat);
+  const lng =
+    parseGeoValue(req.body?.table_geo_lng) ??
+    parseGeoValue(req.body?.geo_lng) ??
+    parseGeoValue(req.body?.lng);
+
+  if (lat === null || lng === null) {
+    res.status(403).json({
+      error: "Location required for table orders. Please rescan at the restaurant.",
+    });
+    return false;
+  }
+
+  const { rows } = await pool.query(
+    "SELECT pos_location_lat, pos_location_lng FROM restaurants WHERE id = $1 LIMIT 1",
+    [restaurantId]
+  );
+  const restaurantLat = parseGeoValue(rows[0]?.pos_location_lat);
+  const restaurantLng = parseGeoValue(rows[0]?.pos_location_lng);
+
+  if (restaurantLat === null || restaurantLng === null) {
+    res.status(400).json({
+      error: "Restaurant location is not configured for table orders.",
+    });
+    return false;
+  }
+
+  const distance = haversineMeters(lat, lng, restaurantLat, restaurantLng);
+  if (distance > radiusMeters) {
+    res.status(403).json({
+      error: `Table orders are only allowed within ${Math.round(radiusMeters)} meters of the restaurant.`,
+    });
+    return false;
+  }
+
+  return true;
 }
 
 // Track the last write/update time per order id to spot read-after-write timing
@@ -182,7 +1003,16 @@ function since(id) {
 }
 
 
-const { emitAlert, emitStockUpdate, emitOrderUpdate, emitOrderConfirmed, emitOrderDelivered, emitPaymentMade, emitOrderPreparing, emitDriverAssigned } = require('../utils/realtime');
+const {
+  emitOrderUpdate,
+  emitOrderConfirmed,
+  emitOrderDelivered,
+  emitOrderCancelled,
+  emitPaymentMade,
+  emitOrderPreparing,
+  emitDriverAssigned,
+  emitDriverOnRoad,
+} = require('../utils/realtime');
 
 let ordersHasCreatedByColumn = null;
 async function hasOrdersCreatedByColumn() {
@@ -227,6 +1057,242 @@ async function ensureTakeawayFields() {
   }
 }
 
+let ordersHasTrafficLoggedColumn = null;
+async function ensureOrdersTrafficLoggedColumn() {
+  if (ordersHasTrafficLoggedColumn === true) return true;
+  try {
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS traffic_logged_at TIMESTAMPTZ`
+    );
+    ordersHasTrafficLoggedColumn = true;
+    return true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure orders.traffic_logged_at column:", err.message);
+    ordersHasTrafficLoggedColumn = false;
+    return false;
+  }
+}
+
+let trafficTablesEnsured = false;
+async function ensureCustomerTrafficTables(client) {
+  if (trafficTablesEnsured) return true;
+  const runner = client || pool;
+  try {
+    await runner.query(`
+      CREATE TABLE IF NOT EXISTS customer_traffic_daily (
+        id SERIAL PRIMARY KEY,
+        restaurant_id INTEGER NOT NULL,
+        date DATE NOT NULL,
+        customer_count INTEGER NOT NULL DEFAULT 0,
+        source TEXT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(restaurant_id, date)
+      );
+    `);
+    await runner.query(`
+      CREATE TABLE IF NOT EXISTS customer_traffic_events (
+        id SERIAL PRIMARY KEY,
+        restaurant_id INTEGER NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        delta INTEGER NOT NULL,
+        table_id INTEGER NULL,
+        order_id INTEGER NULL,
+        source TEXT NULL,
+        meta JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await runner.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_traffic_events_order_unique
+        ON customer_traffic_events(restaurant_id, order_id)
+        WHERE order_id IS NOT NULL;
+    `);
+    trafficTablesEnsured = true;
+    return true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure customer traffic tables:", err.message);
+    return false;
+  }
+}
+
+const toLocalYmd = (value) => {
+  const m = value ? moment.tz(value, DEFAULT_TZ) : moment.tz(DEFAULT_TZ);
+  if (!m.isValid()) return moment.tz(DEFAULT_TZ).format("YYYY-MM-DD");
+  return m.format("YYYY-MM-DD");
+};
+
+async function fetchTableGuests(client, restaurantId, tableNumber) {
+  if (!Number.isFinite(Number(tableNumber))) return null;
+  try {
+    const { rows } = await client.query(
+      `SELECT guests FROM tables WHERE restaurant_id = $1 AND number = $2 LIMIT 1`,
+      [restaurantId, Number(tableNumber)]
+    );
+    const guests = Number(rows?.[0]?.guests);
+    if (!Number.isFinite(guests)) return null;
+    return guests;
+  } catch (err) {
+    console.warn("⚠️ fetchTableGuests failed:", err.message);
+    return null;
+  }
+}
+
+async function logCustomerTraffic(client, { restaurantId, orderId, tableNumber, delta, source, meta = null, forDate = null }) {
+  const safeDelta = Number(delta);
+  if (!Number.isFinite(safeDelta) || safeDelta <= 0) {
+    return { skipped: true, reason: "no_delta" };
+  }
+
+  await ensureOrdersTrafficLoggedColumn();
+  await ensureCustomerTrafficTables(client);
+
+  const ymd = toLocalYmd(forDate || undefined);
+
+  try {
+    await client.query(
+      `
+        INSERT INTO customer_traffic_events (restaurant_id, occurred_at, delta, table_id, order_id, source, meta)
+        VALUES ($1, NOW(), $2, $3, $4, $5, $6)
+        ON CONFLICT (restaurant_id, order_id)
+        WHERE order_id IS NOT NULL
+        DO NOTHING
+      `,
+      [restaurantId, safeDelta, tableNumber || null, orderId || null, source || null, meta]
+    );
+  } catch (err) {
+    console.warn("⚠️ Failed to insert customer traffic event:", err.message);
+  }
+
+  let customerCount = safeDelta;
+  try {
+    const { rows } = await client.query(
+      `
+        INSERT INTO customer_traffic_daily (restaurant_id, date, customer_count, source, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, NOW(), NOW())
+        ON CONFLICT (restaurant_id, date)
+        DO UPDATE SET
+          customer_count = customer_traffic_daily.customer_count + EXCLUDED.customer_count,
+          updated_at = NOW(),
+          source = COALESCE(EXCLUDED.source, customer_traffic_daily.source)
+        RETURNING customer_count
+      `,
+      [restaurantId, ymd, safeDelta, source || null]
+    );
+    customerCount = Number(rows?.[0]?.customer_count || safeDelta);
+  } catch (err) {
+    console.warn("⚠️ Failed to upsert customer_traffic_daily:", err.message);
+  }
+
+  try {
+    await client.query(
+      `UPDATE orders
+         SET traffic_logged_at = COALESCE(traffic_logged_at, NOW())
+       WHERE id = $1 AND restaurant_id = $2`,
+      [orderId, restaurantId]
+    );
+  } catch (err) {
+    console.warn("⚠️ Failed to stamp orders.traffic_logged_at:", err.message);
+  }
+
+  return { date: ymd, customer_count: customerCount };
+}
+
+let orderItemsHasStockDeductedColumn = null;
+async function ensureOrderItemsStockDeductedColumn() {
+  if (orderItemsHasStockDeductedColumn === true) return true;
+  try {
+    await pool.query(
+      `ALTER TABLE order_items
+         ADD COLUMN IF NOT EXISTS stock_deducted BOOLEAN DEFAULT FALSE`
+    );
+    orderItemsHasStockDeductedColumn = true;
+    return true;
+  } catch (err) {
+    console.warn(
+      "⚠️ Unable to ensure order_items.stock_deducted column:",
+      err.message
+    );
+    orderItemsHasStockDeductedColumn = false;
+    return false;
+  }
+}
+
+let ordersHasKitchenTimingFields = null;
+function parseExtrasField(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function computeExtrasTotalForItem(item) {
+  const extras = parseExtrasField(item.extras);
+  return extras.reduce((acc, extra) => {
+    const price = Number(extra?.price ?? extra?.extraPrice ?? 0) || 0;
+    const extraQty =
+      extra?.quantity ??
+      extra?.qty ??
+      extra?.count ??
+      extra?.amount ??
+      1;
+    const qty = Number(extraQty) || 1;
+    return acc + price * qty;
+  }, 0);
+}
+
+async function computeOrderTotalWithExtras(dbClient, orderId) {
+  if (!orderId) return 0;
+  const executor = dbClient && typeof dbClient.query === "function" ? dbClient : pool;
+  try {
+    const { rows } = await executor.query(
+      `SELECT price, quantity, extras
+         FROM order_items
+        WHERE order_id = $1`,
+      [orderId]
+    );
+    return rows.reduce((sum, item) => {
+      const quantity = Number(item.quantity) || 1;
+      const basePrice = Number.parseFloat(item.price) || 0;
+      const extrasTotal = computeExtrasTotalForItem(item);
+      return sum + (basePrice + extrasTotal) * quantity;
+    }, 0);
+  } catch (err) {
+    console.warn(`⚠️ Failed to compute extras for order ${orderId}:`, err?.message || err);
+    return 0;
+  }
+}
+async function ensureKitchenTimingFields() {
+  if (ordersHasKitchenTimingFields === true) return true;
+  try {
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS prep_started_at TIMESTAMP`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS estimated_ready_at TIMESTAMP`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS kitchen_delivered_at TIMESTAMP`
+    );
+    ordersHasKitchenTimingFields = true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure kitchen timing columns:", err.message);
+    ordersHasKitchenTimingFields = false;
+  }
+  return ordersHasKitchenTimingFields;
+}
+
 let ordersHasCancellationFields = null;
 async function ensureCancellationFields() {
   if (ordersHasCancellationFields === true) return true;
@@ -251,9 +1317,40 @@ async function ensureCancellationFields() {
 ensureCancellationFields();
 
 let orderItemsHasCancellationFields = null;
+let orderItemsCancellationColumns = null;
+
+async function getOrderItemsCancellationColumns() {
+  if (orderItemsCancellationColumns) return orderItemsCancellationColumns;
+  try {
+    const { rows } = await pool.query(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_name = 'order_items'`
+    );
+    const cols = new Set(rows.map((r) => String(r.column_name || "").toLowerCase()));
+    orderItemsCancellationColumns = {
+      hasCancelledAt: cols.has("cancelled_at"),
+      hasCancellationReason: cols.has("cancellation_reason"),
+    };
+    return orderItemsCancellationColumns;
+  } catch {
+    orderItemsCancellationColumns = {
+      hasCancelledAt: false,
+      hasCancellationReason: false,
+    };
+    return orderItemsCancellationColumns;
+  }
+}
+
 async function ensureOrderItemCancellationFields() {
   if (orderItemsHasCancellationFields !== null) return orderItemsHasCancellationFields;
   try {
+    const existing = await getOrderItemsCancellationColumns();
+    if (existing.hasCancelledAt && existing.hasCancellationReason) {
+      orderItemsHasCancellationFields = true;
+      return true;
+    }
+
     await pool.query(
       `ALTER TABLE order_items
          ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ`
@@ -262,6 +1359,7 @@ async function ensureOrderItemCancellationFields() {
       `ALTER TABLE order_items
          ADD COLUMN IF NOT EXISTS cancellation_reason TEXT`
     );
+    orderItemsCancellationColumns = { hasCancelledAt: true, hasCancellationReason: true };
     orderItemsHasCancellationFields = true;
     return true;
   } catch (err) {
@@ -280,7 +1378,22 @@ ensureOrderItemCancellationFields();
 // ---- Shared payload builder for printer (no order_number) ----
 async function buildFullOrderPayload(orderId, restaurantId) {
   const { rows: orderRows } = await pool.query(
-    `SELECT id, status, table_number, order_type, total, created_at
+    `SELECT
+       id,
+       status,
+       table_number,
+       order_type,
+       total,
+       created_at,
+       customer_name,
+       customer_phone,
+       customer_address,
+       payment_method,
+       takeaway_notes,
+       receipt_id,
+       external_id,
+       external_source,
+       external_expedition_type
      FROM orders WHERE restaurant_id = $1 AND id = $2`,
     [restaurantId, orderId]
   );
@@ -292,6 +1405,7 @@ async function buildFullOrderPayload(orderId, restaurantId) {
        oi.product_id,
        oi.unique_id,
        oi.name AS order_item_name,
+       oi.external_product_name,
        p.name  AS product_name,
        oi.quantity,
        oi.price,
@@ -308,7 +1422,7 @@ async function buildFullOrderPayload(orderId, restaurantId) {
 
   const items = itemRows.map(it => ({
     ...it,
-    name: it.order_item_name || it.product_name || "Item",
+    name: it.order_item_name || it.external_product_name || it.product_name || "Item",
     extras: typeof it.extras === "string"
       ? (() => { try { return JSON.parse(it.extras); } catch { return []; } })()
       : (it.extras || []),
@@ -325,6 +1439,15 @@ async function buildFullOrderPayload(orderId, restaurantId) {
       order_type: header.order_type,
       total: header.total,
       created_at: header.created_at,
+      customer_name: header.customer_name ?? null,
+      customer_phone: header.customer_phone ?? null,
+      customer_address: header.customer_address ?? null,
+      payment_method: header.payment_method ?? null,
+      takeaway_notes: header.takeaway_notes ?? null,
+      receipt_id: header.receipt_id ?? null,
+      external_id: header.external_id ?? null,
+      external_source: header.external_source ?? null,
+      external_expedition_type: header.external_expedition_type ?? null,
       items,
     },
   };
@@ -339,6 +1462,11 @@ router.get("/", async (req, res) => {
     const restaurantId = await requireRestaurantId(req, res);
     if (!restaurantId) return;
     const { status, table_number, type } = req.query;
+
+    // Fire-and-forget to avoid blocking order fetch on slow cleanup
+    closeStaleReservations(restaurantId).catch((err) =>
+      console.warn("⚠️ closeStaleReservations (non-blocking) failed:", err?.message || err)
+    );
 
     // 🔐 Special mode: always and only open phone/packet
     if (String(status).toLowerCase() === "open_phone") {
@@ -378,6 +1506,179 @@ router.get("/", async (req, res) => {
   } catch (err) {
     console.error("❌ Orders fetch failed:", err);
     res.status(500).json({ error: "Database error" });
+  }
+});
+
+// GET /orders/open/with-items
+// Batched open-order payload used by TableOverview kitchen/packet views.
+router.get("/open/with-items", async (req, res) => {
+  try {
+    await ensureOpenOrderBatchIndexes();
+
+    const modeRaw = String(req.query.mode || "both").trim().toLowerCase();
+    const mode = OPEN_ORDER_MODES[modeRaw] ? modeRaw : "both";
+    const allowedTypes = OPEN_ORDER_MODES[mode];
+
+    const restaurantIdFromQuery = Number.parseInt(
+      String(req.query.restaurant_id ?? req.query.restaurantId ?? ""),
+      10
+    );
+    if (!Number.isFinite(restaurantIdFromQuery)) {
+      return res.status(400).json({ error: "restaurant_id is required" });
+    }
+
+    const resolvedRestaurantId = await resolveRestaurantId(req);
+    const restaurantId = restaurantIdFromQuery;
+
+    if (
+      Number.isFinite(Number(resolvedRestaurantId)) &&
+      Number(resolvedRestaurantId) !== restaurantId
+    ) {
+      return res.status(403).json({ error: "Forbidden restaurant_id" });
+    }
+
+    if (
+      Number.isFinite(Number(req.user?.restaurant_id)) &&
+      Number(req.user.restaurant_id) !== restaurantId
+    ) {
+      return res.status(403).json({ error: "Forbidden restaurant_id" });
+    }
+
+    let sinceClause = "";
+    const params = [restaurantId, allowedTypes];
+    const sinceRaw = String(req.query.since || "").trim();
+    if (sinceRaw) {
+      const sinceDate = /^\d+$/.test(sinceRaw)
+        ? new Date(Number(sinceRaw))
+        : new Date(sinceRaw);
+      if (Number.isFinite(sinceDate.getTime())) {
+        params.push(sinceDate.toISOString());
+        sinceClause = `AND COALESCE(o.updated_at, o.created_at) >= $${params.length}`;
+      }
+    }
+
+    const cancellationColumns = await getOrderItemsCancellationColumns();
+    const itemCancelFilter = cancellationColumns.hasCancelledAt
+      ? "AND oi.cancelled_at IS NULL"
+      : "AND COALESCE(oi.kitchen_status, '') <> 'cancelled'";
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        o.*,
+        COALESCE(oi.items, '[]'::json) AS items,
+        COALESCE(rm.receipt_methods, '[]'::json) AS receipt_methods
+      FROM orders o
+      LEFT JOIN LATERAL (
+        SELECT json_agg(
+          json_build_object(
+            'id', oi.id,
+            'product_id', oi.product_id,
+            'external_product_id', oi.external_product_id,
+            'quantity', oi.quantity,
+            'qty', oi.quantity,
+            'price', oi.price,
+            'ingredients', oi.ingredients,
+            'extras', oi.extras,
+            'unique_id', oi.unique_id,
+            'paid_at', oi.paid_at,
+            'confirmed', oi.confirmed,
+            'payment_method', oi.payment_method,
+            'receipt_id', oi.receipt_id,
+            'note', oi.note,
+            'notes', oi.note,
+            'kitchen_status', oi.kitchen_status,
+            'discount_type', oi.discount_type,
+            'discount_value', oi.discount_value,
+            'name', COALESCE(oi.name, oi.external_product_name, p.name),
+            'order_item_name', oi.name,
+            'external_product_name', oi.external_product_name,
+            'product_name', p.name,
+            'category', p.category
+          )
+          ORDER BY oi.id ASC
+        ) AS items
+        FROM order_items oi
+        LEFT JOIN products p ON p.id = oi.product_id
+        WHERE oi.order_id = o.id
+          ${itemCancelFilter}
+      ) oi ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT json_agg(
+          json_build_object(
+            'payment_method', rm.payment_method,
+            'amount', rm.amount
+          )
+          ORDER BY rm.id ASC
+        ) AS receipt_methods
+        FROM receipt_methods rm
+        WHERE rm.receipt_id = o.receipt_id
+      ) rm ON TRUE
+      WHERE o.restaurant_id = $1
+        AND LOWER(COALESCE(o.status, '')) NOT IN ('closed', 'cancelled', 'canceled')
+        AND LOWER(COALESCE(o.order_type, '')) = ANY($2::text[])
+        ${sinceClause}
+      ORDER BY o.id DESC
+      `,
+      params
+    );
+
+    res.json({ orders: rows });
+  } catch (err) {
+    console.error("❌ Error fetching open orders with items:", err);
+    res.status(500).json({ error: "Failed to fetch open orders with items" });
+  }
+});
+
+// GET /orders/receipt-methods/bulk?ids=1,2,3
+router.get("/receipt-methods/bulk", async (req, res) => {
+  try {
+    const restaurantId = await requireRestaurantId(req, res);
+    if (!restaurantId) return;
+
+    const ids = String(req.query.ids || "")
+      .split(",")
+      .map((value) => Number.parseInt(String(value || "").trim(), 10))
+      .filter((value) => Number.isFinite(value));
+
+    const uniqueIds = Array.from(new Set(ids));
+    if (uniqueIds.length === 0) return res.json({});
+
+    const cappedIds = uniqueIds.slice(0, 1000);
+    const { rows } = await pool.query(
+      `
+      SELECT
+        o.id AS order_id,
+        rm.payment_method,
+        rm.amount
+      FROM orders o
+      LEFT JOIN receipt_methods rm ON rm.receipt_id = o.receipt_id
+      WHERE o.restaurant_id = $1
+        AND o.id = ANY($2::int[])
+      ORDER BY o.id ASC, rm.id ASC
+      `,
+      [restaurantId, cappedIds]
+    );
+
+    const byOrderId = {};
+    cappedIds.forEach((id) => {
+      byOrderId[String(id)] = [];
+    });
+
+    rows.forEach((row) => {
+      const key = String(row.order_id);
+      if (!Array.isArray(byOrderId[key])) byOrderId[key] = [];
+      if (!row.payment_method && row.amount == null) return;
+      byOrderId[key].push({
+        payment_method: row.payment_method,
+        amount: row.amount,
+      });
+    });
+
+    res.json(byOrderId);
+  } catch (err) {
+    console.error("❌ Error fetching bulk receipt methods:", err);
+    res.status(500).json({ error: "Failed to fetch bulk receipt methods" });
   }
 });
 
@@ -441,6 +1742,8 @@ router.post("/", async (req, res) => {
           .json({ error: "QR token does not match requested table" });
       }
       effectiveTableNumber = tokenTable;
+      const allowed = await enforceTableGeo(req, res, restaurantId);
+      if (!allowed) return;
     }
 
     // Normalize pickup_time to a full timestamp string if only HH:MM is provided
@@ -817,7 +2120,7 @@ if (customer_phone && customer_address) {
 
     if (hasItems) {
       await saveOrderItems(order.id, items);
-      await updateStockForOrder(items, restaurantId);
+      await updateStockForOrder(items, restaurantId, io);
       dlog("POST /orders saved items", { id: order.id, count: items.length });
     }
 
@@ -929,7 +2232,8 @@ router.put("/:id/pay", async (req, res) => {
          is_paid,
          customer_name,
          customer_phone,
-         COALESCE(debt_recorded_total, 0) AS debt_recorded_total
+         COALESCE(debt_recorded_total, 0) AS debt_recorded_total,
+         table_number
        FROM orders
       WHERE restaurant_id = $1 AND id = $2
       FOR UPDATE`,
@@ -1029,12 +2333,19 @@ router.put("/:id/pay", async (req, res) => {
 
     console.log("🔍 Kitchen status after PAY:", kitchenCheck.rows);
 
+    const orderTotalWithExtras = await computeOrderTotalWithExtras(client, orderId);
     await client.query("COMMIT");
 
     if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
     else io.to(`restaurant_${restaurantId}`).emit("orders_updated");
 
-    emitPaymentMade(io, restaurantId, orderId, payment_method, total);
+    emitPaymentMade(io, restaurantId, orderId, {
+      payment_method,
+      total: finalOrderTotal,
+      amount: amountPaid,
+      table_number: existingOrder.table_number ?? null,
+      order_total_with_extras: orderTotalWithExtras,
+    });
 
     console.log(`💸 [orders] payment_made emitted for restaurant_${restaurantId}, order ${orderId}`);
 
@@ -1058,10 +2369,19 @@ router.put("/:id/status", async (req, res) => {
   const { status, total, payment_method, payment_status } = req.body; // ✅ added payment_status
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
+
+  // Safety check: ensure id is a valid integer
+  const parsedId = Number(id);
+  if (!Number.isFinite(parsedId) || parsedId <= 0) {
+    return res.status(400).json({ error: "Invalid order ID" });
+  }
+
   const client = await pool.connect();
 
   try {
     await ensureOrderDebtTracking();
+    await ensureKitchenTimingFields();
+    await ensureOrdersTrafficLoggedColumn();
     await client.query("BEGIN");
 
     const { rows: existingRows } = await client.query(
@@ -1070,12 +2390,13 @@ router.put("/:id/status", async (req, res) => {
          is_paid,
          customer_phone,
          table_number,
+         traffic_logged_at,
          payment_method AS current_payment_method,
          COALESCE(debt_recorded_total, 0) AS debt_recorded_total
        FROM orders
       WHERE id = $1 AND restaurant_id = $2
       FOR UPDATE`,
-      [id, restaurantId]
+      [parsedId, restaurantId]
     );
     if (!existingRows.length) {
       await client.query("ROLLBACK");
@@ -1099,6 +2420,32 @@ router.put("/:id/status", async (req, res) => {
       }
     }
 
+    const normalizedStatus =
+      typeof status === "string" && status.trim() !== "" ? status.trim().toLowerCase() : null;
+    const normalizedPaymentStatus =
+      typeof payment_status === "string" && payment_status.trim() !== ""
+        ? payment_status.trim().toLowerCase()
+        : null;
+    const paidRequested = normalizedStatus === "paid" || normalizedPaymentStatus === "paid";
+    const closedRequested = normalizedStatus === "closed";
+
+    // Always persist the full order total when completing payment/closing.
+    // This prevents partial-payment flows from overwriting `orders.total` and breaking reports.
+    let computedTotal = null;
+    if (paidRequested || closedRequested) {
+      const { rows: totalRows } = await client.query(
+        `
+          SELECT COALESCE(SUM(COALESCE(price, 0) * COALESCE(quantity, 1)), 0) AS total
+          FROM order_items
+          WHERE order_id = $1
+        `,
+        [parsedId]
+      );
+      computedTotal = Number(totalRows?.[0]?.total || 0);
+    }
+
+    const nextTotal = paidRequested || closedRequested ? computedTotal : total;
+
     const result = await client.query(
       `UPDATE orders
        SET
@@ -1106,6 +2453,11 @@ router.put("/:id/status", async (req, res) => {
          total = COALESCE($2, total),
          payment_method = COALESCE($3, payment_method),
          payment_status = COALESCE($4, payment_status),       -- ✅ added this
+         kitchen_delivered_at = CASE
+           WHEN ($1 = 'paid' OR $4 = 'paid' OR $1 = 'closed')
+             THEN COALESCE(kitchen_delivered_at, NOW())
+           ELSE kitchen_delivered_at
+         END,
          is_paid = CASE
                      WHEN $1 = 'paid' OR $4 = 'paid' THEN true  -- ✅ support both status or payment_status
                      WHEN $1 IN ('confirmed') THEN false
@@ -1113,7 +2465,14 @@ router.put("/:id/status", async (req, res) => {
                    END
        WHERE id = $5 AND restaurant_id = $6
        RETURNING *`,
-      [status, total, payment_method, payment_status, id, restaurantId]
+      [
+        normalizedStatus,
+        nextTotal,
+        payment_method,
+        normalizedPaymentStatus,
+        parsedId,
+        restaurantId,
+      ]
     );
 
     if (result.rowCount === 0) {
@@ -1123,6 +2482,25 @@ router.put("/:id/status", async (req, res) => {
 
     const updatedOrder = result.rows[0];
     const becamePaid = updatedOrder.is_paid && !existingOrder.is_paid;
+    const shouldLogTraffic =
+      !existingOrder.traffic_logged_at &&
+      (normalizedStatus === "confirmed" ||
+        normalizedStatus === "paid" ||
+        normalizedStatus === "closed");
+
+    if (shouldLogTraffic && Number.isFinite(Number(existingOrder.table_number))) {
+      const guests = await fetchTableGuests(client, restaurantId, existingOrder.table_number);
+      if (Number.isFinite(guests) && guests > 0) {
+        await logCustomerTraffic(client, {
+          restaurantId,
+          orderId: parsedId,
+          tableNumber: existingOrder.table_number,
+          delta: guests,
+          source: "order_status_confirmed",
+          meta: { status: normalizedStatus || null },
+        });
+      }
+    }
 
     // ✅ If payment_method changed, insert a record tracking the change
     if (payment_method && payment_method !== existingOrder.current_payment_method) {
@@ -1132,7 +2510,7 @@ router.put("/:id/status", async (req, res) => {
           `INSERT INTO payments (order_id, payment_method, previous_payment_method, amount, created_at)
            VALUES ($1, $2, $3, $4, NOW())
            ON CONFLICT DO NOTHING`,
-          [id, payment_method, existingOrder.current_payment_method, 0]
+          [parsedId, payment_method, existingOrder.current_payment_method, 0]
         );
       } catch (paymentErr) {
         console.warn("⚠️  Could not insert payment change record:", paymentErr.message);
@@ -1148,7 +2526,7 @@ router.put("/:id/status", async (req, res) => {
              SET paid_at = NOW(),
                  confirmed = TRUE
            WHERE order_id = $1 AND paid_at IS NULL`,
-          [id]
+          [parsedId]
         );
       } catch (markErr) {
         console.warn("⚠️ Failed to mark order_items paid in /orders/:id/status:", markErr);
@@ -1156,7 +2534,11 @@ router.put("/:id/status", async (req, res) => {
 
       const recorded = toMoney(existingOrder.debt_recorded_total);
       const amountReference = toMoney(
-        total !== undefined && total !== null ? total : existingOrder.total
+        paidRequested || closedRequested
+          ? computedTotal
+          : total !== undefined && total !== null
+            ? total
+            : existingOrder.total
       );
       let reduction =
         recorded > 0
@@ -1175,7 +2557,7 @@ router.put("/:id/status", async (req, res) => {
           `UPDATE orders
               SET debt_recorded_total = $1
             WHERE id = $2 AND restaurant_id = $3`,
-          [nextRecorded, id, restaurantId]
+          [nextRecorded, parsedId, restaurantId]
         );
       }
 
@@ -1193,7 +2575,7 @@ router.put("/:id/status", async (req, res) => {
           `UPDATE orders
               SET debt_paid_at = NOW()
             WHERE id = $1 AND restaurant_id = $2`,
-          [id, restaurantId]
+          [parsedId, restaurantId]
         );
       }
     }
@@ -1236,8 +2618,10 @@ router.post("/:id/print", async (req, res) => {
         o.payment_method,
         o.created_at,
         o.customer_name,
-        o.customer_phone
-       FROM orders o
+        o.customer_phone,
+        o.customer_address,
+        o.takeaway_notes
+      FROM orders o
        WHERE o.id = $1 AND o.restaurant_id = $2`,
       [id, restaurantId]
     );
@@ -1258,6 +2642,8 @@ router.post("/:id/print", async (req, res) => {
         oi.price,
         oi.price * oi.quantity as line_total,
         p.name as product_name,
+        oi.name as item_name,
+        oi.external_product_name,
         oi.extras,
         oi.note
        FROM order_items oi
@@ -1281,7 +2667,11 @@ router.post("/:id/print", async (req, res) => {
       return {
         id: item.id,
         product_id: item.product_id,
-        name: item.product_name || "Unknown Item",
+        name:
+          item.item_name ||
+          item.external_product_name ||
+          item.product_name ||
+          "Unknown Item",
         quantity: item.quantity,
         unit_price: item.price,
         price: item.price,
@@ -1308,6 +2698,8 @@ router.post("/:id/print", async (req, res) => {
       created_at: order.created_at,
       customer_name: order.customer_name,
       customer_phone: order.customer_phone,
+      customer_address: order.customer_address,
+      takeaway_notes: order.takeaway_notes,
       items: items,
       timestamp: new Date().toISOString(),
     };
@@ -1453,7 +2845,7 @@ router.post("/order-items", async (req, res) => {
   if (req.qrTable) {
     try {
       const { rows } = await pool.query(
-        `SELECT table_number
+        `SELECT table_number, order_type
          FROM orders
          WHERE id = $1 AND restaurant_id = $2`,
         [order_id, restaurantId]
@@ -1461,6 +2853,7 @@ router.post("/order-items", async (req, res) => {
       const dbTable = rows.length
         ? Number(rows[0].table_number || 0)
         : null;
+      const orderType = rows.length ? String(rows[0].order_type || "") : "";
       const tokenTable = Number(req.qrTable.table_number);
       if (!rows.length || !Number.isFinite(dbTable)) {
         return res.status(404).json({ error: "Order not found" });
@@ -1469,6 +2862,10 @@ router.post("/order-items", async (req, res) => {
         return res
           .status(403)
           .json({ error: "QR token does not match this table" });
+      }
+      if (orderType.toLowerCase() === "table") {
+        const allowed = await enforceTableGeo(req, res, restaurantId);
+        if (!allowed) return;
       }
     } catch (err) {
       console.error(
@@ -1492,33 +2889,57 @@ router.post("/order-items", async (req, res) => {
 
   try {
     await saveOrderItems(order_id, preparedItems);
-    await updateStockForOrder(preparedItems, restaurantId);
+    await updateStockForOrder(preparedItems, restaurantId, io);
+    // Ensure `orders.total` stays in sync (reports rely on it).
+    // Many flows create orders with total=0 and only add items later.
+    await pool.query(
+      `
+        UPDATE orders
+           SET total = (
+             SELECT COALESCE(SUM(COALESCE(price, 0) * COALESCE(quantity, 1)), 0)
+             FROM order_items
+             WHERE order_id = $2
+           )
+         WHERE restaurant_id = $1 AND id = $2
+      `,
+      [restaurantId, order_id]
+    );
      // --- ADD THIS BLOCK:
-const orderRes = await pool.query(
-  "SELECT status FROM orders WHERE restaurant_id = $1 AND id = $2",
-  [restaurantId, order_id]
-);
-const currentStatus = String(orderRes.rows[0]?.status || '').toLowerCase();
-if (["closed", "pending", "open"].includes(currentStatus)) {
-  await pool.query(
-    "UPDATE orders SET status = 'confirmed' WHERE restaurant_id = $1 AND id = $2",
-    [restaurantId, order_id]
-  );
-}
+    const orderRes = await pool.query(
+      "SELECT status, is_paid FROM orders WHERE restaurant_id = $1 AND id = $2",
+      [restaurantId, order_id]
+    );
+    const currentStatus = String(orderRes.rows[0]?.status || "").toLowerCase();
+    const hasNewUnpaidItems = preparedItems.some(
+      (it) => !(it && it.paid_at) && !(it && it.receipt_id)
+    );
 
-// --- Ensure all items and stock updates are fully written before any emit ---
-await new Promise(resolve => setTimeout(resolve, 250)); // short wait ensures DB visibility
+    // If adding new unpaid items to an order that was fully paid before, reopen it.
+    // This happens when a QR pre-order customer taps "order another" and appends items.
+    if (currentStatus === "paid" && hasNewUnpaidItems) {
+      await pool.query(
+        "UPDATE orders SET status = 'confirmed', is_paid = false WHERE restaurant_id = $1 AND id = $2",
+        [restaurantId, order_id]
+      );
+    } else if (["closed", "pending", "open"].includes(currentStatus)) {
+      await pool.query(
+        "UPDATE orders SET status = 'confirmed' WHERE restaurant_id = $1 AND id = $2",
+        [restaurantId, order_id]
+      );
+    }
 
-// ✅ Build payload after all commits — full and fresh
+// ✅ Emit update immediately after writes complete for faster UI status/color refresh.
+io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+
+// ✅ Build payload after writes — full and fresh
 try {
   const payload = await buildFullOrderPayload(order_id, restaurantId);
 
-  // emit both updates and confirmation together
+  // Emit detailed payload (table/order metadata) for instant local patching on clients.
   io.to(`restaurant_${restaurantId}`).emit("order_confirmed", payload);
-  io.to(`restaurant_${restaurantId}`).emit("orders_updated");
 
   console.log(
-    `🖨️ [orders] order_confirmed+updated emitted after saveOrderItems for restaurant_${restaurantId}, order ${order_id}`
+    `🖨️ [orders] order_confirmed emitted after saveOrderItems for restaurant_${restaurantId}, order ${order_id}`
   );
 } catch (e) {
   console.error("❌ Failed to emit order_confirmed after /order-items:", e);
@@ -1624,8 +3045,7 @@ async function saveOrderItems(orderId, items) {
     );
   }
 
-  // ✅ Force DB commit visibility delay
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  // No artificial delay: caller emits updates immediately after writes complete.
 }
 
 
@@ -1740,10 +3160,11 @@ const result = await pool.query(
       old_method !== undefined &&
       _payment_method !== old_method
     ) {
+      await ensurePaymentMethodChangesTracking();
       await pool.query(
-        `INSERT INTO payment_method_changes (order_id, old_method, new_method, changed_by)
-         VALUES ($1, $2, $3, $4)`,
-        [id, old_method, _payment_method, changed_by || "system"]
+        `INSERT INTO payment_method_changes (order_id, old_method, new_method, changed_by, changed_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [id, old_method, _payment_method, changed_by || req.user?.username || "system"]
       );
     }
 
@@ -1758,12 +3179,11 @@ const result = await pool.query(
       let driverName = null;
       try {
         const driverRes = await pool.query(
-          "SELECT name, full_name, fullName FROM staff WHERE id = $1",
+          "SELECT name FROM staff WHERE id = $1",
           [updatedOrder.driver_id]
         );
         const row = driverRes.rows[0];
-        driverName =
-          row?.name || row?.full_name || row?.fullname || row?.fullName || null;
+        driverName = row?.name || null;
       } catch (err) {
         console.warn("⚠️ Failed to fetch driver name for notification:", err);
       }
@@ -1795,6 +3215,7 @@ router.post("/:id/close", async (req, res) => {
   const client = await pool.connect();
   try {
     await ensureOrderDebtTracking();
+    await ensureKitchenTimingFields();
     await client.query("BEGIN");
 
     const { rows } = await client.query(
@@ -1807,6 +3228,8 @@ router.post("/:id/close", async (req, res) => {
          customer_name,
          customer_phone,
          kitchen_delivered_at,
+         external_source,
+         payment_method,
          COALESCE(debt_recorded_total, 0) AS debt_recorded_total
        FROM orders
       WHERE restaurant_id = $1 AND id = $2
@@ -1832,12 +3255,68 @@ router.post("/:id/close", async (req, res) => {
     
     if (!kitchenDelivered) {
       try {
-        const itemsRes = await client.query(
-          `SELECT id, kitchen_status FROM order_items WHERE order_id = $1 AND restaurant_id = $2`,
-          [id, restaurantId]
+        const safeParseArray = (value) => {
+          if (!value) return [];
+          if (Array.isArray(value)) return value;
+          if (typeof value === "string") {
+            try {
+              const parsed = JSON.parse(value);
+              return Array.isArray(parsed) ? parsed : [];
+            } catch {
+              return [];
+            }
+          }
+          return [];
+        };
+
+        const { rows: settingsRows } = await client.query(
+          `SELECT excluded_categories, excluded_items
+             FROM kitchen_compile_settings
+            WHERE restaurant_id = $1
+            ORDER BY id
+            LIMIT 1`,
+          [restaurantId]
         );
-        const items = itemsRes.rows || [];
-        console.log(`🍽️ [Order ${id}] Found ${items.length} items:`, items.map(it => ({ id: it.id, kitchen_status: it.kitchen_status })));
+
+        const excludedCategoriesRaw = safeParseArray(settingsRows[0]?.excluded_categories);
+        const excludedItemsRaw = safeParseArray(settingsRows[0]?.excluded_items);
+        const excludedCategories = new Set(
+          excludedCategoriesRaw.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
+        );
+        const excludedItems = new Set(
+          excludedItemsRaw
+            .map((value) => {
+              if (value === null || value === undefined || value === "") return null;
+              const num = Number(value);
+              if (Number.isFinite(num)) return String(num);
+              return String(value).trim();
+            })
+            .filter(Boolean)
+        );
+
+        const itemsRes = await client.query(
+          `SELECT
+             oi.id,
+             oi.kitchen_status,
+             oi.product_id,
+             p.category AS product_category
+           FROM order_items oi
+           JOIN orders o ON o.id = oi.order_id
+           LEFT JOIN products p ON p.id = oi.product_id
+           WHERE o.restaurant_id = $1 AND oi.order_id = $2`,
+          [restaurantId, id]
+        );
+        const items = (itemsRes.rows || []).filter((row) => {
+          const category = String(row.product_category || "").trim().toLowerCase();
+          const productId = row.product_id === null || row.product_id === undefined ? "" : String(row.product_id).trim();
+          if (category && excludedCategories.has(category)) return false;
+          if (productId && excludedItems.has(productId)) return false;
+          return true;
+        });
+        console.log(
+          `🍽️ [Order ${id}] Found ${items.length} relevant items:`,
+          items.map((it) => ({ id: it.id, kitchen_status: it.kitchen_status }))
+        );
         
         // If there are NO items, allow close (empty order or items not tracked)
         if (items.length === 0) {
@@ -1846,7 +3325,7 @@ router.post("/:id/close", async (req, res) => {
         } else if (items.length > 0) {
           const allReady = items.every((it) => {
             const s = (it.kitchen_status || "").toString().toLowerCase();
-            const ready = s === "delivered" || s === "ready";
+            const ready = s === "delivered" || s === "ready" || s === "packet_delivered";
             console.log(`   - Item ${it.id}: status="${it.kitchen_status}" → normalized="${s}" → ready=${ready}`);
             return ready;
           });
@@ -1866,12 +3345,24 @@ router.post("/:id/close", async (req, res) => {
     }
     console.log(`✅ [Order ${id}] Kitchen delivered. Proceeding with close.`);
 
-    const totalNow = toMoney(existing.total);
+    // Keep totals consistent for reports even when some items never hit the kitchen UI.
+    const { rows: totalRows } = await client.query(
+      `
+        SELECT COALESCE(SUM(COALESCE(price, 0) * COALESCE(quantity, 1)), 0) AS total
+        FROM order_items
+        WHERE order_id = $1
+      `,
+      [id]
+    );
+    const totalNow = toMoney(totalRows?.[0]?.total || 0);
     const recorded = toMoney(existing.debt_recorded_total);
     const delta = existing.is_paid ? 0 : toMoney(totalNow - recorded);
     const needsDebtAdjustment = delta !== 0 && !existing.is_paid;
+    
+    // External orders (migros/yemeksepeti/etc) are prepaid, skip phone validation
+    const isExternalOrder = Boolean(existing.external_source);
 
-    if (needsDebtAdjustment) {
+    if (needsDebtAdjustment && !isExternalOrder) {
       const phoneOk = (existing.customer_phone || "").trim();
       if (!phoneOk) {
         await client.query("ROLLBACK");
@@ -1893,10 +3384,12 @@ router.post("/:id/close", async (req, res) => {
     const updated = await client.query(
       `UPDATE orders
           SET status = 'closed',
-              debt_recorded_total = $3
+              total = $3,
+              kitchen_delivered_at = COALESCE(kitchen_delivered_at, NOW()),
+              debt_recorded_total = $4
         WHERE restaurant_id = $1 AND id = $2
         RETURNING *`,
-      [restaurantId, id, existing.is_paid ? recorded : totalNow]
+      [restaurantId, id, totalNow, existing.is_paid ? recorded : totalNow]
     );
 
     const order = updated.rows[0];
@@ -1950,24 +3443,43 @@ router.patch("/:id/cancel", async (req, res) => {
 
   const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
   const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
-  const partialItems = Array.from(
-    new Set(
-      rawItems
-        .map((entry) => {
-          if (entry === null || entry === undefined) return "";
-          return typeof entry === "string" ? entry.trim() : String(entry).trim();
-        })
-        .filter(Boolean)
-    )
-  );
+  const requestedItemsMap = new Map(); // unique_id -> requestedQty (null => full row)
 
-  if (partialItems.length > 0) {
-    const hasFields = await ensureOrderItemCancellationFields();
-    if (!hasFields) {
-      return res.status(500).json({
-        error: "Unable to prepare order item cancellation; contact your administrator.",
-      });
+  for (const entry of rawItems) {
+    if (!entry) continue;
+    if (typeof entry === "string") {
+      const key = entry.trim();
+      if (!key) continue;
+      if (!requestedItemsMap.has(key)) requestedItemsMap.set(key, null);
+      continue;
     }
+    if (typeof entry === "object") {
+      const uniqueId = String(entry.unique_id || entry.uniqueId || "").trim();
+      if (!uniqueId) continue;
+      const qtyRaw = entry.quantity ?? entry.qty ?? null;
+      const qty = qtyRaw === null || qtyRaw === undefined ? null : Number(qtyRaw);
+      const normalizedQty = Number.isFinite(qty) ? Math.max(1, Math.floor(qty)) : null;
+
+      const prev = requestedItemsMap.get(uniqueId);
+      if (prev === null) continue; // already requested "full row"
+      if (normalizedQty === null) {
+        requestedItemsMap.set(uniqueId, null);
+      } else {
+        requestedItemsMap.set(uniqueId, (prev || 0) + normalizedQty);
+      }
+    }
+  }
+
+  const requestedItems = Array.from(requestedItemsMap.entries()).map(([unique_id, quantity]) => ({
+    unique_id,
+    quantity, // null => full row
+  }));
+
+  if (requestedItems.length > 0) {
+    const cancellationColumns = await getOrderItemsCancellationColumns();
+    const cancelPredicate = cancellationColumns.hasCancelledAt
+      ? "cancelled_at IS NULL"
+      : "COALESCE(kitchen_status, '') <> 'cancelled'";
 
     let client;
     try {
@@ -1992,14 +3504,34 @@ router.patch("/:id/cancel", async (req, res) => {
         return res.status(400).json({ error: "Order already cancelled" });
       }
 
+      const requestedUniqueIds = requestedItems.map((i) => i.unique_id);
       const { rows: itemsRows } = await client.query(
-        `SELECT id, unique_id, price, quantity
+        `SELECT
+           id,
+           unique_id,
+           order_id,
+           product_id,
+           quantity,
+           price,
+           ingredients,
+           extras,
+           confirmed,
+           payment_method,
+           receipt_id,
+           note,
+           discount_type,
+           discount_value,
+           external_product_id,
+           external_product_name,
+           name,
+           kitchen_status,
+           paid_at
          FROM order_items
          WHERE order_id = $1
            AND unique_id = ANY($2::text[])
-           AND cancelled_at IS NULL
+           AND ${cancelPredicate}
          FOR UPDATE`,
-        [orderId, partialItems]
+        [orderId, requestedUniqueIds]
       );
 
       if (!itemsRows.length) {
@@ -2007,25 +3539,139 @@ router.patch("/:id/cancel", async (req, res) => {
         return res.status(404).json({ error: "No matching items found" });
       }
 
-      const itemIds = itemsRows.map((item) => item.id);
-      const totalReduction = itemsRows.reduce((sum, item) => {
-        const price = toMoney(parseFloat(item.price) || 0);
-        const qty = Number(item.quantity) || 0;
-        return sum + price * qty;
-      }, 0);
+      const requestedQtyByUniqueId = new Map(requestedItems.map((it) => [it.unique_id, it.quantity]));
+
+      let totalReduction = 0;
+      const cancelledItemIds = [];
+
+      for (const row of itemsRows) {
+        const rowQty = Number(row.quantity) || 0;
+        if (rowQty <= 0) continue;
+
+        const requestedQty = requestedQtyByUniqueId.get(row.unique_id);
+        const cancelQty = requestedQty === null || requestedQty === undefined
+          ? rowQty
+          : Math.min(rowQty, Math.max(1, Number(requestedQty) || 1));
+
+        totalReduction += toMoney(parseFloat(row.price) || 0) * cancelQty;
+
+        if (cancelQty >= rowQty) {
+          cancelledItemIds.push(row.id);
+          continue;
+        }
+
+        // Partial cancel: split the line item.
+        const remainingQty = rowQty - cancelQty;
+        await client.query(
+          `UPDATE order_items
+              SET quantity = $1
+            WHERE id = $2`,
+          [remainingQty, row.id]
+        );
+
+        const newUniqueId = uuidv4();
+        const cancelledAt = cancellationColumns.hasCancelledAt ? "NOW()" : "NULL";
+        const cancellationReasonValue = cancellationColumns.hasCancellationReason ? "NULLIF($18, '')" : "NULL";
+
+        const insertCols = [
+          "order_id",
+          "product_id",
+          "quantity",
+          "price",
+          "ingredients",
+          "extras",
+          "unique_id",
+          "confirmed",
+          "kitchen_status",
+          "payment_method",
+          "receipt_id",
+          "note",
+          "discount_type",
+          "discount_value",
+          "external_product_id",
+          "external_product_name",
+          "name",
+          "paid_at",
+        ];
+
+        if (cancellationColumns.hasCancelledAt) insertCols.push("cancelled_at");
+        if (cancellationColumns.hasCancellationReason) insertCols.push("cancellation_reason");
+
+        const baseValuesSql = [
+          "$1", "$2", "$3", "$4",
+          "$5::jsonb", "$6::jsonb", "$7",
+          "$8", "$9", "$10", "$11", "$12",
+          "$13", "$14", "$15", "$16", "$17", "$18",
+        ];
+
+        const insertValuesSql = [...baseValuesSql];
+        const params = [
+          row.order_id,
+          row.product_id,
+          cancelQty,
+          parseFloat(row.price) || 0,
+          typeof row.ingredients === "string"
+            ? row.ingredients
+            : JSON.stringify(row.ingredients || []),
+          typeof row.extras === "string" ? row.extras : JSON.stringify(row.extras || []),
+          newUniqueId,
+          row.confirmed ?? true,
+          "cancelled",
+          row.payment_method || null,
+          row.receipt_id || null,
+          row.note || null,
+          row.discount_type || null,
+          row.discount_value || 0,
+          row.external_product_id || null,
+          row.external_product_name || null,
+          row.name || null,
+          row.paid_at || null,
+        ];
+
+        if (cancellationColumns.hasCancelledAt) insertValuesSql.push(cancelledAt);
+        if (cancellationColumns.hasCancellationReason) {
+          insertValuesSql.push("NULLIF($19, '')");
+          params.push(reason);
+        }
+
+        const { rows: inserted } = await client.query(
+          `INSERT INTO order_items (${insertCols.join(", ")})
+           VALUES (${insertValuesSql.join(", ")})
+           RETURNING id`,
+          params
+        );
+        const insertedId = inserted?.[0]?.id;
+        if (insertedId) cancelledItemIds.push(insertedId);
+      }
+
       const updatedTotal = Math.max(
         0,
         toMoney(orderRows[0].total || 0) - toMoney(totalReduction)
       );
 
-      await client.query(
-        `UPDATE order_items
-           SET cancelled_at = NOW(),
-               cancellation_reason = NULLIF($1, ''),
-               kitchen_status = 'cancelled'
-         WHERE id = ANY($2::int[])`,
-        [reason, itemIds]
-      );
+      if (cancelledItemIds.length > 0) {
+        const updateColumns = ["kitchen_status = 'cancelled'"];
+        const updateParams = [];
+        let paramIdx = 1;
+
+        if (cancellationColumns.hasCancelledAt) {
+          updateColumns.push("cancelled_at = NOW()");
+        }
+        if (cancellationColumns.hasCancellationReason) {
+          updateColumns.push(`cancellation_reason = NULLIF($${paramIdx++}, '')`);
+          updateParams.push(reason);
+        }
+
+        const itemIdsParam = `$${paramIdx++}`;
+        updateParams.push(cancelledItemIds);
+
+        await client.query(
+          `UPDATE order_items
+             SET ${updateColumns.join(", ")}
+           WHERE id = ANY(${itemIdsParam}::int[])`,
+          updateParams
+        );
+      }
 
       await client.query(
         `UPDATE orders
@@ -2038,11 +3684,18 @@ router.patch("/:id/cancel", async (req, res) => {
         `SELECT COUNT(*)::int AS count
          FROM order_items
          WHERE order_id = $1
-           AND cancelled_at IS NULL`,
+           AND ${cancellationColumns.hasCancelledAt ? "cancelled_at IS NULL" : "COALESCE(kitchen_status, '') <> 'cancelled'"}`,
         [orderId]
       );
       const remainingCount = Number(remainingRows[0]?.count ?? 0);
       let orderNowCancelled = false;
+      let orderTableNumber = null;
+
+      const { rows: tableRows } = await client.query(
+        "SELECT table_number FROM orders WHERE restaurant_id = $1 AND id = $2",
+        [restaurantId, orderId]
+      );
+      orderTableNumber = tableRows?.[0]?.table_number ?? null;
 
       if (remainingCount === 0) {
         await client.query(
@@ -2061,16 +3714,25 @@ router.patch("/:id/cancel", async (req, res) => {
       const ioRef = req.app.get("io");
       ioRef && ioRef.to(`restaurant_${restaurantId}`).emit("orders_updated");
       if (orderNowCancelled) {
-        ioRef && ioRef.to(`restaurant_${restaurantId}`).emit("order_cancelled", { orderId });
+        ioRef &&
+          emitOrderCancelled(ioRef, restaurantId, orderId, {
+            table_number: orderTableNumber,
+            reason,
+          });
       }
+
+      const externalSync = orderNowCancelled
+        ? await sendExternalOrderRejection({ orderId, reason })
+        : { skipped: true, reason: "order_not_cancelled" };
 
       return res.json({
         ok: true,
         partial: true,
         orderCancelled: orderNowCancelled,
-        itemsCancelled: itemIds.length,
+        itemsCancelled: cancelledItemIds.length,
         remainingCount,
         newTotal: updatedTotal,
+        externalSync,
       });
     } catch (err) {
       if (client) await client.query("ROLLBACK");
@@ -2097,8 +3759,21 @@ router.patch("/:id/cancel", async (req, res) => {
     }
 
     const ioRef = req.app.get("io");
-    ioRef && ioRef.to(`restaurant_${restaurantId}`).emit("order_cancelled", { orderId });
-    return res.json({ ok: true, orderId, orderCancelled: true, partial: false });
+    if (ioRef) {
+      emitOrderCancelled(ioRef, restaurantId, orderId, {
+        table_number: rows[0]?.table_number ?? null,
+        reason,
+      });
+    }
+
+    const externalSync = await sendExternalOrderRejection({ orderId, reason });
+    return res.json({
+      ok: true,
+      orderId,
+      orderCancelled: true,
+      partial: false,
+      externalSync,
+    });
   } catch (err) {
     console.error("❌ Failed to cancel order:", err);
     res.status(500).json({ error: "Failed to cancel order" });
@@ -2180,6 +3855,86 @@ router.post("/:id/add-debt", async (req, res) => {
     );
 
     const newRecordedTotal = recorded + delta;
+    const orderItemsQuery = `
+      SELECT oi.kitchen_status,
+             oi.product_id,
+             COALESCE(p.category, '') AS product_category
+      FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id AND o.restaurant_id = $1
+      LEFT JOIN products p ON p.id = oi.product_id
+      WHERE oi.order_id = $2`;
+
+    const kitchenSettingsQuery = `
+      SELECT excluded_items, excluded_categories
+      FROM kitchen_compile_settings
+      WHERE restaurant_id = $1
+      ORDER BY id DESC
+      LIMIT 1`;
+
+    const safeParseArray = (value) => {
+      if (!value) return [];
+      if (Array.isArray(value)) return value;
+      if (typeof value === "string") {
+        try {
+          return JSON.parse(value);
+        } catch {
+          return [];
+        }
+      }
+      return [];
+    };
+
+    const [itemsResult, settingsResult] = await Promise.all([
+      client.query(orderItemsQuery, [restaurantId, id]),
+      client.query(kitchenSettingsQuery, [restaurantId]),
+    ]);
+
+    const excludedCategoriesRaw = safeParseArray(settingsResult.rows[0]?.excluded_categories);
+    const excludedItemsRaw = safeParseArray(settingsResult.rows[0]?.excluded_items);
+
+    const excludedCategories = new Set(
+      excludedCategoriesRaw
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    const excludedItems = new Set(
+      excludedItemsRaw
+        .map((value) => {
+          if (value === null || value === undefined || value === "") return null;
+          const normalized = Number.isFinite(Number(value))
+            ? String(Number(value))
+            : String(value).trim();
+          return normalized;
+        })
+        .filter(Boolean)
+    );
+
+    const relevantItems = (itemsResult.rows || []).filter((row) => {
+      const category = String(row.product_category || "").trim().toLowerCase();
+      const productId =
+        row.product_id === null || row.product_id === undefined
+          ? ""
+          : String(row.product_id).trim();
+      if (category && excludedCategories.has(category)) return false;
+      if (productId && excludedItems.has(productId)) return false;
+      return true;
+    });
+
+    const hasUndelivered = relevantItems.some((row) => {
+      const status = String(row.kitchen_status || "").trim().toLowerCase();
+      if (!status) return false;
+      return status !== "delivered" && status !== "packet_delivered";
+    });
+
+    if (hasUndelivered) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "Kitchen still has undelivered items",
+        message:
+          "Order cannot be closed because there are still kitchen items being prepared",
+      });
+    }
+
     const nextOrderTotal = Math.max(currentTotal, newRecordedTotal);
     const updateResult = await client.query(
       `UPDATE orders
@@ -2238,261 +3993,18 @@ router.get('/debug/order-item-discounts', async (req, res) => {
 
 
 
-// ✅ Update stock based on ingredients and extras
-async function updateStockForOrder(orderItems, restaurantId) {
-  console.log("🧾 Received order items:", orderItems);
-
-  // Helper: resolve extras group amount/unit
-  async function resolveExtraFromGroups(name) {
-    const q = await pool.query(
-      `SELECT amount, unit
-       FROM extras_group_items
-       WHERE LOWER(ingredient_name) = LOWER($1)
-       ORDER BY id DESC
-       LIMIT 1`,
-      [name]
-    );
-    if (!q.rows.length) return null;
-    const r = q.rows[0] || {};
-    return { amount: Number(r.amount), unit: (r.unit || "").toLowerCase() };
-  }
-
-  // Helper: fallback unit from stock
-  async function resolveUnitFromStock(name) {
-    const q = await pool.query(
-      `SELECT unit
-       FROM stock
-       WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2)
-       ORDER BY id DESC
-       LIMIT 1`,
-      [restaurantId, name]
-    );
-    if (!q.rows.length) return "";
-    return (q.rows[0].unit || "").toLowerCase();
-  }
-
-  for (const item of orderItems) {
-    const quantityMultiplier = parseInt(item.quantity) || 1;
-
-    const safeParseList = (value) => {
-      if (Array.isArray(value)) return value;
-      if (value === null || value === undefined || value === "") return [];
-      if (typeof value === "object") return [value].flat().filter(Boolean);
-      try {
-        const parsed = JSON.parse(value);
-        return Array.isArray(parsed) ? parsed : [];
-      } catch (err) {
-        console.warn("⚠️ Could not parse ingredients/extras JSON:", err?.message || err);
-        return [];
-      }
-    };
-
-    const ingredients = safeParseList(item.ingredients);
-    const extras = safeParseList(item.extras);
-
-    // 🚑 Fallback: fetch recipe ingredients from DB if none provided
-    if ((!ingredients || ingredients.length === 0) && item.product_id) {
-      try {
-        const q = await pool.query(
-          `SELECT ingredients
-           FROM products
-           WHERE restaurant_id = $1 AND id = $2`,
-          [restaurantId, item.product_id]
-        );
-        if (q.rows[0]?.ingredients) {
-          const parsed =
-            typeof q.rows[0].ingredients === "string"
-              ? JSON.parse(q.rows[0].ingredients)
-              : q.rows[0].ingredients;
-          if (Array.isArray(parsed)) {
-            ingredients = parsed;
-            console.log(`📦 Loaded ${parsed.length} ingredients for product_id=${item.product_id}`);
-          }
-        }
-      } catch (e) {
-        console.error("❌ Could not fetch fallback ingredients:", e);
-      }
-    }
-
-    // 🔻 Deduct Ingredients
-    for (const ing of ingredients) {
-      let ingUnit = (ing.unit || "").toLowerCase();
-      let amountPerUnit = parseFloat(ing.quantity) * quantityMultiplier;
-
-      const stockRes = await pool.query(
-        `SELECT id, unit
-         FROM stock
-         WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2)
-         LIMIT 1`,
-        [restaurantId, ing.ingredient || ing.name]
-      );
-
-      if (stockRes.rows.length) {
-        const stockUnit = (stockRes.rows[0].unit || "").toLowerCase();
-
-        // Normalize units (g/kg, ml/l, piece/portion)
-        if (ingUnit && ingUnit !== stockUnit) {
-          if (ingUnit === "g" && stockUnit === "kg") {
-            amountPerUnit /= 1000;
-            ingUnit = stockUnit;
-          } else if (ingUnit === "kg" && stockUnit === "g") {
-            amountPerUnit *= 1000;
-            ingUnit = stockUnit;
-          } else if (ingUnit === "ml" && stockUnit === "l") {
-            amountPerUnit /= 1000;
-            ingUnit = stockUnit;
-          } else if (ingUnit === "l" && stockUnit === "ml") {
-            amountPerUnit *= 1000;
-            ingUnit = stockUnit;
-          } else if (
-            (ingUnit === "piece" && stockUnit === "portion") ||
-            (ingUnit === "portion" && stockUnit === "piece")
-          ) {
-            ingUnit = stockUnit;
-          }
-        }
-      }
-
-      console.log(`🔻 Deducting Ingredient: ${ing.ingredient || ing.name} -${amountPerUnit} ${ingUnit}`);
-
-      const res = await pool.query(
-        `UPDATE stock
-         SET quantity = quantity - $1
-         WHERE restaurant_id = $2 AND LOWER(name) = LOWER($3)
-         RETURNING *`,
-        [amountPerUnit, restaurantId, ing.ingredient || ing.name]
-      );
-
-      if (res.rowCount > 0) {
-        const updatedStock = res.rows[0];
-        emitStockUpdate(io, updatedStock.id);
-
-        if (updatedStock.quantity > updatedStock.critical_quantity && updatedStock.auto_added_to_cart) {
-          await pool.query(
-            "UPDATE stock SET auto_added_to_cart = FALSE WHERE restaurant_id = $1 AND id = $2",
-            [restaurantId, updatedStock.id]
-          );
-        }
-
-        if (updatedStock.critical_quantity && updatedStock.quantity <= updatedStock.critical_quantity) {
-          emitAlert(
-   io,
-   restaurantId,
-   `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-   updatedStock.id,
-   "stock",
-   { stockId: updatedStock.id }
- );
-        }
-      }
-    }
-
-    // 🔻 Deduct Extras
-    for (const ex of extras) {
-      const extraName = ex.name || ex.ingredient_name;
-      if (!extraName) continue;
-
-      let amountPerPortion = Number(ex.amount);
-      let extraUnit = (ex.unit || "").toLowerCase();
-      const portionsPicked = parseInt(ex.quantity) || 1;
-
-      if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0 || !extraUnit) {
-        const grp = await resolveExtraFromGroups(extraName);
-        if (grp) {
-          amountPerPortion = grp.amount;
-          extraUnit = grp.unit;
-        }
-      }
-
-      const stockRes = await pool.query(
-        `SELECT id, unit
-         FROM stock
-         WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2)
-         LIMIT 1`,
-        [restaurantId, extraName]
-      );
-
-      if (stockRes.rows.length) {
-        const stockUnit = (stockRes.rows[0].unit || "").toLowerCase();
-        if (extraUnit && extraUnit !== stockUnit) {
-          if (extraUnit === "g" && stockUnit === "kg") {
-            amountPerPortion /= 1000;
-            extraUnit = stockUnit;
-          } else if (extraUnit === "kg" && stockUnit === "g") {
-            amountPerPortion *= 1000;
-            extraUnit = stockUnit;
-          } else if (extraUnit === "ml" && stockUnit === "l") {
-            amountPerPortion /= 1000;
-            extraUnit = stockUnit;
-          } else if (extraUnit === "l" && stockUnit === "ml") {
-            amountPerPortion *= 1000;
-            extraUnit = stockUnit;
-          } else if (
-            (extraUnit === "piece" && stockUnit === "portion") ||
-            (extraUnit === "portion" && stockUnit === "piece")
-          ) {
-            extraUnit = stockUnit;
-          }
-        }
-      }
-
-      if (!extraUnit) {
-        extraUnit = await resolveUnitFromStock(extraName);
-      }
-
-      if (!Number.isFinite(amountPerPortion) || amountPerPortion <= 0) {
-        amountPerPortion = 1;
-      }
-
-      const usedQty = amountPerPortion * portionsPicked * quantityMultiplier;
-
-      console.log(`🔻 Deducting Extra: ${extraName} -${usedQty} ${extraUnit}`);
-
-     const res = await pool.query(
-  `UPDATE stock
-   SET quantity = quantity - $1
-   WHERE restaurant_id = $2 AND LOWER(name) = LOWER($3)
-   RETURNING *`,
-  [usedQty, restaurantId, extraName]   // ✅ only 3 params now
-);
-
-
-      if (res.rowCount > 0) {
-        const updatedStock = res.rows[0];
-        emitStockUpdate(io, updatedStock.id);
-
-        if (updatedStock.quantity > updatedStock.critical_quantity && updatedStock.auto_added_to_cart) {
-          await pool.query(
-            "UPDATE stock SET auto_added_to_cart = FALSE WHERE restaurant_id = $1 AND id = $2",
-            [restaurantId, updatedStock.id]
-          );
-        }
-
-        if (updatedStock.critical_quantity && updatedStock.quantity <= updatedStock.critical_quantity) {
-          emitAlert(
-            io,
-            `🧂 Stock Low: ${updatedStock.name} (${updatedStock.quantity} ${updatedStock.unit})`,
-            updatedStock.id,
-            "stock",
-            { stockId: updatedStock.id }
-          );
-        }
-      }
-    }
-  }
-}
-
-
-
-
  // ✅ Public route for QR Menu order view
 // ✅ Safe for both authenticated POS users AND public QR menu views
-router.get("/:id", async (req, res) => {
+router.get("/:id", async (req, res, next) => {
   const { id } = req.params;
   const identifier = req.query.identifier;
   let restaurant_id = req.user?.restaurant_id || null;
 
   try {
+    // Avoid swallowing other explicit routes like /reservations, /reports, etc.
+    // This route is only for numeric order IDs.
+    if (!/^\d+$/.test(String(id || ""))) return next();
+
     // Allow public QR menu with ?identifier=
     if (!restaurant_id && identifier) {
       if (/^\d+$/.test(identifier)) {
@@ -2570,8 +4082,20 @@ router.get("/:id/items", async (req, res) => {
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
   try {
-    const hasCancellationColumn = await ensureOrderItemCancellationFields();
-    const cancelFilter = hasCancellationColumn ? "AND oi.cancelled_at IS NULL" : "";
+    const includeCancelled =
+      String(req.query?.include_cancelled || req.query?.includeCancelled || "")
+        .trim()
+        .toLowerCase() === "true" ||
+      String(req.query?.include_cancelled || req.query?.includeCancelled || "")
+        .trim()
+        .toLowerCase() === "1";
+
+    const cancellationColumns = await getOrderItemsCancellationColumns();
+    const cancelFilter = includeCancelled
+      ? ""
+      : cancellationColumns.hasCancelledAt
+        ? "AND oi.cancelled_at IS NULL"
+        : "AND COALESCE(oi.kitchen_status, '') <> 'cancelled'";
     const result = await pool.query(
   `SELECT
      oi.id,
@@ -2592,7 +4116,8 @@ router.get("/:id/items", async (req, res) => {
      oi.discount_value,
      oi.name AS order_item_name,
      oi.external_product_name,
-     p.name AS product_name
+     p.name AS product_name,
+     p.category AS category
    FROM order_items oi
    LEFT JOIN products p ON oi.product_id = p.id
    JOIN orders o ON o.id = oi.order_id
@@ -2659,7 +4184,7 @@ router.post("/sub-orders", async (req, res) => {
     payment_method,
     items = [],
     receipt_id,
-    mark_paid = true, // <-- NEW: if false, will NOT stamp paid_at
+    mark_paid = true, // default to paid unless explicitly set
   } = req.body;
 
   const client = await pool.connect();
@@ -2675,6 +4200,8 @@ router.post("/sub-orders", async (req, res) => {
     );
     const subOrderId = rows[0].sub_order_id;
 
+    const shouldMarkPaid = !!mark_paid && !!receipt_id;
+
     const itemsWithReceipt = items.map((item) => ({
       ...item,
       receipt_id: receipt_id || null,
@@ -2686,64 +4213,197 @@ router.post("/sub-orders", async (req, res) => {
     // ❌ Prevent double deduction if these items were already confirmed before payment
 const unconfirmedItems = itemsWithReceipt.filter(it => !it.confirmed && !it.paid_at);
 if (unconfirmedItems.length > 0) {
-  await updateStockForOrder(unconfirmedItems, req.user.restaurant_id);
+  await updateStockForOrder(unconfirmedItems, req.user.restaurant_id, io);
 }
 
 
 
-    const uniqueIds = itemsWithReceipt.map((i) => i.unique_id);
+    const requestedByUniqueId = new Map(
+      itemsWithReceipt
+        .filter((it) => it && typeof it === "object" && it.unique_id)
+        .map((it) => [
+          String(it.unique_id),
+          Math.max(1, Math.trunc(Number(it.quantity) || 1)),
+        ])
+    );
+    const uniqueIds = Array.from(requestedByUniqueId.keys());
 
-    if (mark_paid && receipt_id) {
-      const updateRes = await client.query(
-        `UPDATE order_items
-         SET sub_order_id = $1,
-             paid_at = NOW(),
-             confirmed = true,
-             receipt_id = $4,
-             payment_method = $5
-         WHERE order_id = $2
-           AND unique_id = ANY($3::text[])`,
-        [subOrderId, order_id, uniqueIds, receipt_id, payment_method || "Split"]
+    if (uniqueIds.length > 0) {
+      const { rows: locked } = await client.query(
+        `SELECT *
+           FROM order_items
+          WHERE order_id = $1
+            AND unique_id = ANY($2::text[])
+          FOR UPDATE`,
+        [order_id, uniqueIds]
       );
-      console.log(
-        `✅ Marked ${updateRes.rowCount} item(s) as paid for sub_order ${subOrderId}`
-      );
-    } else {
-      const updateRes = await client.query(
-        `UPDATE order_items
-         SET sub_order_id = $1,
-             confirmed = true
-         WHERE order_id = $2
-           AND unique_id = ANY($3::text[])`,
-        [subOrderId, order_id, uniqueIds]
-      );
-      console.log(
-        `🟡 Added ${updateRes.rowCount} item(s) to sub_order ${subOrderId} (UNPAID)`
-      );
+
+      let updatedPaid = 0;
+      let insertedPaid = 0;
+      let updatedUnpaid = 0;
+
+      for (const row of locked) {
+        const key = String(row.unique_id);
+        const requestedQty = requestedByUniqueId.get(key);
+        if (!requestedQty) continue;
+
+        const safeJson = (val) => {
+          if (val === null || val === undefined) return JSON.stringify([]);
+          if (typeof val === "string") return val;
+          try {
+            return JSON.stringify(val);
+          } catch {
+            return JSON.stringify([]);
+          }
+        };
+
+        const existingQty = Math.max(1, Math.trunc(Number(row.quantity) || 1));
+        const payQty = Math.min(Math.max(1, requestedQty), existingQty);
+
+        if (shouldMarkPaid) {
+          if (row.paid_at) {
+            // Skip already-paid rows (prevents double-stamping); frontend should not send these.
+            continue;
+          }
+
+          if (payQty < existingQty) {
+            const remainingQty = existingQty - payQty;
+
+            // Keep the original row as the remaining UNPAID quantity.
+            await client.query(
+              `UPDATE order_items
+                  SET quantity = $2,
+                      confirmed = true,
+                      sub_order_id = NULL,
+                      paid_at = NULL,
+                      receipt_id = NULL,
+                      payment_method = NULL
+                WHERE id = $1`,
+              [row.id, remainingQty]
+            );
+            updatedUnpaid += 1;
+
+            // Insert a new PAID row for the paid portion.
+            const newUniqueId = `${key}::p:${uuidv4()}`;
+
+            const safeJson = (val) => {
+              if (val === null || val === undefined) return JSON.stringify([]);
+              if (typeof val === "string") return val;
+              try {
+                return JSON.stringify(val);
+              } catch {
+                return JSON.stringify([]);
+              }
+            };
+
+            await client.query(
+              `INSERT INTO order_items (
+                 order_id, product_id, quantity, price,
+                 ingredients, extras, unique_id,
+                 confirmed, kitchen_status, payment_method, receipt_id, note,
+                 discount_type, discount_value,
+                 external_product_id, external_product_name, name,
+                 sub_order_id, paid_at
+               )
+               VALUES (
+                 $1,$2,$3,$4,
+                 $5::jsonb,$6::jsonb,$7,
+                 TRUE,$8,$9,$10,$11,
+                 $12,$13,
+                 $14,$15,$16,
+                 $17, NOW()
+               )`,
+              [
+                row.order_id,
+                row.product_id,
+                payQty,
+                row.price,
+                safeJson(row.ingredients),
+                safeJson(row.extras),
+                newUniqueId,
+                row.kitchen_status || "new",
+                payment_method || "Split",
+                receipt_id,
+                row.note || null,
+                row.discount_type || null,
+                Number(row.discount_value) || 0,
+                row.external_product_id || null,
+                row.external_product_name || null,
+                row.name || null,
+                subOrderId,
+              ]
+            );
+            insertedPaid += 1;
+          } else {
+            const updateRes = await client.query(
+              `UPDATE order_items
+                  SET sub_order_id = $1,
+                      paid_at = NOW(),
+                      confirmed = true,
+                      receipt_id = $3,
+                      payment_method = $4
+                WHERE id = $2`,
+              [subOrderId, row.id, receipt_id, payment_method || "Split"]
+            );
+            updatedPaid += updateRes.rowCount || 0;
+          }
+        } else {
+          // Unpaid sub-order: just link and confirm (no paid_at).
+          const updateRes = await client.query(
+            `UPDATE order_items
+                SET sub_order_id = $1,
+                    confirmed = true
+              WHERE id = $2`,
+            [subOrderId, row.id]
+          );
+          updatedPaid += updateRes.rowCount || 0;
+        }
+      }
+
+      if (shouldMarkPaid) {
+        console.log(
+          `✅ Sub-order ${subOrderId} paid items updated=${updatedPaid}, inserted=${insertedPaid}, remainingUpdated=${updatedUnpaid}`
+        );
+      } else {
+        console.log(`🟡 Sub-order ${subOrderId} items linked=${updatedPaid}`);
+      }
     }
 
     // Keep order total in sync with the sub-order's total
     await client.query(
-      `UPDATE orders
-SET total = total + $1
-WHERE restaurant_id = $2 AND id = $3`,
-     [total, req.user.restaurant_id, order_id]
+              `UPDATE orders
+	SET total = total + $1
+	WHERE restaurant_id = $2 AND id = $3`,
+      [total, req.user.restaurant_id, order_id]
     );
 
-await client.query("COMMIT");
-// 🔒 Tenant-safe emit only for this restaurant
-if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, req.user.restaurant_id);
+    await client.query("COMMIT");
+    // 🔒 Tenant-safe emit only for this restaurant
+    if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, req.user.restaurant_id);
 
+    // 🔥 Emit payment event only when marked paid AND receipt present
+    if (shouldMarkPaid) {
+      const restaurantId = req.user.restaurant_id;
+      const tableResult = await client.query(
+        "SELECT table_number FROM orders WHERE id = $1 AND restaurant_id = $2",
+        [order_id, restaurantId]
+      );
+      const tableNumber = tableResult.rows?.[0]?.table_number ?? null;
+      const orderTotalWithExtras = await computeOrderTotalWithExtras(client, order_id);
+      emitPaymentMade(io, restaurantId, order_id, {
+        payment_method,
+        total,
+        amount: total,
+        table_number: tableNumber,
+        order_total_with_extras: orderTotalWithExtras,
+      });
 
-// 🔥 Emit payment event if marked paid
-if (mark_paid) {
-  const restaurantId = req.user.restaurant_id;
- emitPaymentMade(io, restaurantId, order_id, payment_method, total);
+      console.log(
+        `💸 [orders] payment_made emitted from sub-order for restaurant_${restaurantId}, order ${order_id}`
+      );
+    }
 
-  console.log(`💸 [orders] payment_made emitted from sub-order for restaurant_${restaurantId}, order ${order_id}`);
-}
-
-res.json({ sub_order_id: subOrderId, mark_paid: !!mark_paid });
+    res.json({ sub_order_id: subOrderId, mark_paid: !!mark_paid });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Sub-order failed:", err);
@@ -2891,13 +4551,14 @@ async function insertReceiptMethods(receiptId, methodAmounts = {}) {
 }
 
 
-// ✅ Support both single and sub-orders in split receipts
-// PATCHED: Always save receipt_id to the order when posting split payments
-
-router.post("/receipt-methods", async (req, res) => {
-  let { receipt_id, methods, order_id } = req.body;
-
-  try {
+	// ✅ Support both single and sub-orders in split receipts
+	// PATCHED: Always save receipt_id to the order when posting split payments
+	
+	router.post("/receipt-methods", async (req, res) => {
+	  let { receipt_id, methods, order_id } = req.body;
+	
+	  try {
+	    await ensurePaymentMethodChangesTracking();
     // If missing, generate new receipt_id and update order
     if ((!receipt_id || receipt_id === "null") && order_id) {
       const { rows } = await pool.query(
@@ -2923,40 +4584,108 @@ router.post("/receipt-methods", async (req, res) => {
     // Remove existing methods for this receipt
     await pool.query(`DELETE FROM receipt_methods WHERE receipt_id = $1`, [receipt_id]);
 
-    // Insert all split methods for this receipt
-    for (const [method, amount] of Object.entries(methods)) {
-      if (parseFloat(amount) > 0) {
-        await pool.query(
-          `INSERT INTO receipt_methods (receipt_id, payment_method, amount) VALUES ($1, $2, $3)`,
-          [receipt_id, method, amount]
-        );
-      }
-    }
+	    // Insert all split methods for this receipt
+	    for (const [method, amount] of Object.entries(methods)) {
+	      if (parseFloat(amount) > 0) {
+	        await pool.query(
+	          `INSERT INTO receipt_methods (receipt_id, payment_method, amount) VALUES ($1, $2, $3)`,
+	          [receipt_id, method, amount]
+	        );
+	      }
+	    }
+	
+	    const restaurantId = req.user.restaurant_id;
+	    const changedBy = req.user?.username || req.user?.name || req.user?.email || "system";
+	    // Update payment_method string on order for clarity.
+	    // IMPORTANT: An order can have multiple receipts over time (e.g. QRMenu "order another"),
+	    // so we MERGE new method(s) with existing ones instead of overwriting.
+	    const methodKeys = Object.keys(methods || {})
+	      .filter((k) => parseFloat(methods[k]) > 0)
+	      .map((k) => String(k || "").trim())
+	      .filter(Boolean);
+	    const thisPaymentMethodStr = methodKeys.join("+");
 
-    // Update payment_method string on order for clarity
-    const paymentMethodStr = Object.keys(methods)
-      .filter((k) => parseFloat(methods[k]) > 0)
-      .join("+");
+	    let orderId =
+	      order_id === null || order_id === undefined ? null : Number(order_id);
+	    if (!Number.isFinite(orderId) && receipt_id) {
+	      const { rows } = await pool.query(
+	        "SELECT id FROM orders WHERE receipt_id = $1 AND restaurant_id = $2 LIMIT 1",
+	        [receipt_id, restaurantId]
+	      );
+	      orderId = rows[0]?.id ? Number(rows[0].id) : null;
+	    }
+	    if (!Number.isFinite(orderId)) {
+	      return res.status(400).json({ error: "Invalid payload: missing order_id" });
+	    }
 
-    await pool.query(
-      `UPDATE orders SET payment_method = $1 WHERE receipt_id = $2`,
-      [paymentMethodStr, receipt_id]
-    );
+	    const { rows: beforeRows } = await pool.query(
+	      "SELECT payment_method FROM orders WHERE restaurant_id = $1 AND id = $2",
+	      [restaurantId, orderId]
+	    );
+	    const prevMethodRaw = beforeRows[0]?.payment_method ?? null;
 
-    // 🔥 Emit payment_made after split receipt saved
-    const restaurantId = req.user.restaurant_id;
-    const { rows } = await pool.query(
-      "SELECT id FROM orders WHERE receipt_id = $1 AND restaurant_id = $2",
-      [receipt_id, restaurantId]
-    );
-    const orderId = rows[0]?.id;
-    if (orderId) {
- emitPaymentMade(io, restaurantId, orderId, paymentMethodStr || "Split", null);
+	    const parseMethodTokens = (value) =>
+	      String(value || "")
+	        .split("+")
+	        .map((t) => t.trim())
+	        .filter(Boolean);
 
-      console.log(
-        `💸 [orders] payment_made emitted after receipt_methods for restaurant_${restaurantId}, order ${orderId}`
-      );
-    }
+	    // Preserve existing casing when a new token matches case-insensitively.
+	    const mergedTokens = [];
+	    const seen = new Map(); // lower -> display token
+
+	    for (const tok of parseMethodTokens(prevMethodRaw)) {
+	      const lower = tok.toLowerCase();
+	      if (!seen.has(lower)) {
+	        seen.set(lower, tok);
+	        mergedTokens.push(tok);
+	      }
+	    }
+	    for (const tok of methodKeys) {
+	      const lower = tok.toLowerCase();
+	      if (seen.has(lower)) continue;
+	      seen.set(lower, tok);
+	      mergedTokens.push(tok);
+	    }
+
+	    const mergedPaymentMethodStr = mergedTokens.join("+");
+
+	    await pool.query(
+	      `UPDATE orders
+	          SET payment_method = $1
+	        WHERE restaurant_id = $2 AND id = $3`,
+	      [mergedPaymentMethodStr, restaurantId, orderId]
+	    );
+	
+	    // 🔥 Emit payment_made after split receipt saved
+	    // Record payment method changes (timeline in history)
+	    const prev = prevMethodRaw;
+	    if (prev !== mergedPaymentMethodStr) {
+	      await pool.query(
+	        `INSERT INTO payment_method_changes (order_id, old_method, new_method, changed_by, changed_at)
+	         VALUES ($1, $2, $3, $4, NOW())`,
+	        [orderId, prev, mergedPaymentMethodStr, changedBy]
+	      );
+	    }
+	
+	    if (orderId) {
+	      const tableResult = await pool.query(
+	        "SELECT table_number FROM orders WHERE id = $1 AND restaurant_id = $2",
+	        [orderId, restaurantId]
+	      );
+	      const tableNumber = tableResult.rows?.[0]?.table_number ?? null;
+	      const orderTotalWithExtras = await computeOrderTotalWithExtras(pool, orderId);
+	      emitPaymentMade(io, restaurantId, orderId, {
+	        payment_method: thisPaymentMethodStr || mergedPaymentMethodStr || "Split",
+	        total: null,
+	        table_number: tableNumber,
+	        order_total_with_extras: orderTotalWithExtras,
+	      });
+	
+	      console.log(
+	        `💸 [orders] payment_made emitted after receipt_methods for restaurant_${restaurantId}, order ${orderId}`
+	      );
+	    }
 
     res.json({ message: "Receipt methods saved", receipt_id });
   } catch (err) {
@@ -2975,34 +4704,114 @@ router.put("/order-items/kitchen-status", async (req, res) => {
 
   const client = await pool.connect();
   try {
+    await ensureKitchenTimingFields();
     await client.query("BEGIN");
 
-    // 1. Update kitchen_status for all items
+    // 1. Update kitchen_status for all items (tenant-safe, no reliance on order_items.restaurant_id)
     await client.query(
-  `UPDATE order_items SET kitchen_status = $1 WHERE restaurant_id = $2 AND id = ANY($3::int[])`,
-  [status, req.user.restaurant_id, ids]
-);
+      `UPDATE order_items AS oi
+       SET kitchen_status = $1
+       FROM orders o
+       WHERE oi.order_id = o.id
+         AND o.restaurant_id = $2
+         AND oi.id = ANY($3::int[])`,
+      [status, req.user.restaurant_id, ids]
+    );
 
 
     // 2. Find affected order IDs
     const { rows: itemOrders } = await client.query(
-  `SELECT DISTINCT order_id FROM order_items WHERE restaurant_id = $1 AND id = ANY($2::int[])`,
-  [req.user.restaurant_id, ids]
-);
+      `SELECT DISTINCT oi.order_id
+       FROM order_items oi
+       JOIN orders o ON oi.order_id = o.id
+       WHERE o.restaurant_id = $1
+         AND oi.id = ANY($2::int[])`,
+      [req.user.restaurant_id, ids]
+    );
 
     const orderIds = itemOrders.map((r) => r.order_id);
+    const orderTableMap = new Map();
+      if (orderIds.length) {
+        const { rows: orderRows } = await client.query(
+          `SELECT id, table_number, external_source, external_id, customer_name, order_type
+           FROM orders
+           WHERE restaurant_id = $1 AND id = ANY($2::int[])`,
+          [req.user.restaurant_id, orderIds]
+        );
+        orderRows.forEach((row) => {
+          orderTableMap.set(row.id, {
+            number: row.table_number ?? null,
+            external_source: row.external_source ?? null,
+            external_id: row.external_id ?? null,
+            customer_name: row.customer_name ?? null,
+            order_type: row.order_type ?? null,
+          });
+        });
+      }
+
+    // Load kitchen exclusions (so excluded items don't block order-level delivered).
+    const safeParseArray = (value) => {
+      try {
+        if (!value) return [];
+        return typeof value === "string" ? JSON.parse(value) : value;
+      } catch {
+        return [];
+      }
+    };
+    const { rows: settingsRows } = await client.query(
+      `SELECT excluded_categories, excluded_items
+         FROM kitchen_compile_settings
+         WHERE restaurant_id = $1
+         ORDER BY id
+         LIMIT 1`,
+      [req.user.restaurant_id]
+    );
+    const excludedCategoriesRaw = safeParseArray(settingsRows[0]?.excluded_categories);
+    const excludedItemsRaw = safeParseArray(settingsRows[0]?.excluded_items);
+    const excludedCategories = new Set(
+      excludedCategoriesRaw
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    const excludedItems = new Set(
+      excludedItemsRaw
+        .map((value) => {
+          if (value === null || value === undefined || value === "") return null;
+          const num = Number(value);
+          if (Number.isFinite(num)) return String(num);
+          return String(value).trim();
+        })
+        .filter(Boolean)
+    );
 
     // 3. For each order, set prep_started_at / estimated_ready_at / kitchen_delivered_at
-    const deliveredOrderIds = [];
+    const deliveredOrders = [];
     const penaltyPerBatch = (orderIds.length - 1) * 2 * 60; // +2min per extra order in the batch
 
     for (const orderId of orderIds) {
       // Fetch all items for this order
       const { rows: allItems } = await client.query(
-        `SELECT kitchen_status FROM order_items WHERE order_id = $1`,
-        [orderId]
+        `SELECT
+           oi.kitchen_status,
+           oi.product_id,
+           p.category AS product_category
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         LEFT JOIN products p ON p.id = oi.product_id
+         WHERE oi.order_id = $1 AND o.restaurant_id = $2`,
+        [orderId, req.user.restaurant_id]
       );
-      const statuses = allItems.map((i) => i.kitchen_status);
+      const relevantItems = (allItems || []).filter((row) => {
+        const category = String(row.product_category || "").trim().toLowerCase();
+        const productId =
+          row.product_id === null || row.product_id === undefined
+            ? ""
+            : String(row.product_id).trim();
+        if (category && excludedCategories.has(category)) return false;
+        if (productId && excludedItems.has(productId)) return false;
+        return true;
+      });
+      const statuses = relevantItems.map((i) => i.kitchen_status);
 
       // --- PENALTY LOGIC ---
       if (statuses.includes("preparing")) {
@@ -3011,9 +4820,10 @@ router.put("/order-items/kitchen-status", async (req, res) => {
         const { rows: itemsWithPrep } = await client.query(
           `SELECT oi.quantity, p.preparation_time
            FROM order_items oi
+           JOIN orders o ON oi.order_id = o.id
            JOIN products p ON oi.product_id = p.id
-          WHERE oi.order_id = $1 AND oi.restaurant_id = $2`,
-         [id, req.user.restaurant_id]
+          WHERE oi.order_id = $1 AND o.restaurant_id = $2`,
+          [orderId, req.user.restaurant_id]
         );
 
         const penaltyPerExtra = 2 * 60; // 2min per extra of same product
@@ -3054,38 +4864,93 @@ router.put("/order-items/kitchen-status", async (req, res) => {
       }
 
       // a) PREP STARTED (prep_started_at always set above)
-      // b) ALL DELIVERED
-      if (statuses.length && statuses.every((s) => s === "delivered")) {
-        await client.query(
-  `UPDATE orders SET kitchen_delivered_at = NOW() WHERE restaurant_id = $1 AND id = $2`,
-  [req.user.restaurant_id, orderId]
-);
+      // b) ALL DELIVERED (ignoring kitchen-excluded items)
+      // If there are no relevant items (everything excluded), treat as delivered.
+      const allDelivered =
+        statuses.length === 0 ||
+        statuses.every((s) => (s || "").toString().toLowerCase() === "delivered");
 
-        deliveredOrderIds.push(orderId);
+      if (allDelivered) {
+        const tableInfo = orderTableMap.get(orderId);
+
+        await client.query(
+          `UPDATE orders SET kitchen_delivered_at = NOW() WHERE restaurant_id = $1 AND id = $2`,
+          [req.user.restaurant_id, orderId]
+        );
+
+        deliveredOrders.push({
+          orderId,
+          table_number: tableInfo?.number ?? null,
+          table_label: null,
+          customer_name: tableInfo?.customer_name ?? null,
+          order_type: tableInfo?.order_type ?? null,
+          external_source: tableInfo?.external_source ?? null,
+          external_id: tableInfo?.external_id ?? null,
+        });
       }
     }
 
-await client.query("COMMIT");
+    await client.query("COMMIT");
 
-// 4️⃣ Tenant-safe socket emits
-const io = getIO();
-io.to(`restaurant_${req.user.restaurant_id}`).emit("orders_updated");
+    // 4️⃣ Tenant-safe socket emits
+    const io = getIO();
+    io.to(`restaurant_${req.user.restaurant_id}`).emit("orders_updated");
 
-if (status === "preparing" && orderIds.length) {
-  orderIds.forEach((orderId) =>
-    emitOrderPreparing(io, req.user.restaurant_id, orderId)
-  );
-}
+    if (status === "preparing" && orderIds.length) {
+      orderIds.forEach((orderId) => {
+        const tableInfo = orderTableMap.get(orderId);
+        emitOrderPreparing(io, req.user.restaurant_id, orderId, {
+          table_number: tableInfo?.number ?? null,
+            table_label: null,
+          customer_name: tableInfo?.customer_name ?? null,
+          order_type: tableInfo?.order_type ?? null,
+          external_source: tableInfo?.external_source ?? null,
+          external_id: tableInfo?.external_id ?? null,
+          order_id: orderId,
+        });
+        if (String(tableInfo?.external_source || "").toLowerCase() === "yemeksepeti") {
+          emitYsOrderStatus(req.user.restaurant_id, orderId, "preparing", {});
+        }
+      });
+    }
 
-if (status === "ready" && orderIds.length) {
-  io.to(`restaurant_${req.user.restaurant_id}`).emit("order_ready", { orderIds });
-}
+    if (status === "ready" && orderIds.length) {
+      io.to(`restaurant_${req.user.restaurant_id}`).emit("order_ready", { orderIds });
+      await Promise.allSettled(
+        orderIds.map((orderId) => sendExternalPreparationCompleted({ orderId }))
+      );
+    }
 
-if (status === "delivered" && deliveredOrderIds.length) {
-  deliveredOrderIds.forEach((orderId) =>
-    emitOrderDelivered(io, req.user.restaurant_id, orderId)
-  );
-}
+    if (status === "delivered" && deliveredOrders.length) {
+      deliveredOrders.forEach(({ 
+        orderId, 
+        table_number, 
+        customer_name,
+        order_type,
+        external_source,
+        external_id 
+      }) =>
+        emitOrderDelivered(io, req.user.restaurant_id, orderId, {
+          table_number,
+          table_label: null,
+          customer_name,
+          order_type,
+          external_source,
+          external_id,
+          order_id: orderId,
+        })
+      );
+      deliveredOrders.forEach(({ orderId }) => {
+        const meta = orderTableMap.get(orderId);
+        if (String(meta?.external_source || "").toLowerCase() === "yemeksepeti") {
+          emitYsOrderStatus(req.user.restaurant_id, orderId, "delivered", {});
+        }
+      });
+      // Some kitchen flows skip `ready` and move straight to `delivered`.
+      await Promise.allSettled(
+        deliveredOrders.map(({ orderId }) => sendExternalPreparationCompleted({ orderId }))
+      );
+    }
 
     res.json({ updated: ids.length });
   } catch (err) {
@@ -3115,14 +4980,30 @@ router.patch("/:id/driver-status", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // 🛑 Block driver status change if driver_id is not assigned
     const driverCheck = await client.query(
-  `SELECT driver_id FROM orders WHERE restaurant_id = $1 AND id = $2`,
-  [req.user.restaurant_id, id]
-);
+      `SELECT
+         driver_id,
+         customer_name,
+         table_number,
+         external_source,
+         external_id,
+         external_expedition_type,
+         customer_address,
+         order_type
+       FROM orders WHERE restaurant_id = $1 AND id = $2`,
+      [req.user.restaurant_id, id]
+    );
 
     const order = driverCheck.rows[0];
-    if (!order || !order.driver_id) {
+    const isYsOrder = String(order?.external_source || "").toLowerCase() === "yemeksepeti";
+    const isYemeksepetiPickup =
+      order &&
+      (order.external_source === "yemeksepeti" || order.external_id) &&
+      (String(order.external_expedition_type || "").toLowerCase() === "pickup" ||
+        String(order.customer_address || "").toLowerCase() === "pickup order");
+
+    // 🛑 Block driver status change if driver_id is not assigned, except YS pickup orders (no driver needed)
+    if (!order || (!order.driver_id && !isYemeksepetiPickup)) {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Cannot change driver status: no driver assigned!" });
     }
@@ -3150,7 +5031,53 @@ router.patch("/:id/driver-status", async (req, res) => {
     await client.query("COMMIT");
 
 // 🔒 Tenant-safe emit only to this restaurant
-getIO().to(`restaurant_${req.user.restaurant_id}`).emit("orders_updated");
+    const io = getIO();
+    io.to(`restaurant_${req.user.restaurant_id}`).emit("orders_updated");
+    io
+      .to(`restaurant_${req.user.restaurant_id}`)
+      .emit("driver_status_updated", { orderId: Number(id), driver_status });
+    if (["on_road", "picked_up"].includes(String(driver_status || "").toLowerCase())) {
+      await sendExternalOrderPickedUp({ orderId: Number(id) });
+      if (driver_status === "picked_up" && isYsOrder) {
+        emitYsOrderStatus(req.user.restaurant_id, Number(id), "picked_up", {});
+      }
+      if (process.env.YS_PARTNER_FULFILLMENT_ENABLED === "true") {
+        try {
+          const partnerRes = await sendYsPartnerFulfillment({ orderId: Number(id), status: "DISPATCHED" });
+          if (partnerRes?.skipped) {
+            dlog("ℹ️ [ys-partner] DISPATCHED skipped:", partnerRes.reason);
+          }
+        } catch (err) {
+          console.warn(
+            "⚠️ YS partner fulfillment (DISPATCHED) failed:",
+            err?.message || err
+          );
+        }
+      }
+    }
+    if (driver_status === "delivered") {
+      // Do not attempt to sync "delivered" to Yemeksepeti via middleware callbacks.
+      // Middleware supports: order_accepted / order_rejected / order_picked_up (+ preparation-completed).
+      // A "delivered" signal should come from platform logistics (when supported).
+      dlog(`✅ Driver marked order as DELIVERED - no external sync performed`);
+      if (isYsOrder) {
+        emitYsOrderStatus(req.user.restaurant_id, Number(id), "delivered", {});
+      }
+      emitOrderDelivered(io, req.user.restaurant_id, Number(id), {
+        table_number: order?.table_number ?? null,
+      });
+      io.to(`restaurant_${req.user.restaurant_id}`).emit("driver_delivered", {
+        orderId: Number(id),
+        customer_name: order?.customer_name || null,
+        driver_status,
+      });
+    }
+
+    if (driver_status === "on_road") {
+      emitDriverOnRoad(io, req.user.restaurant_id, Number(id), {
+        customer_name: order?.customer_name || null,
+      });
+    }
 res.json({ success: true });
 
   } catch (err) {
@@ -3228,14 +5155,20 @@ router.patch("/:orderId/merge-table", async (req, res) => {
 
   try {
     await client.query("BEGIN");
+    const restaurantId = req.user?.restaurant_id;
+    if (!restaurantId) throw new Error("Missing restaurant context");
 
     // 1️⃣ Find destination order (open)
     const { rows: target } = await client.query(
       `SELECT id, restaurant_id, total, is_paid
          FROM orders
-        WHERE table_number = $1 AND status <> 'closed'
+        WHERE restaurant_id = $2
+          AND table_number = $1
+          AND status <> 'closed'
+          AND status <> 'cancelled'
+          AND status <> 'canceled'
         LIMIT 1`,
-      [target_table_number]
+      [target_table_number, restaurantId]
     );
     if (!target.length) throw new Error("Target order not found or closed");
     const targetOrder = target[0];
@@ -3244,17 +5177,16 @@ router.patch("/:orderId/merge-table", async (req, res) => {
     const { rows: source } = await client.query(
       `SELECT id, restaurant_id, total
          FROM orders
-        WHERE id = $1
+        WHERE restaurant_id = $2
+          AND id = $1
         LIMIT 1`,
-      [orderId]
+      [orderId, restaurantId]
     );
     if (!source.length) throw new Error("Source order not found");
     const sourceOrder = source[0];
 
     if (targetOrder.restaurant_id !== sourceOrder.restaurant_id)
       throw new Error("Cross-restaurant merge is not allowed");
-
-    const restaurantId = targetOrder.restaurant_id;
 
     // 3️⃣ Move all order_items (preserve all payment info!)
     await client.query(
@@ -3305,7 +5237,7 @@ router.patch("/:orderId/merge-table", async (req, res) => {
 
     await client.query("COMMIT");
 
- // 7️⃣ Emit (tenant-safe)
+// 7️⃣ Emit (tenant-safe)
 if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
 
 io.to(`restaurant_${restaurantId}`).emit("order_merged", {
@@ -3343,7 +5275,7 @@ console.log("✅ confirm-online route loaded");
     await client.query("BEGIN");
 
     // 1. Get order
-const orderRes = await pool.query(`
+const orderRes = await client.query(`
   SELECT o.*,
          c.name AS customer_name,
          c.phone AS customer_phone,
@@ -3354,7 +5286,7 @@ const orderRes = await pool.query(`
   WHERE o.restaurant_id = $1 AND o.id = $2
 `, [req.user.restaurant_id, req.params.id]);
 
-    const order = rows[0];
+    const order = orderRes.rows[0];
     if (!order) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Order not found" });
@@ -3386,6 +5318,39 @@ const orderRes = await pool.query(`
 const ioRef = req.app.get("io");
 const restaurantId = req.user.restaurant_id;
 
+if (order.external_source === "yemeksepeti") {
+  try {
+    await ensureOrderItemsStockDeductedColumn();
+    const { rows: orderItems } = await pool.query(
+      `SELECT id, product_id, quantity, ingredients, extras,
+              COALESCE(stock_deducted, FALSE) AS stock_deducted
+       FROM order_items
+       WHERE order_id = $1`,
+      [id]
+    );
+    const matchedItems = orderItems.filter(
+      (it) => Boolean(it.product_id) && !it.stock_deducted
+    );
+    const skippedCount = orderItems.length - matchedItems.length;
+    if (matchedItems.length) {
+      await updateStockForOrder(matchedItems, restaurantId, io);
+      await pool.query(
+        `UPDATE order_items
+         SET stock_deducted = TRUE
+         WHERE id = ANY($1::int[])`,
+        [matchedItems.map((row) => row.id)]
+      );
+    }
+    console.log("📦 [orders] Yemeksepeti stock deducted on accept:", {
+      orderId: id,
+      items: matchedItems.length,
+      skipped_unmatched: skippedCount,
+    });
+  } catch (e) {
+    console.error("❌ Failed to deduct stock on Yemeksepeti accept:", e);
+  }
+}
+
 try {
   const payload = await buildFullOrderPayload(id, restaurantId);
   ioRef.to(`restaurant_${restaurantId}`).emit("order_confirmed", payload);
@@ -3398,11 +5363,12 @@ try {
 if (typeof emitOrderUpdate === "function") emitOrderUpdate(ioRef, restaurantId);
 else ioRef.to(`restaurant_${restaurantId}`).emit("orders_updated");
 
+  if (String(order.external_source || "").toLowerCase() === "yemeksepeti") {
+    emitYsOrderStatus(restaurantId, Number(id), "accepted", {});
+  }
 
-
-
-
-    res.json({ message: "Order confirmed", order: updateRes.rows[0] });
+    const externalSync = await sendExternalOrderAccepted({ orderId: Number(id) });
+    res.json({ message: "Order confirmed", order: updateRes.rows[0], externalSync });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error confirming online order:", err);
@@ -3416,6 +5382,7 @@ else ioRef.to(`restaurant_${restaurantId}`).emit("orders_updated");
 router.get('/:id/payment-changes', async (req, res) => {
   const { id } = req.params;
   try {
+    await ensurePaymentMethodChangesTracking();
     const result = await pool.query(
       `SELECT old_method, new_method, changed_by, changed_at
          FROM payment_method_changes
@@ -3430,8 +5397,10 @@ router.get('/:id/payment-changes', async (req, res) => {
   }
 });
 
-router.get("/:raw", async (req, res) => {
+router.get("/:raw", async (req, res, next) => {
   const raw = String(req.params.raw || "").trim();
+  // Defer to more specific routes (e.g., /reservations, /reservations/:id)
+  if (!/^\d+$/.test(raw)) return next();
   console.log(`🧪 [orders] GET /api/orders/${raw} — resolver start`);
 
   try {
@@ -3445,7 +5414,22 @@ router.get("/:raw", async (req, res) => {
 
     // 3) Fetch header
     const { rows: orderRows } = await pool.query(
-      `SELECT id, status, table_number, order_type, total, created_at
+      `SELECT
+         id,
+         status,
+         table_number,
+         order_type,
+         total,
+         created_at,
+         customer_name,
+         customer_phone,
+         customer_address,
+         payment_method,
+         takeaway_notes,
+         receipt_id,
+         external_id,
+         external_source,
+         external_expedition_type
        FROM orders WHERE restaurant_id = $1 AND id = $2`,
 [restaurantId, internalId]
 
@@ -3564,7 +5548,11 @@ router.post("/reservations", async (req, res) => {
              reservation_time = $2,
              reservation_clients = $3,
              reservation_notes = $4,
-             status = CASE WHEN status = 'confirmed' THEN 'reserved' ELSE status END,
+             status = CASE 
+               WHEN LOWER(COALESCE(status,'')) IN ('closed', 'cancelled', 'canceled') THEN 'reserved'
+               WHEN status = 'confirmed' THEN 'reserved'
+               ELSE COALESCE(status, 'reserved')
+             END,
              updated_at = NOW()
          WHERE restaurant_id = $5 AND id = $6
          RETURNING *`,
@@ -3646,6 +5634,10 @@ router.get("/reservations", async (req, res) => {
   const { start_date, end_date, table_number } = req.query;
 
   try {
+    closeStaleReservations(restaurantId).catch((err) =>
+      console.warn("⚠️ closeStaleReservations (non-blocking) failed:", err?.message || err)
+    );
+
     let query = `
       SELECT
         id,
@@ -3662,19 +5654,23 @@ router.get("/reservations", async (req, res) => {
         created_at,
         updated_at
       FROM orders
-      WHERE restaurant_id = $1 AND (status = 'reserved' OR reservation_date IS NOT NULL)
+      WHERE restaurant_id = $1
+        AND (
+          (LOWER(COALESCE(status,'')) = 'reserved' AND LOWER(COALESCE(status,'')) NOT IN ('closed', 'cancelled', 'canceled'))
+          OR (reservation_date IS NOT NULL AND LOWER(COALESCE(status,'')) NOT IN ('closed', 'cancelled', 'canceled'))
+        )
     `;
     const params = [restaurantId];
     let paramIdx = 2;
 
     // Filter by date range if provided
     if (start_date) {
-      query += ` AND reservation_date >= $${paramIdx++}`;
+      query += ` AND reservation_date::date >= $${paramIdx++}::date`;
       params.push(start_date);
     }
 
     if (end_date) {
-      query += ` AND reservation_date <= $${paramIdx++}`;
+      query += ` AND reservation_date::date <= $${paramIdx++}::date`;
       params.push(end_date);
     }
 
@@ -3687,6 +5683,8 @@ router.get("/reservations", async (req, res) => {
     query += ` ORDER BY reservation_date ASC, reservation_time ASC`;
 
     const result = await pool.query(query, params);
+    
+    console.log(`📋 [GET /reservations] Query found ${result.rowCount} reservations for restaurant ${restaurantId}, date range: ${start_date} to ${end_date}`);
 
     res.json({
       success: true,
@@ -3713,22 +5711,22 @@ router.put("/reservations/:id", async (req, res) => {
     let paramIdx = 1;
 
     if (reservation_date) {
-      updates.push(`reservation_date = $${paramIdx++}`);
+      updates.push(`reservation_date = $${paramIdx++}::date`);
       params.push(reservation_date);
     }
 
     if (reservation_time) {
-      updates.push(`reservation_time = $${paramIdx++}`);
+      updates.push(`reservation_time = $${paramIdx++}::time`);
       params.push(reservation_time);
     }
 
     if (reservation_clients !== undefined) {
-      updates.push(`reservation_clients = $${paramIdx++}`);
+      updates.push(`reservation_clients = $${paramIdx++}::integer`);
       params.push(parseInt(reservation_clients) || 0);
     }
 
     if (reservation_notes !== undefined) {
-      updates.push(`reservation_notes = $${paramIdx++}`);
+      updates.push(`reservation_notes = $${paramIdx++}::text`);
       params.push((reservation_notes || "").trim());
     }
 
@@ -3736,7 +5734,7 @@ router.put("/reservations/:id", async (req, res) => {
       return res.status(400).json({ error: "No fields to update" });
     }
 
-    // Add WHERE clause
+    // Add WHERE clause with properly tracked parameter indices
     updates.push(`updated_at = NOW()`);
     params.push(restaurantId);
     params.push(id);
@@ -3744,7 +5742,7 @@ router.put("/reservations/:id", async (req, res) => {
     const query = `
       UPDATE orders
       SET ${updates.join(", ")}
-      WHERE restaurant_id = $${paramIdx + 1} AND id = $${paramIdx + 2}
+      WHERE restaurant_id = $${paramIdx++}::integer AND id = $${paramIdx++}::integer
       RETURNING *
     `;
 
@@ -3937,6 +5935,97 @@ router.put("/:id/reservations", async (req, res) => {
   } catch (err) {
     console.error("❌ Error updating reservation:", err);
     res.status(500).json({ error: "Failed to update reservation" });
+  }
+});
+
+// ✅ DELETE /orders/:id/reservations - Remove reservation from an order/table
+router.delete("/:id/reservations", async (req, res) => {
+  const { id } = req.params;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  const orderId = Number(id);
+  if (!Number.isFinite(orderId)) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, status, order_type, total
+         FROM orders
+        WHERE restaurant_id = $1 AND id = $2
+        LIMIT 1`,
+      [restaurantId, orderId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Order not found" });
+
+    const order = rows[0];
+    const total = Number(order.total || 0);
+
+    const { rowCount: hasItems } = await pool.query(
+      `SELECT 1 FROM order_items WHERE order_id = $1 LIMIT 1`,
+      [orderId]
+    );
+
+    // If it's an empty reservation-only order, close it so the table becomes free.
+    const shouldClose = (!hasItems || hasItems === 0) && total <= 0;
+
+    const updated = await pool.query(
+      `UPDATE orders
+          SET reservation_date = NULL,
+              reservation_time = NULL,
+              reservation_clients = NULL,
+              reservation_notes = NULL,
+              status = CASE
+                WHEN $3 THEN 'closed'
+                WHEN LOWER(COALESCE(status,'')) = 'reserved' THEN 'confirmed'
+                ELSE status
+              END,
+              updated_at = NOW()
+        WHERE restaurant_id = $1 AND id = $2
+        RETURNING *`,
+      [restaurantId, orderId, shouldClose]
+    );
+
+    io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+
+    return res.json({
+      success: true,
+      message: "✅ Reservation removed",
+      order: updated.rows[0],
+    });
+  } catch (err) {
+    console.error("❌ Error deleting reservation for order:", err);
+    return res.status(500).json({ error: "Failed to delete reservation" });
+  }
+});
+
+// 🧪 TEST ENDPOINT: Manually trigger Yemeksepeti status sync for debugging
+router.post("/:id/test-yemeksepeti-sync", async (req, res) => {
+  try {
+    const { id } = req.params;
+    dlog(`🧪 TEST: Manually triggering Yemeksepeti sync for order ${id}`);
+
+    // Simulate what happens when driver presses "delivered"
+    const result = await sendExternalOrderPickedUp({ orderId: Number(id) });
+
+    res.json({
+      success: true,
+      message: "✅ Yemeksepeti sync test completed - check backend logs",
+      syncResult: result,
+      expectedBehavior: result?.skipped 
+        ? `Sync skipped (reason: ${result.reason})`
+        : result?.ok
+        ? "✅ Order status sent to Yemeksepeti (order_picked_up)"
+        : "❌ Sync failed - check error details above",
+    });
+  } catch (err) {
+    console.error("❌ Yemeksepeti sync test failed:", err);
+    res.status(500).json({ 
+      error: "Test failed", 
+      details: err.message,
+      logs: "Check backend console for details"
+    });
   }
 });
 

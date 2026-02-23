@@ -56,6 +56,7 @@ router.get("/", async (req, res) => {
     const { rows } = await pool.query(query, params);
     res.json(rows); // each row has full Cloudinary URL now
   } catch (e) {
+    // Keep: Useful for production debugging
     console.error("❌ Category image fetch failed:", e);
     res.status(500).json({ error: "Internal server error" });
   }
@@ -82,6 +83,7 @@ router.post("/", upload.single("image"), async (req, res) => {
       { folder: "category_images", public_id: `cat_${Date.now()}` },
       async (err, result) => {
         if (err || !result) {
+          // Keep: Useful for production debugging
           console.error("Cloudinary upload error:", err);
           return res.status(500).json({ error: "Image upload failed" });
         }
@@ -100,6 +102,7 @@ router.post("/", upload.single("image"), async (req, res) => {
 
     streamifier.createReadStream(req.file.buffer).pipe(uploadStream);
   } catch (e) {
+    // Keep: Useful for production debugging
     console.error("❌ Category upload failed:", e);
     res.status(500).json({ error: "Internal server error" });
   }

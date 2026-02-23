@@ -3,6 +3,8 @@ module.exports = (io) => {
   const express = require("express");
   const router = express.Router();
   const { pool } = require("../db");
+  const dayjs = require("dayjs");
+  const { sendEmail } = require("../utils/notifications");
 const authMiddleware = require("../middleware/authMiddleware");
   /*===============================
            Auto supplier orders
@@ -14,6 +16,62 @@ const normalizeArray = (val) => {
   if (Array.isArray(val)) return val;
   return val.replace(/[{}"]/g, "").split(",").filter(Boolean);
 };
+
+const computeNextScheduledAt = (currentScheduledAt, repeatType) => {
+  const now = dayjs();
+  let next = dayjs(currentScheduledAt);
+  if (!next.isValid()) next = now;
+
+  const type = String(repeatType || "").toLowerCase().trim() || "weekly";
+  const step = (date) => {
+    if (type === "daily") return date.add(1, "day");
+    if (type === "monthly") return date.add(1, "month");
+    return date.add(7, "day"); // weekly/default
+  };
+
+  let guard = 0;
+  while (!next.isAfter(now) && guard < 60) {
+    next = step(next);
+    guard += 1;
+  }
+
+  return next.toDate();
+};
+
+async function getRestaurantReplyToEmail(restaurantId) {
+  try {
+    const r = await pool.query(
+      `
+      SELECT u.email AS owner_email
+      FROM restaurants r
+      LEFT JOIN users u ON u.id = r.owner_id
+      WHERE r.id = $1
+      LIMIT 1
+      `,
+      [restaurantId]
+    );
+    const ownerEmail = r.rows?.[0]?.owner_email;
+    if (ownerEmail) return ownerEmail;
+
+    const fallback = await pool.query(
+      `
+      SELECT email
+      FROM users
+      WHERE restaurant_id = $1
+        AND email IS NOT NULL
+        AND TRIM(email) <> ''
+      ORDER BY (role = 'admin') DESC, id ASC
+      LIMIT 1
+      `,
+      [restaurantId]
+    );
+    return fallback.rows?.[0]?.email || null;
+  } catch (err) {
+    // Keep: Useful for production debugging
+    console.warn("⚠️ Failed to load restaurant reply-to email:", err?.message || err);
+    return null;
+  }
+}
 
   // ✅ Create supplier cart
   router.post("/supplier-carts", async (req, res) => {
@@ -202,12 +260,45 @@ router.put("/supplier-carts/:id/confirm", async (req, res) => {
         return res.status(400).json({ error: "Cart must be confirmed before sending." });
       }
 
-      // Reset auto-add flags for all items
       const itemsRes = await pool.query(
-        `SELECT * FROM supplier_cart_items WHERE cart_id=$1`,
-        [id]
+        `SELECT * FROM supplier_cart_items WHERE restaurant_id=$1 AND cart_id=$2`,
+        [restaurantId, id]
       );
-      for (const item of itemsRes.rows) {
+      const items = itemsRes.rows || [];
+
+      if (!cart.email || !String(cart.email || "").trim()) {
+        return res.status(400).json({ error: "Supplier email is missing." });
+      }
+      if (items.length === 0) {
+        return res.status(400).json({ error: "Cart is empty." });
+      }
+
+      const replyTo = await getRestaurantReplyToEmail(restaurantId);
+      const restaurantContactLine = replyTo
+        ? `<p><strong>Restaurant contact:</strong> <a href="mailto:${replyTo}">${replyTo}</a></p>`
+        : "";
+
+      const htmlBody = `
+        <h2>📦 New Supplier Order</h2>
+        ${restaurantContactLine}
+        <p><strong>Supplier:</strong> ${cart.supplier_name}</p>
+        <p><strong>Scheduled for:</strong> ${new Date(scheduled_at || cart.scheduled_at || Date.now()).toLocaleString("tr-TR", { hour12: false })}</p>
+        <h3>📝 Products:</h3>
+        <ul>
+          ${items.map(item => `<li>${item.product_name} — ${item.quantity} ${item.unit}</li>`).join("")}
+        </ul>
+        <p style="margin-top:1.5em;">Best regards,<br><strong>Beypro</strong></p>
+      `;
+
+      await sendEmail(cart.email, "📦 Beypro Supplier Order", htmlBody, true, {
+        replyTo: replyTo || undefined,
+        fromName: "Beypro Orders",
+        throwOnError: true,
+      });
+
+      // Reset auto-add flags for all items (same as scheduled mailer)
+      for (const item of items) {
+        if (!item.stock_id) continue;
         await pool.query(
           `UPDATE stock
            SET auto_added_to_cart=FALSE, last_auto_add_at=NULL
@@ -216,13 +307,39 @@ router.put("/supplier-carts/:id/confirm", async (req, res) => {
         );
       }
 
-      // Archive cart
+      // Clear items so next cycle starts empty
       await pool.query(
-        `UPDATE supplier_carts SET archived=true WHERE restaurant_id=$1 AND id=$2`,
+        `DELETE FROM supplier_cart_items
+         WHERE restaurant_id=$1 AND cart_id=$2`,
         [restaurantId, id]
       );
 
-      res.json({ success: true, message: "Order sent successfully." });
+      // Do NOT reset auto schedule: keep cart active if auto_confirm is enabled.
+      if (cart.auto_confirm === true) {
+        const now = dayjs();
+        const cartScheduled = scheduled_at || cart.scheduled_at;
+        const shouldReschedule = cartScheduled && dayjs(cartScheduled).isBefore(now.add(1, "minute"));
+        const nextScheduledAt = shouldReschedule
+          ? computeNextScheduledAt(cartScheduled, cart.repeat_type)
+          : cart.scheduled_at;
+
+        await pool.query(
+          `UPDATE supplier_carts
+           SET scheduled_at = COALESCE($3, scheduled_at),
+               archived = false,
+               confirmed = true
+           WHERE restaurant_id=$1 AND id=$2`,
+          [restaurantId, id, nextScheduledAt]
+        );
+      } else {
+        // one-time manual send: archive as sent
+        await pool.query(
+          `UPDATE supplier_carts SET archived=true WHERE restaurant_id=$1 AND id=$2`,
+          [restaurantId, id]
+        );
+      }
+
+      res.json({ success: true, message: "Order email sent successfully." });
     } catch (error) {
       console.error("❌ Error sending supplier cart:", error);
       res.status(500).json({ error: "Database error sending cart." });
@@ -295,9 +412,11 @@ router.get("/supplier-carts/items", async (req, res) => {
           [restaurantId, supplier_id]
         );
         targetCart = insertRes.rows[0];
-        console.log(
-          `🆕 Auto-created new supplier cart id=${targetCart.id} for supplier=${supplier_id}`
-        );
+        if (process.env.NODE_ENV !== "production") {
+          console.log(
+            `🆕 Auto-created new supplier cart id=${targetCart.id} for supplier=${supplier_id}`
+          );
+        }
       }
     }
 
@@ -534,7 +653,9 @@ router.get("/supplier-carts/scheduled", async (req, res) => {
         [restaurantId, supplier_id]
       );
       cart = insertRes.rows[0];
-      console.log(`🆕 Auto-created new supplier cart id=${cart.id} for supplier=${supplier_id}`);
+      if (process.env.NODE_ENV !== "production") {
+        console.log(`🆕 Auto-created new supplier cart id=${cart.id} for supplier=${supplier_id}`);
+      }
     }
 
     // Fetch items for this cart

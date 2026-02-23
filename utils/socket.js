@@ -15,18 +15,36 @@ function initSocket(server) {
   try {
     if (!origin) return callback(null, true);
     const normalized = String(origin).toLowerCase();
+    const isDev = process.env.NODE_ENV !== "production";
+    const isPrivateLanOrigin =
+      /^https?:\/\/(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?$/.test(
+        normalized
+      );
     const allowList = new Set([
       "http://localhost:5173",
       "https://pos.beypro.com",
       "https://www.pos.beypro.com",
       "https://hurrypos-frontend.onrender.com",
-      "https://hurrypos-backend.onrender.com:443", // ✅ Mobile WebView
-      "https://hurrypos-backend.onrender.com",     // ✅ Mobile WebView
-      "http://localhost:8081",                     // ✅ Expo dev server
+      "https://hurrypos-backend.onrender.com:443", // ✅ Legacy Render
+      "https://hurrypos-backend.onrender.com",
+      "https://api.beypro.com:443",                // ✅ New AWS API
+      "https://api.beypro.com",
+      "http://localhost:8081",                     // ✅ Expo dev server (Android)
+      "http://localhost:19000",                    // ✅ Expo dev server (legacy)
+      "http://localhost:19006",                    // ✅ Expo web/devtools
     ]);
+
+    const isExpoOrigin =
+      normalized.startsWith("https://expo.dev") ||
+      normalized.startsWith("https://u.expo.dev") ||
+      normalized.startsWith("https://exp.host") ||
+      normalized.startsWith("exp://") ||
+      normalized.startsWith("exps://");
 
     if (
       allowList.has(normalized) ||
+      (isDev && isPrivateLanOrigin) ||
+      isExpoOrigin ||
       normalized.startsWith("file://") ||
       normalized.startsWith("app://") || // ✅ packaged Electron
       normalized.startsWith("capacitor://") || // ✅ Capacitor mobile

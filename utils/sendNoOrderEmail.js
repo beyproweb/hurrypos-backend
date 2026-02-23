@@ -1,10 +1,14 @@
 const { sendEmail } = require("./notifications");
 
-async function sendNoOrderEmail(supplierName, supplierEmail, scheduledDate) {
+async function sendNoOrderEmail(supplierName, supplierEmail, scheduledDate, options = {}) {
   if (!supplierEmail) {
     console.warn("📭 Skipped email not sent: No email address provided.");
     return;
   }
+
+  const replyTo = options && options.replyTo ? String(options.replyTo) : "";
+  const restaurantName =
+    options && options.restaurantName ? String(options.restaurantName) : "";
 
   const formattedDate = new Date(scheduledDate).toLocaleString("tr-TR", {
     hour12: false,
@@ -13,10 +17,16 @@ async function sendNoOrderEmail(supplierName, supplierEmail, scheduledDate) {
 
   const subject = "📭 No Order This Week";
 
+  const restaurantLine =
+    restaurantName || replyTo
+      ? `<p><strong>Restaurant:</strong> ${restaurantName || "—"}${replyTo ? ` &nbsp;(<a href="mailto:${replyTo}">${replyTo}</a>)` : ""}</p>`
+      : "";
+
   const htmlBody = `
     <div style="font-family: Arial, sans-serif; font-size: 15px; color: #333;">
       <h2 style="color: #e63946;">📭 No Order This Week</h2>
       <p>Hello <strong>${supplierName}</strong>,</p>
+      ${restaurantLine}
       <p>
         No order was generated for the scheduled date: <strong>${formattedDate}</strong>.
       </p>
@@ -31,7 +41,10 @@ async function sendNoOrderEmail(supplierName, supplierEmail, scheduledDate) {
   `;
 
   try {
-    await sendEmail(supplierEmail, subject, htmlBody, true);
+    await sendEmail(supplierEmail, subject, htmlBody, true, {
+      replyTo: replyTo || undefined,
+      fromName: "Beypro Orders",
+    });
     console.log(`📭 Skipped-order notice sent to ${supplierEmail}`);
   } catch (err) {
     console.error("❌ Failed to send skipped-order email:", err);

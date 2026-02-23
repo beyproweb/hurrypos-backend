@@ -7,7 +7,7 @@ router.get("/qr-resolve/:code", async (req, res) => {
   try {
     const { code } = req.params;
     const { rows } = await pool.query(
-      "SELECT id, slug, qr_token FROM restaurants WHERE qr_code_id = $1",
+      "SELECT id, slug, qr_token FROM restaurants WHERE qr_code_id = $1 OR slug = $1 OR id::text = $1 LIMIT 1",
       [code]
     );
     if (!rows.length) return res.status(404).json({ error: "Invalid QR code" });
@@ -114,8 +114,8 @@ router.get("/qr-link/:slug", async (req, res) => {
       return res.status(404).json({ error: "Restaurant not found" });
     }
 
-    const { slug: s, qr_code_id } = rows[0];
-    const link = `https://pos.beypro.com/qr-menu/${s}/${qr_code_id}`;
+    const { slug: s } = rows[0];
+    const link = `https://pos.beypro.com/${s}`;
 
     res.json({ success: true, link });
   } catch (err) {
@@ -287,9 +287,42 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
       }
     }
 
+    const defaults = {
+      main_title: "Welcome to Our Restaurant",
+      subtitle: "Fresh • Local • Crafted",
+      tagline: "",
+      phone: "",
+      primary_color: "#4F46E5",
+      hero_slides: [],
+      story_title: "",
+      story_text: "",
+      story_image: "",
+      reviews: [],
+      social_instagram: "",
+      social_tiktok: "",
+      social_website: "",
+      gallery_images: [],
+      show_open_status: true,
+      delivery_time: "25–35 min",
+      pickup_time: "10 min",
+      call_button_enabled: true,
+      enable_popular: true,
+      qr_theme: "auto",
+      loyalty_enabled: false,
+      loyalty_goal: 10,
+      loyalty_reward_text: "Free Menu Item",
+      loyalty_color: "#F59E0B",
+      delivery_enabled: true,
+      table_geo_enabled: false,
+      table_geo_radius_meters: 150,
+    };
+
     res.json({
       success: true,
-      customization: data
+      customization: {
+        ...defaults,
+        ...data,
+      },
     });
 
   } catch (err) {

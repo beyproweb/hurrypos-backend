@@ -2,6 +2,168 @@ const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
 const {
+  getMiddlewareBearerForCallbackUrl,
+  clearMiddlewareBearerForCallbackUrl,
+} = require("../utils/dhMiddlewareToken");
+
+const klog = (...args) =>
+  console.log(new Date().toISOString(), "[kitchen]", ...args);
+
+const parseCallbackUrls = (value) => {
+  if (!value) return null;
+  if (typeof value === "object") return value;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+
+const resolveAcceptUrl = (callbackUrls) => {
+  if (!callbackUrls || typeof callbackUrls !== "object") return null;
+  return (
+    callbackUrls.orderAcceptedUrl ||
+    callbackUrls.orderAcceptedURL ||
+    callbackUrls.order_accepted_url ||
+    callbackUrls.order_accepted ||
+    null
+  );
+};
+
+const resolvePreparedUrl = (callbackUrls) => {
+  if (!callbackUrls || typeof callbackUrls !== "object") return null;
+  return (
+    callbackUrls.orderPreparedUrl ||
+    callbackUrls.orderPreparedUpUrl ||
+    callbackUrls.orderPreparedURL ||
+    callbackUrls.order_prepared_url ||
+    callbackUrls.order_prepared ||
+    null
+  );
+};
+
+const sendExternalOrderAccepted = async (orderId) => {
+  if (!orderId) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT external_callback_urls, external_source, external_id
+         FROM orders
+        WHERE id = $1
+        LIMIT 1`,
+      [orderId]
+    );
+    if (!rows.length) return;
+
+    const order = rows[0];
+    const isExternalOrder = Boolean(
+      order.external_source === "yemeksepeti" ||
+        order.external_callback_urls ||
+        order.external_id
+    );
+    if (!isExternalOrder) return;
+
+    const callbackUrls = parseCallbackUrls(order.external_callback_urls);
+    const acceptUrl = resolveAcceptUrl(callbackUrls);
+    if (!acceptUrl) return;
+
+    let authHeader = await getMiddlewareBearerForCallbackUrl(acceptUrl);
+    klog("📤 Sending external order_accepted (kitchen):", acceptUrl);
+    let response = await fetch(acceptUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(authHeader ? { Authorization: authHeader } : {}),
+      },
+      body: JSON.stringify({ status: "order_accepted" }),
+    });
+    let responseBody = await response.text();
+    if (response.status === 401 && authHeader) {
+      clearMiddlewareBearerForCallbackUrl(acceptUrl);
+      authHeader = await getMiddlewareBearerForCallbackUrl(acceptUrl);
+      response = await fetch(acceptUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authHeader ? { Authorization: authHeader } : {}),
+        },
+        body: JSON.stringify({ status: "order_accepted" }),
+      });
+      responseBody = await response.text();
+    }
+
+    klog(
+      "📥 External order_accepted response (kitchen):",
+      acceptUrl,
+      response.status,
+      responseBody
+    );
+  } catch (err) {
+    klog("❌ External order_accepted failed (kitchen):", orderId, err.message);
+  }
+};
+
+const sendExternalPreparationCompleted = async (orderId) => {
+  if (!orderId) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT external_callback_urls, external_source, external_id
+         FROM orders
+        WHERE id = $1
+        LIMIT 1`,
+      [orderId]
+    );
+    if (!rows.length) return;
+
+    const order = rows[0];
+    const isExternalOrder = Boolean(
+      order.external_source === "yemeksepeti" ||
+        order.external_callback_urls ||
+        order.external_id
+    );
+    if (!isExternalOrder) return;
+
+    const callbackUrls = parseCallbackUrls(order.external_callback_urls);
+    const preparedUrl = resolvePreparedUrl(callbackUrls);
+    if (!preparedUrl) {
+      klog("⚠️ External prep-completed skipped (missing prepared url):", orderId);
+      return;
+    }
+
+    let authHeader = await getMiddlewareBearerForCallbackUrl(preparedUrl);
+    klog("📤 Sending external preparation-completed:", preparedUrl);
+    let response = await fetch(preparedUrl, {
+      method: "POST",
+      headers: {
+        ...(authHeader ? { Authorization: authHeader } : {}),
+      },
+    });
+    let responseBody = await response.text();
+    if (response.status === 401 && authHeader) {
+      clearMiddlewareBearerForCallbackUrl(preparedUrl);
+      authHeader = await getMiddlewareBearerForCallbackUrl(preparedUrl);
+      response = await fetch(preparedUrl, {
+        method: "POST",
+        headers: {
+          ...(authHeader ? { Authorization: authHeader } : {}),
+        },
+      });
+      responseBody = await response.text();
+    }
+
+    klog(
+      "📥 External preparation-completed response:",
+      preparedUrl,
+      response.status,
+      responseBody
+    );
+  } catch (err) {
+    klog("❌ External preparation-completed failed:", orderId, err.message);
+  }
+};
+const {
   emitOrderUpdate,
   emitStockUpdate,
   emitOrderConfirmed,
@@ -11,6 +173,7 @@ const {
 
 const { getIO } = require("../utils/socket");
 const authMiddleware = require("../middleware/authMiddleware");
+const { attachAllowedModules } = require("../middleware/moduleGuard");
 
 router.options("*", (req, res) => res.sendStatus(204));
 
@@ -31,6 +194,28 @@ async function ensureTakeawayColumns() {
     console.warn("⚠️ Unable to ensure takeaway columns for kitchen:", err.message);
   }
 }
+
+let ensuredKitchenTimingColumns = false;
+async function ensureKitchenTimingColumns() {
+  if (ensuredKitchenTimingColumns) return;
+  try {
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS prep_started_at TIMESTAMP`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS estimated_ready_at TIMESTAMP`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS kitchen_delivered_at TIMESTAMP`
+    );
+    ensuredKitchenTimingColumns = true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure kitchen timing columns:", err.message);
+  }
+}
 /* ✅ PUBLIC endpoint used by GlobalOrderAlert */
 router.get("/order-items/preparing", async (req, res) => {
   try {
@@ -49,6 +234,22 @@ router.get("/order-items/preparing", async (req, res) => {
 
 /* 🔒 All routes below require token */
 router.use(authMiddleware);
+router.use(async (req, res, next) => {
+  const allowed = await attachAllowedModules(req);
+
+  // Standalone namespace fallback: if coming through /api/standalone/*
+  // and the user is authenticated for a restaurant, allow kitchen access
+  // without requiring pos_core.
+  const isStandalone = typeof req.originalUrl === "string" && req.originalUrl.startsWith("/api/standalone/");
+  if (isStandalone && req.user?.restaurant_id) {
+    return next();
+  }
+
+  if (Array.isArray(allowed) && !allowed.includes("qr_kitchen") && !allowed.includes("pos_core")) {
+    return res.status(403).json({ error: "MODULE_NOT_ALLOWED" });
+  }
+  return next();
+});
 
 
 // ✅ GET all confirmed or paid order items for the kitchen
@@ -84,6 +285,8 @@ router.get("/kitchen-orders", authMiddleware, async (req, res) => {
         o.takeaway_notes,
         o.id AS order_id,
         o.driver_id,
+        o.external_id,
+        o.external_source,
         s.name AS driver_name,
         p.ingredients AS p_ingredients,
         p.extras AS p_extras,
@@ -98,7 +301,7 @@ router.get("/kitchen-orders", authMiddleware, async (req, res) => {
         AND oi.confirmed = true
         AND oi.kitchen_status IN ('new', 'preparing', 'ready')
         AND o.status IN ('confirmed', 'paid')
-AND o.order_type IN ('phone', 'packet', 'table', 'takeaway')
+AND o.order_type IN ('phone', 'packet', 'table', 'takeaway', 'online', 'delivery')
       ORDER BY o.created_at ASC
       `,
       [restaurantId]
@@ -153,6 +356,8 @@ AND o.order_type IN ('phone', 'packet', 'table', 'takeaway')
         takeaway_notes: row.takeaway_notes,
         order_id: row.order_id,
         driver_id: row.driver_id,
+        external_id: row.external_id,
+        external_source: row.external_source,
         driver_name: row.driver_name,
         restaurant_id: row.restaurant_id,
       }));
@@ -375,6 +580,8 @@ router.put("/order-items/kitchen-status", async (req, res) => {
     return res.status(400).json({ error: "Missing ids or status" });
   }
 
+  await ensureKitchenTimingColumns();
+  const client = await pool.connect();
   try {
     const restaurantId = req.user?.restaurant_id;
     if (!restaurantId) {
@@ -383,30 +590,170 @@ router.put("/order-items/kitchen-status", async (req, res) => {
     }
 
     console.log(`🔧 Updating ${ids.length} item(s) to status '${status}' for restaurant ${restaurantId}`);
+    await client.query("BEGIN");
 
-    const result = await pool.query(
-  `UPDATE order_items AS oi
-   SET kitchen_status = $1
-   FROM orders o
-   WHERE oi.order_id = o.id
-   AND o.restaurant_id = $2
-   AND oi.id = ANY($3::int[])
-   RETURNING oi.id, oi.kitchen_status`,
-  [status, restaurantId, ids]
-);
-
+    const result = await client.query(
+      `UPDATE order_items AS oi
+       SET kitchen_status = $1
+       FROM orders o
+       WHERE oi.order_id = o.id
+       AND o.restaurant_id = $2
+       AND oi.id = ANY($3::int[])
+       RETURNING oi.id, oi.kitchen_status`,
+      [status, restaurantId, ids]
+    );
 
     console.log("✅ Kitchen status DB result:", result.rowCount, "rows updated");
 
     if (result.rowCount === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ error: "No items updated" });
+    }
+
+    const { rows: itemOrders } = await client.query(
+      `SELECT DISTINCT oi.order_id
+       FROM order_items oi
+       JOIN orders o ON oi.order_id = o.id
+       WHERE o.restaurant_id = $1
+         AND oi.id = ANY($2::int[])`,
+      [restaurantId, ids]
+    );
+    const orderIds = itemOrders.map((r) => r.order_id);
+
+    // Fetch order details for notifications
+    const orderDetailsMap = new Map();
+    if (orderIds.length) {
+      const { rows: orderRows } = await client.query(
+        `SELECT id, table_number, customer_name, order_type, external_source, external_id
+         FROM orders
+         WHERE restaurant_id = $1 AND id = ANY($2::int[])`,
+        [restaurantId, orderIds]
+      );
+      orderRows.forEach((row) => {
+        orderDetailsMap.set(row.id, {
+          table_number: row.table_number ?? null,
+          table_label: row.table_number ?? null,
+          customer_name: row.customer_name ?? null,
+          order_type: row.order_type ?? null,
+          external_source: row.external_source ?? null,
+          external_id: row.external_id ?? null,
+        });
+      });
+    }
+
+    const deliveredOrderIds = [];
+    const penaltyPerBatch = (orderIds.length - 1) * 2 * 60; // +2min per extra order in batch
+
+    for (const orderId of orderIds) {
+      const { rows: allItems } = await client.query(
+        `SELECT kitchen_status FROM order_items WHERE order_id = $1`,
+        [orderId]
+      );
+      const statuses = allItems.map((i) => i.kitchen_status);
+
+      if (statuses.includes("preparing")) {
+        const { rows: itemsWithPrep } = await client.query(
+          `SELECT oi.quantity, p.preparation_time
+           FROM order_items oi
+           JOIN orders o ON oi.order_id = o.id
+           JOIN products p ON oi.product_id = p.id
+          WHERE oi.order_id = $1 AND o.restaurant_id = $2`,
+          [orderId, restaurantId]
+        );
+
+        const penaltyPerExtra = 2 * 60; // 2min per extra of same product
+        const itemTimes = [];
+
+        for (const row of itemsWithPrep) {
+          const prep = parseInt(row.preparation_time, 10) || 1; // minutes
+          const qty = parseInt(row.quantity, 10) || 1;
+          const timeForThisProduct = (prep * 60) + ((qty - 1) * penaltyPerExtra);
+          itemTimes.push(timeForThisProduct);
+        }
+
+        let totalSeconds = itemTimes.length ? Math.max(...itemTimes) : 0;
+        if (itemsWithPrep.length >= 3) totalSeconds = Math.round(totalSeconds * 1.2);
+
+        totalSeconds += penaltyPerBatch;
+
+        const estReadyAt = new Date(Date.now() + totalSeconds * 1000);
+
+        await client.query(
+          `UPDATE orders
+           SET prep_started_at = COALESCE(prep_started_at, NOW()),
+               estimated_ready_at = $1
+           WHERE restaurant_id = $2 AND id = $3`,
+          [estReadyAt, restaurantId, orderId]
+        );
+      } else {
+        await client.query(
+          `UPDATE orders SET estimated_ready_at = NULL WHERE restaurant_id = $1 AND id = $2`,
+          [restaurantId, orderId]
+        );
+      }
+
+      if (statuses.length && statuses.every((s) => s === "delivered")) {
+        await client.query(
+          `UPDATE orders SET kitchen_delivered_at = NOW() WHERE restaurant_id = $1 AND id = $2`,
+          [restaurantId, orderId]
+        );
+        deliveredOrderIds.push(orderId);
+      }
+    }
+
+    await client.query("COMMIT");
+
+    const normalizedStatus = String(status).toLowerCase();
+    if (normalizedStatus === "preparing" && orderIds.length) {
+      await Promise.allSettled(orderIds.map((orderId) => sendExternalOrderAccepted(orderId)));
+    }
+    // Notify Delivery Hero (Yemeksepeti): our kitchen flow uses `delivered` to mean "prepared".
+    if (normalizedStatus === "delivered" && deliveredOrderIds.length) {
+      await Promise.allSettled(
+        deliveredOrderIds.map((orderId) => sendExternalPreparationCompleted(orderId))
+      );
     }
 
     // 🔊 Emit socket update
     try {
       const io = require("../utils/socket").getIO();
-      io.emit(`order_${status}`, { ids, status });
-      console.log("📡 Socket emitted:", `order_${status}`);
+      const { emitOrderPreparing, emitOrderDelivered } = require("../utils/realtime");
+      
+      io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+      
+      const normalizedStatus = String(status).toLowerCase();
+      
+      if (normalizedStatus === "preparing") {
+        orderIds.forEach((orderId) => {
+          const details = orderDetailsMap.get(orderId);
+          emitOrderPreparing(io, restaurantId, orderId, {
+            table_number: details?.table_number ?? null,
+            table_label: details?.table_label ?? null,
+            customer_name: details?.customer_name ?? null,
+            order_type: details?.order_type ?? null,
+            external_source: details?.external_source ?? null,
+            external_id: details?.external_id ?? null,
+            order_id: orderId,
+          });
+        });
+      }
+      
+      if (normalizedStatus === "delivered" && deliveredOrderIds.length) {
+        deliveredOrderIds.forEach((orderId) => {
+          const details = orderDetailsMap.get(orderId);
+          emitOrderDelivered(io, restaurantId, orderId, {
+            table_number: details?.table_number ?? null,
+            table_label: details?.table_label ?? null,
+            customer_name: details?.customer_name ?? null,
+            order_type: details?.order_type ?? null,
+            external_source: details?.external_source ?? null,
+            external_id: details?.external_id ?? null,
+            order_id: orderId,
+          });
+        });
+      }
+      
+      console.log("📡 Socket emitted:", `order_${status}`, "and orders_updated");
     } catch (emitErr) {
       console.warn("⚠️ Socket emit failed:", emitErr.message);
     }
@@ -417,8 +764,11 @@ router.put("/order-items/kitchen-status", async (req, res) => {
       updatedItems: result.rows,
     });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("❌ Failed to update kitchen_status:", err);
     res.status(500).json({ error: "Database update error" });
+  } finally {
+    client.release();
   }
 });
 

@@ -32,14 +32,76 @@ module.exports = (io) => {
     return value * factor;
   };
 
+  const toNumberSafe = (value) => {
+    if (value === null || value === undefined) return 0;
+    if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+    const normalized = parseFloat(String(value).replace(",", "."));
+    return Number.isFinite(normalized) ? normalized : 0;
+  };
+
+  const verifyManagerPin = async (client, restaurantId, pin) => {
+    if (!pin) return null;
+
+    // 1) Staff PINs (manager/admin/owner)
+    const staffRes = await client.query(
+      `SELECT id, name, role
+         FROM staff
+        WHERE restaurant_id = $1
+          AND pin = $2
+          AND status = 'active'
+        LIMIT 1`,
+      [restaurantId, String(pin)]
+    );
+    const staff = staffRes.rows[0];
+    if (staff) {
+      const role = String(staff.role || "").toLowerCase();
+      if (["manager", "admin", "owner"].includes(role)) return staff;
+    }
+
+    // 2) Admin user PIN/password fallback (use users table)
+    try {
+      const userRes = await client.query(
+        `SELECT id, full_name AS name, role
+           FROM users
+          WHERE restaurant_id = $1
+            AND password = $2
+          LIMIT 1`,
+        [restaurantId, String(pin)]
+      );
+      const userRow = userRes.rows[0];
+      if (userRow) {
+        const role = String(userRow.role || "").toLowerCase();
+        if (["admin", "owner", "manager"].includes(role)) return userRow;
+      }
+    } catch (err) {
+      // older schemas might not have password exposed; ignore
+      console.warn("PIN fallback on users failed:", err.message);
+    }
+
+    return null;
+  };
+
   // ✅ protect all stock routes
   router.use(authMiddleware);
+
+  let ensuredCleaningColumn = false;
+  async function ensureCleaningColumn(client) {
+    if (ensuredCleaningColumn) return;
+    const runner = client || pool;
+    try {
+      await runner.query(`ALTER TABLE stock ADD COLUMN IF NOT EXISTS is_cleaning_supply BOOLEAN DEFAULT FALSE`);
+      ensuredCleaningColumn = true;
+    } catch (err) {
+      console.warn("⚠️ stock cleaning column ensure failed:", err.message);
+    }
+  }
 
   // ==============================
   // GET /stock - list all stock with price per unit
   // ==============================
   router.get("/", async (req, res) => {
     try {
+      await ensureCleaningColumn();
       const restaurantId = req.user.restaurant_id;
 
       const notifRes = await pool.query(
@@ -57,13 +119,14 @@ module.exports = (io) => {
 
       const result = await pool.query(
         `
-        SELECT s.*, sp.name AS supplier_name,
-          COALESCE(
-            NULLIF(ip1.price_per_unit, 0),
-            NULLIF(ip2.price_per_unit, 0),
-            (SELECT ROUND(total_cost / NULLIF(quantity, 0), 4)
-             FROM transactions
-             WHERE restaurant_id = s.restaurant_id
+	        SELECT s.*, sp.name AS supplier_name,
+	          COALESCE(
+	            NULLIF(ip1.price_per_unit, 0),
+	            NULLIF(ip_items.price_per_unit, 0),
+	            NULLIF(ip2.price_per_unit, 0),
+	            (SELECT ROUND(total_cost / NULLIF(quantity, 0), 4)
+	             FROM transactions
+	             WHERE restaurant_id = s.restaurant_id
                AND LOWER(ingredient) = LOWER(s.name)
                AND unit = s.unit
                AND quantity > 0
@@ -74,22 +137,52 @@ module.exports = (io) => {
         LEFT JOIN suppliers sp
           ON s.supplier_id = sp.id
          AND sp.restaurant_id = s.restaurant_id
-        LEFT JOIN LATERAL (
-          SELECT price AS price_per_unit
-          FROM ingredient_price_history
-          WHERE LOWER(ingredient_name) = LOWER(s.name) AND unit = s.unit
-          ORDER BY changed_at DESC
-          LIMIT 1
-        ) ip1 ON true
-        LEFT JOIN LATERAL (
-          SELECT ROUND(total_cost / NULLIF(quantity, 0), 4) AS price_per_unit
-          FROM transactions
-          WHERE restaurant_id = s.restaurant_id
-            AND LOWER(ingredient) = LOWER(s.name)
-            AND unit = s.unit
-          ORDER BY delivery_date DESC
-          LIMIT 1
-        ) ip2 ON true
+	        LEFT JOIN LATERAL (
+	          SELECT price AS price_per_unit
+	          FROM ingredient_price_history
+	          WHERE LOWER(BTRIM(ingredient_name)) = LOWER(BTRIM(s.name))
+	            AND LOWER(BTRIM(unit)) = LOWER(BTRIM(s.unit))
+	          ORDER BY changed_at DESC, ctid DESC
+	          LIMIT 1
+	        ) ip1 ON true
+	        LEFT JOIN LATERAL (
+	          SELECT
+	            COALESCE(
+	              NULLIF(BTRIM(item->>'price_per_unit'), '')::numeric,
+	              CASE
+	                WHEN COALESCE(NULLIF(BTRIM(item->>'quantity'), '')::numeric, 0) > 0
+	                  THEN ROUND(
+	                    COALESCE(NULLIF(BTRIM(item->>'total_cost'), '')::numeric, 0) /
+	                    NULLIF(NULLIF(BTRIM(item->>'quantity'), '')::numeric, 0),
+	                    4
+	                  )
+	              END,
+	              0
+	            ) AS price_per_unit
+	          FROM transactions t
+	          CROSS JOIN LATERAL jsonb_array_elements(
+	            CASE
+	              WHEN t.items IS NULL THEN '[]'::jsonb
+	              WHEN jsonb_typeof(t.items::jsonb) = 'array' THEN t.items::jsonb
+	              ELSE '[]'::jsonb
+	            END
+	          ) AS item
+	          WHERE t.restaurant_id = s.restaurant_id
+	            AND (s.supplier_id IS NULL OR t.supplier_id = s.supplier_id)
+	            AND LOWER(BTRIM(item->>'ingredient')) = LOWER(BTRIM(s.name))
+	            AND LOWER(BTRIM(item->>'unit')) = LOWER(BTRIM(s.unit))
+	          ORDER BY t.delivery_date DESC NULLS LAST, t.created_at DESC NULLS LAST
+	          LIMIT 1
+	        ) ip_items ON true
+	        LEFT JOIN LATERAL (
+	          SELECT ROUND(total_cost / NULLIF(quantity, 0), 4) AS price_per_unit
+	          FROM transactions
+	          WHERE restaurant_id = s.restaurant_id
+	            AND LOWER(BTRIM(ingredient)) = LOWER(BTRIM(s.name))
+	            AND LOWER(BTRIM(unit)) = LOWER(BTRIM(s.unit))
+	          ORDER BY delivery_date DESC
+	          LIMIT 1
+	        ) ip2 ON true
         WHERE s.restaurant_id = $1
         ORDER BY s.name ASC
         `,
@@ -403,6 +496,464 @@ module.exports = (io) => {
     } catch (err) {
       console.error("❌ Error updating auto-add timestamp:", err);
       res.status(500).json({ error: "Failed to update auto-add timestamp" });
+    }
+  });
+
+  // ==============================
+  // GET /stock/batches/:stockId (tenant-safe)
+  // ==============================
+  router.get("/batches/:stockId", async (req, res) => {
+    const restaurantId = req.user.restaurant_id;
+    const { stockId } = req.params;
+    try {
+      const { rows } = await pool.query(
+        `
+        SELECT id, batch_ref, expiry_date, remaining_quantity, cost_price, created_at
+        FROM stock_batches
+        WHERE restaurant_id = $1
+          AND stock_id = $2
+          AND remaining_quantity > 0
+        ORDER BY expiry_date NULLS LAST, created_at ASC
+        `,
+        [restaurantId, stockId]
+      );
+      res.json({ batches: rows });
+    } catch (err) {
+      console.error("❌ Failed to fetch batches:", err);
+      res.status(500).json({ error: "Failed to fetch batches" });
+    }
+  });
+
+  // ==============================
+  // POST /stock/verify-manager-pin
+  // ==============================
+  router.post("/verify-manager-pin", async (req, res) => {
+    const restaurantId = req.user.restaurant_id;
+    const pin = req.body?.pin;
+    const client = await pool.connect();
+    try {
+      const manager = await verifyManagerPin(client, restaurantId, pin);
+      if (!manager) {
+        return res.status(403).json({ error: "Invalid manager PIN" });
+      }
+      res.json({ ok: true, manager: { id: manager.id, name: manager.name, role: manager.role } });
+    } catch (err) {
+      console.error("❌ Manager PIN check failed:", err);
+      res.status(500).json({ error: "PIN verification failed" });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ==============================
+  // POST /stock/waste  (waste + adjustment corrections)
+  // ==============================
+  router.post("/waste", async (req, res) => {
+    const {
+      stock_id,
+      quantity,
+      reason,
+      notes,
+      other_reason_note,
+      batch_id,
+      expiry_date,
+      supplier_batch_ref,
+      image_url,
+      manager_pin,
+      type,
+    } = req.body || {};
+
+    const restaurantId = req.user.restaurant_id;
+    const qty = toNumberSafe(quantity);
+    const movementType =
+      String(type || "waste").toLowerCase() === "adjustment_correction"
+        ? "adjustment_correction"
+        : "waste";
+
+    if (!(qty > 0)) {
+      return res.status(400).json({ error: "Quantity must be greater than zero." });
+    }
+    if (movementType === "waste" && !reason) {
+      return res.status(400).json({ error: "Waste reason is required." });
+    }
+    if (movementType === "waste" && String(reason).toLowerCase() === "other" && !other_reason_note) {
+      return res.status(400).json({ error: "Other reason note is required." });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const currentRole = String(req.user?.role || "").toLowerCase();
+      const currentUserIsManager = ["manager", "admin", "owner"].includes(currentRole);
+      let manager =
+        currentUserIsManager && req.user
+          ? {
+              id: req.user.id,
+              name:
+                req.user.full_name ||
+                req.user.name ||
+                req.user.email ||
+                req.user.username ||
+                "current user",
+              role: req.user.role || currentRole,
+            }
+          : null;
+
+      if (!manager) {
+        manager = await verifyManagerPin(client, restaurantId, manager_pin);
+      }
+
+      if (!manager) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ error: "Manager PIN required" });
+      }
+
+      const stockRes = await client.query(
+        `SELECT * FROM stock WHERE id = $1 AND restaurant_id = $2 FOR UPDATE`,
+        [stock_id, restaurantId]
+      );
+      const stockRow = stockRes.rows[0];
+      if (!stockRow) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Stock item not found." });
+      }
+
+      const currentQty = toNumberSafe(stockRow.quantity);
+      if (movementType === "waste" && qty > currentQty) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Not enough stock to waste." });
+      }
+
+      const pricePerUnit = toNumberSafe(
+        stockRow.price_per_unit ??
+          stockRow.unit_price ??
+          stockRow.cost_per_unit ??
+          stockRow.purchase_price ??
+          stockRow.cost_price ??
+          stockRow.price
+      );
+
+      const normalizedExpiry = normalizeExpiryDate(expiry_date);
+      const appliedRows = [];
+      let remaining = qty;
+
+      if (movementType === "waste") {
+        const batchRes = await client.query(
+          `
+          SELECT id, remaining_quantity, cost_price, expiry_date, batch_ref
+          FROM stock_batches
+          WHERE restaurant_id = $1 AND stock_id = $2 AND remaining_quantity > 0
+          ORDER BY expiry_date NULLS LAST, created_at ASC
+          FOR UPDATE
+        `,
+          [restaurantId, stock_id]
+        );
+
+        const batches = Array.isArray(batchRes.rows) ? [...batchRes.rows] : [];
+        const targetBatchId = batch_id ? Number(batch_id) : null;
+        if (targetBatchId) {
+          batches.sort((a, b) => {
+            if (a.id === targetBatchId) return -1;
+            if (b.id === targetBatchId) return 1;
+            return 0;
+          });
+        }
+
+        for (const b of batches) {
+          if (remaining <= 0) break;
+          const available = toNumberSafe(b.remaining_quantity);
+          if (!(available > 0)) continue;
+          const useQty = Math.min(available, remaining);
+          const cost = toNumberSafe(b.cost_price) || pricePerUnit;
+          const totalValue = useQty * cost;
+
+          await client.query(
+            `UPDATE stock_batches SET remaining_quantity = remaining_quantity - $1 WHERE id = $2`,
+            [useQty, b.id]
+          );
+
+          appliedRows.push({
+            batch_id: b.id,
+            qty: useQty,
+            cost_price: cost,
+            total_value: totalValue,
+            meta: {
+              supplier_batch_ref: supplier_batch_ref || b.batch_ref || null,
+              expiry_date: b.expiry_date || normalizedExpiry || stockRow.expiry_date || null,
+              other_reason_note:
+                String(reason).toLowerCase() === "other" ? other_reason_note || null : null,
+            },
+          });
+
+          remaining -= useQty;
+        }
+
+        if (remaining > 0) {
+          const fallbackCost = pricePerUnit || 0;
+          appliedRows.push({
+            batch_id: batch_id || null,
+            qty: remaining,
+            cost_price: fallbackCost,
+            total_value: remaining * fallbackCost,
+            meta: {
+              supplier_batch_ref: supplier_batch_ref || null,
+              expiry_date: normalizedExpiry || stockRow.expiry_date || null,
+              other_reason_note:
+                String(reason).toLowerCase() === "other" ? other_reason_note || null : null,
+            },
+          });
+          remaining = 0;
+        }
+
+        const nextQty = Math.max(0, currentQty - qty);
+        await client.query(
+          `UPDATE stock SET quantity = $1 WHERE id = $2 AND restaurant_id = $3`,
+          [nextQty, stock_id, restaurantId]
+        );
+      } else {
+        const cost = pricePerUnit || 0;
+        let correctionBatchId = null;
+        try {
+          const ins = await client.query(
+            `INSERT INTO stock_batches
+             (restaurant_id, stock_id, supplier_id, supplier_name, batch_ref, expiry_date, quantity, remaining_quantity, cost_price, total_cost, source_transaction_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10)
+             RETURNING id`,
+            [
+              restaurantId,
+              stock_id,
+              stockRow.supplier_id || null,
+              stockRow.supplier_name || null,
+              supplier_batch_ref || null,
+              normalizedExpiry || stockRow.expiry_date || null,
+              qty,
+              cost || null,
+              cost ? qty * cost : null,
+              null,
+            ]
+          );
+          correctionBatchId = ins.rows?.[0]?.id || null;
+        } catch (err) {
+          console.warn("⚠️ Failed to insert correction batch:", err.message);
+        }
+
+        const nextQty = currentQty + qty;
+        await client.query(
+          `UPDATE stock
+           SET quantity = $1,
+               expiry_date = CASE
+                 WHEN expiry_date IS NULL THEN $2
+                 WHEN $2 IS NULL THEN expiry_date
+                 ELSE LEAST(expiry_date, $2)
+               END
+           WHERE id = $3 AND restaurant_id = $4`,
+          [nextQty, normalizedExpiry || stockRow.expiry_date || null, stock_id, restaurantId]
+        );
+
+        appliedRows.push({
+          batch_id: correctionBatchId,
+          qty,
+          cost_price: cost,
+          total_value: qty * cost * -1,
+          meta: {
+            supplier_batch_ref: supplier_batch_ref || null,
+            expiry_date: normalizedExpiry || stockRow.expiry_date || null,
+            other_reason_note: null,
+          },
+        });
+      }
+
+      const inserted = [];
+      for (const row of appliedRows) {
+        const ins = await client.query(
+          `INSERT INTO stock_movements
+            (restaurant_id, stock_id, batch_id, movement_type, qty, unit, cost_price, total_value, reason, notes, image_url, user_id, manager_id, meta)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+           RETURNING *`,
+          [
+            restaurantId,
+            stock_id,
+            row.batch_id,
+            movementType,
+            row.qty,
+            stockRow.unit,
+            row.cost_price,
+            row.total_value,
+            reason || movementType,
+            notes || null,
+            image_url || null,
+            req.user?.id || null,
+            manager.id,
+            row.meta ? row.meta : null,
+          ]
+        );
+        inserted.push(ins.rows[0]);
+      }
+
+      await client.query("COMMIT");
+      emitStockUpdate(io, stock_id);
+
+      return res.json({
+        success: true,
+        movement_type: movementType,
+        total_loss_value: inserted
+          .filter((r) => r.movement_type === "waste")
+          .reduce((sum, r) => sum + toNumberSafe(r.total_value), 0),
+        rows: inserted,
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("❌ Waste entry failed:", err);
+      res
+        .status(500)
+        .json({ error: err?.message || "Failed to create waste entry. Please try again." });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ==============================
+  // GET /stock/waste/logs
+  // ==============================
+  router.get("/waste/logs", async (req, res) => {
+    const restaurantId = req.user.restaurant_id;
+    const { from, to, reason } = req.query;
+    const clauses = ["sm.restaurant_id = $1"];
+    const params = [restaurantId];
+    let idx = 2;
+
+    if (from) {
+      clauses.push(`sm.created_at >= $${idx}`);
+      params.push(new Date(from));
+      idx += 1;
+    }
+    if (to) {
+      clauses.push(`sm.created_at <= $${idx}`);
+      params.push(new Date(`${to}T23:59:59.999Z`));
+      idx += 1;
+    }
+    if (reason) {
+      clauses.push(`LOWER(COALESCE(sm.reason, '')) = LOWER($${idx})`);
+      params.push(String(reason));
+      idx += 1;
+    }
+
+    try {
+      const { rows } = await pool.query(
+        `
+        SELECT
+          sm.*,
+          s.name AS product_name,
+          s.unit AS product_unit,
+          b.batch_ref,
+          b.expiry_date
+        FROM stock_movements sm
+        LEFT JOIN stock s ON s.id = sm.stock_id
+        LEFT JOIN stock_batches b ON b.id = sm.batch_id
+        WHERE ${clauses.join(" AND ")}
+        ORDER BY sm.created_at DESC
+        LIMIT 300
+      `,
+        params
+      );
+      res.json({ items: rows });
+    } catch (err) {
+      console.error("❌ Failed to load waste logs:", err);
+      res.status(500).json({ error: "Failed to load waste logs" });
+    }
+  });
+
+  // ==============================
+  // GET /stock/waste/metrics
+  // ==============================
+  router.get("/waste/metrics", async (req, res) => {
+    const restaurantId = req.user.restaurant_id;
+    const { from, to } = req.query;
+
+    const start =
+      from && !Number.isNaN(new Date(from).getTime())
+        ? new Date(from)
+        : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const end =
+      to && !Number.isNaN(new Date(to).getTime())
+        ? new Date(`${to}T23:59:59.999Z`)
+        : new Date();
+
+    try {
+      const [wasteAgg, salesAgg, topProducts, reasonRows] = await Promise.all([
+        pool.query(
+          `
+          SELECT
+            COALESCE(SUM(total_value), 0) AS total_waste,
+            COUNT(*) AS waste_count
+          FROM stock_movements
+          WHERE restaurant_id = $1
+            AND movement_type = 'waste'
+            AND created_at BETWEEN $2 AND $3
+        `,
+          [restaurantId, start, end]
+        ),
+        pool.query(
+          `
+          SELECT COALESCE(SUM(total), 0) AS total_sales
+          FROM orders
+          WHERE restaurant_id = $1
+            AND (is_paid = TRUE OR LOWER(COALESCE(status, '')) IN ('paid', 'closed', 'confirmed'))
+            AND created_at BETWEEN $2 AND $3
+        `,
+          [restaurantId, start, end]
+        ),
+        pool.query(
+          `
+          SELECT
+            sm.stock_id,
+            s.name AS product_name,
+            SUM(sm.qty) AS total_qty,
+            SUM(sm.total_value) AS total_loss
+          FROM stock_movements sm
+          LEFT JOIN stock s ON s.id = sm.stock_id
+          WHERE sm.restaurant_id = $1
+            AND sm.movement_type = 'waste'
+            AND sm.created_at BETWEEN $2 AND $3
+          GROUP BY sm.stock_id, s.name
+          ORDER BY total_loss DESC NULLS LAST
+          LIMIT 5
+        `,
+          [restaurantId, start, end]
+        ),
+        pool.query(
+          `
+          SELECT
+            COALESCE(NULLIF(reason, ''), 'unspecified') AS reason,
+            SUM(total_value) AS total_loss,
+            SUM(qty) AS total_qty
+          FROM stock_movements
+          WHERE restaurant_id = $1
+            AND movement_type = 'waste'
+            AND created_at BETWEEN $2 AND $3
+          GROUP BY COALESCE(NULLIF(reason, ''), 'unspecified')
+          ORDER BY total_loss DESC NULLS LAST
+        `,
+          [restaurantId, start, end]
+        ),
+      ]);
+
+      const totalWaste = toNumberSafe(wasteAgg.rows?.[0]?.total_waste);
+      const totalSales = toNumberSafe(salesAgg.rows?.[0]?.total_sales);
+      const wastePctOfSales = totalSales > 0 ? (totalWaste / totalSales) * 100 : 0;
+
+      res.json({
+        from: start,
+        to: end,
+        totalWaste,
+        wastePctOfSales,
+        topProducts: topProducts.rows || [],
+        byReason: reasonRows.rows || [],
+      });
+    } catch (err) {
+      console.error("❌ Failed to load waste metrics:", err);
+      res.status(500).json({ error: "Failed to load waste metrics" });
     }
   });
 

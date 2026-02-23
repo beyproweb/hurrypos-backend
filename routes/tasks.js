@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require("../db");
 const { getIO } = require("../utils/socket");
+const { saveNotification } = require("../utils/realtime");
 const OpenAI = require("openai");
 const authMiddleware = require("../middleware/authMiddleware");
 
@@ -143,6 +144,20 @@ User said (in ${languageLabel}): "${message}"
     const newTask = insert.rows[0];
     getIO(req)?.emit("task_created", newTask);
 
+    saveNotification({
+      restaurantId,
+      message: `📝 New task: ${newTask.title}`,
+      type: "task",
+      stockId: null,
+      extra: {
+        taskId: newTask.id,
+        status: newTask.status,
+        assigned_to: newTask.assigned_to ?? null,
+        due_at: newTask.due_at ?? null,
+        priority: newTask.priority ?? null,
+      },
+    });
+
     return res.status(201).json({ status: "saved", task: newTask });
   } catch (err) {
     console.error("❌ Error in /voice-command:", err);
@@ -221,6 +236,20 @@ router.post("/tasks", async (req, res) => {
 
     const newTask = insert.rows[0];
     getIO(req)?.emit("task_created", newTask);
+
+    saveNotification({
+      restaurantId,
+      message: `📝 New task: ${newTask.title}`,
+      type: "task",
+      stockId: null,
+      extra: {
+        taskId: newTask.id,
+        status: newTask.status,
+        assigned_to: newTask.assigned_to ?? null,
+        due_at: newTask.due_at ?? null,
+        priority: newTask.priority ?? null,
+      },
+    });
     res.status(201).json(newTask);
   } catch (err) {
     console.error("❌ Error saving task:", err);
@@ -245,6 +274,18 @@ router.patch("/tasks/:id/start", async (req, res) => {
       return res.status(404).json({ error: "Task not found" });
     }
     getIO(req)?.emit("task_updated", result.rows[0]);
+
+    const completedTask = result.rows[0];
+    saveNotification({
+      restaurantId,
+      message: `✅ Task completed: ${completedTask.title}`,
+      type: "task",
+      stockId: null,
+      extra: {
+        taskId: completedTask.id,
+        status: completedTask.status,
+      },
+    });
     res.json(result.rows[0]);
   } catch (err) {
     console.error("❌ Error starting task:", err);

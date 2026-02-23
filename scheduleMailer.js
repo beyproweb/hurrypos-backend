@@ -1,12 +1,90 @@
-const pool = require("./db");
+require("dotenv").config();
+
+const { pool } = require("./db");
 const { sendEmail } = require("./utils/notifications");
 const sendNoOrderEmail = require("./utils/sendNoOrderEmail");
 const { loadLocalizationForRestaurant } = require("./utils/localization");
 const { getCurrencyMeta } = require("./utils/currency");
-require("dotenv").config();
 const dayjs = require("dayjs");
 
 console.log("⏰ Scheduled mailer started. Waiting for carts...");
+
+const restaurantContactCache = new Map();
+async function getRestaurantContact(restaurantId) {
+  const key = String(restaurantId);
+  if (restaurantContactCache.has(key)) return restaurantContactCache.get(key);
+
+  const contact = { email: null, restaurantName: null, ownerName: null };
+
+  try {
+    const res = await pool.query(
+      `
+      SELECT
+        r.name AS restaurant_name,
+        u.email AS owner_email,
+        u.full_name AS owner_name
+      FROM restaurants r
+      LEFT JOIN users u ON u.id = r.owner_id
+      WHERE r.id = $1
+      LIMIT 1
+      `,
+      [restaurantId]
+    );
+
+    const row = res.rows?.[0];
+    if (row) {
+      contact.restaurantName = row.restaurant_name || null;
+      contact.ownerName = row.owner_name || null;
+      contact.email = row.owner_email || null;
+    }
+
+    if (!contact.email) {
+      const fallback = await pool.query(
+        `
+        SELECT email, full_name AS owner_name
+        FROM users
+        WHERE restaurant_id = $1
+          AND email IS NOT NULL
+          AND TRIM(email) <> ''
+        ORDER BY (role = 'admin') DESC, id ASC
+        LIMIT 1
+        `,
+        [restaurantId]
+      );
+      const fb = fallback.rows?.[0];
+      if (fb) {
+        contact.email = fb.email || contact.email;
+        contact.ownerName = fb.owner_name || contact.ownerName;
+      }
+    }
+  } catch (err) {
+    console.warn("⚠️ Failed to load restaurant contact:", err?.message || err);
+  }
+
+  restaurantContactCache.set(key, contact);
+  return contact;
+}
+
+function computeNextScheduledAt(currentScheduledAt, repeatType) {
+  const now = dayjs();
+  let next = dayjs(currentScheduledAt);
+  if (!next.isValid()) next = now;
+
+  const type = String(repeatType || "").toLowerCase().trim() || "weekly";
+  const step = (date) => {
+    if (type === "daily") return date.add(1, "day");
+    if (type === "monthly") return date.add(1, "month");
+    return date.add(7, "day"); // weekly/default
+  };
+
+  let guard = 0;
+  while (!next.isAfter(now) && guard < 60) {
+    next = step(next);
+    guard += 1;
+  }
+
+  return next.toDate();
+}
 
 const checkItemRecentlyCritical = async (restaurantId, stock_id) => {
   const res = await pool.query(
@@ -48,6 +126,8 @@ const runScheduledMailer = async () => {
 
     for (const cart of cartRes.rows) {
       const { restaurant_id } = cart;
+      const restaurantContact = await getRestaurantContact(restaurant_id);
+      const replyTo = restaurantContact?.email || undefined;
 
       const itemsRes = await pool.query(
         `SELECT * FROM supplier_cart_items
@@ -56,67 +136,82 @@ const runScheduledMailer = async () => {
       );
       const items = itemsRes.rows;
 
-      if (items.length === 0) {
-        console.warn(`⚠️ Cart ${cart.id} has no items, skipping`);
-        continue;
-      }
+      const hasAnyItems = Array.isArray(items) && items.length > 0;
 
-      let hasCritical = false;
-      for (const item of items) {
-        const critical = await checkItemRecentlyCritical(restaurant_id, item.stock_id);
-        if (critical) {
-          hasCritical = true;
-          break;
-        }
-      }
+      if (!hasAnyItems) {
+        console.log(`⏭️ Cart ${cart.id} has no items (no-order week)`);
 
-      if (!hasCritical) {
-        console.log(`⏭️ Skipping cart ${cart.id} (no recently critical items)`);
-
-        // 📨 Notify supplier (tenant-safe)
         if (cart.email) {
-          await sendNoOrderEmail(cart.supplier_name, cart.email, cart.scheduled_at);
+          await sendNoOrderEmail(cart.supplier_name, cart.email, cart.scheduled_at, {
+            replyTo,
+            restaurantName: restaurantContact?.restaurantName || null,
+          });
           console.log(`📭 No-order email sent to: ${cart.email}`);
+        } else {
+          console.warn(`⚠️ Cart ${cart.id} has no supplier email.`);
+        }
+      } else {
+        const restaurantContactLine = replyTo
+          ? `<p><strong>Restaurant contact:</strong> <a href="mailto:${replyTo}">${replyTo}</a></p>`
+          : "";
+        const htmlBody = `
+          <h2>📦 New Supplier Order</h2>
+          ${restaurantContactLine}
+          <p><strong>Supplier:</strong> ${cart.supplier_name}</p>
+          <p><strong>Scheduled for:</strong> ${new Date(cart.scheduled_at).toLocaleString("tr-TR", { hour12: false })}</p>
+          <h3>📝 Products:</h3>
+          <ul>
+            ${items
+              .map(
+                (item) =>
+                  `<li>${item.product_name} — ${item.quantity} ${item.unit}</li>`
+              )
+              .join("")}
+          </ul>
+          <p style="margin-top:1.5em;">Best regards,<br><strong>Beypro</strong></p>
+        `;
+
+        if (cart.email) {
+          await sendEmail(cart.email, `📦 Beypro Scheduled Order`, htmlBody, true, {
+            replyTo,
+            fromName: "Beypro Orders",
+          });
+          console.log(`✅ Email sent to: ${cart.email}`);
+        } else {
+          console.warn(`⚠️ Cart ${cart.id} has no supplier email.`);
         }
 
-        // 🗃️ Archive as skipped
-        await pool.query(
-          `UPDATE supplier_carts
-           SET archived = true, skipped = true
-           WHERE restaurant_id=$1 AND id=$2`,
-          [restaurant_id, cart.id]
-        );
-
-        continue;
+        // Reset auto-add flags for all items (same as manual send endpoint)
+        for (const item of items) {
+          if (!item.stock_id) continue;
+          await pool.query(
+            `UPDATE stock
+             SET auto_added_to_cart=FALSE, last_auto_add_at=NULL
+             WHERE restaurant_id=$1 AND id=$2`,
+            [restaurant_id, item.stock_id]
+          );
+        }
       }
 
-      // 📨 Send real order email
-      const htmlBody = `
-        <h2>📦 New Supplier Order</h2>
-        <p><strong>Supplier:</strong> ${cart.supplier_name}</p>
-        <p><strong>Scheduled for:</strong> ${new Date(cart.scheduled_at).toLocaleString("tr-TR", { hour12: false })}</p>
-        <h3>📝 Products:</h3>
-        <ul>
-          ${items.map(item => `<li>${item.product_name} — ${item.quantity} ${item.unit}</li>`).join("")}
-        </ul>
-        <p style="margin-top:1.5em;">Best regards,<br><strong>Beypro</strong></p>
-      `;
-
-      if (cart.email) {
-        await sendEmail({ restaurant_id }, cart.email, `📦 Beypro Scheduled Order`, htmlBody, true);
-        console.log(`✅ Email sent to: ${cart.email}`);
-      } else {
-        console.warn(`⚠️ Cart ${cart.id} has no supplier email.`);
-      }
-
-      // 🗃️ Archive as sent
+      // Clear items so next cycle starts empty
       await pool.query(
-        `UPDATE supplier_carts
-         SET archived = true, skipped = false
-         WHERE restaurant_id=$1 AND id=$2`,
+        `DELETE FROM supplier_cart_items
+         WHERE restaurant_id=$1 AND cart_id=$2`,
         [restaurant_id, cart.id]
       );
-      console.log(`📦 Archived cart ${cart.id}`);
+
+      // Keep the cart active but move schedule forward, so auto-send stays enabled in UI.
+      const nextScheduledAt = computeNextScheduledAt(cart.scheduled_at, cart.repeat_type);
+      await pool.query(
+        `UPDATE supplier_carts
+         SET scheduled_at = $3,
+             skipped = $4,
+             archived = false,
+             confirmed = true
+         WHERE restaurant_id=$1 AND id=$2`,
+        [restaurant_id, cart.id, nextScheduledAt, !hasAnyItems]
+      );
+      console.log(`📆 Rescheduled cart ${cart.id} -> ${nextScheduledAt.toISOString()}`);
     }
   } catch (err) {
     console.error("❌ Scheduled mailer error:", err);
@@ -217,7 +312,11 @@ const runScheduledPayroll = async () => {
           <p style="margin-top:2em;">Thank you for your dedication!<br><strong>Beypro</strong></p>
         `;
 
-        await sendEmail({ restaurant_id }, email, subject, html, true);
+        const restaurantContact = await getRestaurantContact(restaurant_id);
+        await sendEmail(email, subject, html, true, {
+          replyTo: restaurantContact?.email || undefined,
+          fromName: "Beypro Payroll",
+        });
         console.log(`📧 Auto-payroll email sent to ${email}`);
       } else {
         console.warn(`⚠️ No email found for staff ${staff_id}`);
