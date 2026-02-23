@@ -1,4 +1,0 @@
-Bridge test file
-version: 1.2.2
-timestamp: 20250910-185147
-bridge-mini commit: f44a5d7

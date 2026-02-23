@@ -164,17 +164,77 @@ const DEFAULT_RECEIPT_LAYOUT = {
   itemFontSize: 14,
 };
 
+const DEFAULT_KITCHEN_LAYOUT = {
+  headerTitle: "KITCHEN",
+  headerSubtitle: "",
+  alignment: "left",
+  paperWidth: "58mm",
+  spacing: 1.15,
+  itemFontSize: 15,
+  showLogo: false,
+  showHeader: true,
+  showInvoiceNumber: true,
+  showTableNumber: true,
+  showStaffName: false,
+  showPacketCustomerInfo: true,
+  showNotes: true,
+  showPrices: false,
+  showTotals: false,
+  footerText: "",
+};
+
 const getDefaultPrinterConfig = () => ({
   receiptPrinter: null,
   kitchenPrinter: null,
   layout: { ...DEFAULT_RECEIPT_LAYOUT },
+  kitchenLayout: { ...DEFAULT_KITCHEN_LAYOUT },
   defaults: {
     cut: true,
     cashDrawer: false,
   },
   customLines: [],
+  kitchenCustomLines: [],
   lastSynced: new Date().toISOString(),
 });
+
+function normalizePrinterSettings(payload = {}, updateTimestamp = false) {
+  const layoutOverride =
+    payload.layout && typeof payload.layout === "object" ? payload.layout : {};
+  const kitchenLayoutOverride =
+    payload.kitchenLayout && typeof payload.kitchenLayout === "object"
+      ? payload.kitchenLayout
+      : {};
+  const defaultsOverride =
+    payload.defaults && typeof payload.defaults === "object" ? payload.defaults : {};
+
+  const base = getDefaultPrinterConfig();
+  const merged = {
+    ...base,
+    ...payload,
+    defaults: {
+      ...base.defaults,
+      ...defaultsOverride,
+    },
+    layout: {
+      ...DEFAULT_RECEIPT_LAYOUT,
+      ...layoutOverride,
+    },
+    kitchenLayout: {
+      ...DEFAULT_KITCHEN_LAYOUT,
+      ...kitchenLayoutOverride,
+    },
+  };
+
+  merged.customLines = Array.isArray(payload.customLines) ? payload.customLines : merged.customLines;
+  merged.kitchenCustomLines = Array.isArray(payload.kitchenCustomLines)
+    ? payload.kitchenCustomLines
+    : merged.kitchenCustomLines;
+  merged.lastSynced = payload.lastSynced || base.lastSynced;
+  if (updateTimestamp) {
+    merged.lastSynced = new Date().toISOString();
+  }
+  return merged;
+}
 
 // ---------- routes ----------
 
@@ -537,7 +597,8 @@ router.get("/sync", authMiddleware, async (req, res) => {
       [restaurantId]
     );
 
-    const settings = result.rows[0]?.settings || getDefaultPrinterConfig();
+    const raw = result.rows[0]?.settings || {};
+    const settings = normalizePrinterSettings(raw, false);
     res.json({ ok: true, settings });
   } catch (err) {
     console.error("❌ Failed to fetch printer settings:", err);
@@ -549,8 +610,6 @@ router.post("/sync", authMiddleware, async (req, res) => {
   const restaurantId = req.user?.restaurant_id;
   const userId = req.user?.id; // Extract user_id from auth context
   const payload = req.body || {};
-  const layoutOverride =
-    payload.layout && typeof payload.layout === "object" ? payload.layout : {};
 
   if (!restaurantId) {
     return res.status(400).json({ ok: false, error: "restaurant_id is required" });
@@ -560,15 +619,7 @@ router.post("/sync", authMiddleware, async (req, res) => {
     return res.status(400).json({ ok: false, error: "user_id is required" });
   }
 
-  const settings = {
-    ...getDefaultPrinterConfig(),
-    ...payload,
-    layout: {
-      ...DEFAULT_RECEIPT_LAYOUT,
-      ...layoutOverride,
-    },
-    lastSynced: new Date().toISOString(),
-  };
+  const settings = normalizePrinterSettings(payload, true);
 
   try {
     await pool.query(

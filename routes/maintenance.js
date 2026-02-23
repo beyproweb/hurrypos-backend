@@ -4,6 +4,7 @@ const fs = require("fs");
 const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
+const { saveNotification } = require("../utils/realtime");
 const auth = require("../middleware/authMiddleware");
 const multer = require("multer");
 
@@ -114,6 +115,14 @@ router.post("/", upload.single("photo"), async (req, res) => {
 
     const row = insert.rows[0];
     req.app.get("io")?.to(`restaurant_${restaurantId}`).emit("maintenance_created", row);
+
+    saveNotification({
+      restaurantId,
+      message: `🛠️ Maintenance created: ${row.title}`,
+      type: "maintenance",
+      stockId: null,
+      extra: { issueId: row.id, status: row.status, priority: row.priority },
+    });
     res.status(201).json(row);
   } catch (err) {
     console.error("❌ maintenance create error:", err);
@@ -178,6 +187,17 @@ router.put("/:id", async (req, res) => {
 
     const updated = rows[0];
     req.app.get("io")?.to(`restaurant_${restaurantId}`).emit("maintenance_updated", updated);
+
+    if (allowed.status) {
+      const verb = updated.status === "resolved" ? "resolved" : `set to ${updated.status}`;
+      saveNotification({
+        restaurantId,
+        message: `🛠️ Maintenance ${verb}: ${updated.title}`,
+        type: "maintenance",
+        stockId: null,
+        extra: { issueId: updated.id, status: updated.status, priority: updated.priority },
+      });
+    }
     res.json(updated);
   } catch (err) {
     console.error("❌ maintenance update error:", err);
@@ -199,6 +219,14 @@ router.patch("/:id/start", async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: "Issue not found" });
     req.app.get("io")?.to(`restaurant_${restaurantId}`).emit("maintenance_updated", rows[0]);
+
+    saveNotification({
+      restaurantId,
+      message: `🛠️ Maintenance started: ${rows[0].title}`,
+      type: "maintenance",
+      stockId: null,
+      extra: { issueId: rows[0].id, status: rows[0].status, priority: rows[0].priority },
+    });
     res.json(rows[0]);
   } catch (err) {
     console.error("❌ maintenance start error:", err);
@@ -219,6 +247,14 @@ router.patch("/:id/resolve", async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: "Issue not found" });
     req.app.get("io")?.to(`restaurant_${restaurantId}`).emit("maintenance_updated", rows[0]);
+
+    saveNotification({
+      restaurantId,
+      message: `✅ Maintenance resolved: ${rows[0].title}`,
+      type: "maintenance",
+      stockId: null,
+      extra: { issueId: rows[0].id, status: rows[0].status, priority: rows[0].priority },
+    });
     res.json(rows[0]);
   } catch (err) {
     console.error("❌ maintenance resolve error:", err);
@@ -237,6 +273,14 @@ router.delete("/:id", async (req, res) => {
     );
     if (!rowCount) return res.status(404).json({ error: "Issue not found" });
     req.app.get("io")?.to(`restaurant_${restaurantId}`).emit("maintenance_deleted", { id });
+
+    saveNotification({
+      restaurantId,
+      message: `🗑️ Maintenance deleted (#${id})`,
+      type: "maintenance",
+      stockId: null,
+      extra: { issueId: id, status: "deleted" },
+    });
     res.json({ success: true });
   } catch (err) {
     console.error("❌ maintenance delete error:", err);

@@ -358,6 +358,7 @@ function buildTransporter() {
 
   // Explicit debug mode
   if (strategy === "json") {
+    // Keep: Useful for production debugging
     console.warn("📬 Email campaigns using jsonTransport (SMTP_STRATEGY=json)");
     return nodemailer.createTransport({ jsonTransport: true });
   }
@@ -367,12 +368,16 @@ function buildTransporter() {
   const pass = truthyStr(SMTP_PASS);
 
   if (url) {
-    console.log("📬 Email campaigns using SMTP_URL transport");
+    if (process.env.NODE_ENV !== "production") {
+      console.log("📬 Email campaigns using SMTP_URL transport");
+    }
     return nodemailer.createTransport(url);
   }
 
   if (truthyStr(SMTP_SERVICE) && user && pass) {
-    console.log(`📬 Email campaigns using nodemailer service=${truthyStr(SMTP_SERVICE)}`);
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`📬 Email campaigns using nodemailer service=${truthyStr(SMTP_SERVICE)}`);
+    }
     return nodemailer.createTransport({
       service: truthyStr(SMTP_SERVICE),
       auth: { user, pass },
@@ -396,6 +401,7 @@ function buildTransporter() {
   }
 
   if (!host || !user || !pass) {
+    // Keep: Useful for production debugging
     console.warn(
       "⚠️ Email campaigns falling back to jsonTransport because SMTP_HOST/USER/PASS are not fully configured."
     );
@@ -710,6 +716,7 @@ router.post("/email", async (req, res) => {
         if (ins.rows[0].sent_at) insertedSentAt = ins.rows[0].sent_at;
       }
     } catch (err) {
+      // Keep: Useful for production debugging
       console.error("❌ DB insert failed (campaign):", err);
     }
 
@@ -723,9 +730,11 @@ router.post("/email", async (req, res) => {
       "no-reply@example.com";
     const from = fromName ? `"${fromName}" <${senderEmail}>` : senderEmail;
 
-    console.log(
-      `📣 Email campaign triggered — restaurant=${restaurantIdStr}, subject="${subject}", recipients=${rcpts.length}`
-    );
+    if (process.env.NODE_ENV !== "production") {
+      console.log(
+        `📣 Email campaign triggered — restaurant=${restaurantIdStr}, subject="${subject}", recipients=${rcpts.length}`
+      );
+    }
 
     let sent = 0;
     const failures = [];
@@ -749,6 +758,7 @@ router.post("/email", async (req, res) => {
         sent += 1;
       } catch (e) {
         failures.push({ email: rcpt, error: e?.message || String(e) });
+        // Keep: Useful for production debugging
         console.warn(`⚠️ Email send failed for ${rcpt}:`, e?.message || e);
       }
     }
@@ -761,12 +771,15 @@ router.post("/email", async (req, res) => {
         );
       }
     } catch (err) {
+      // Keep: Useful for production debugging
       console.error("⚠️ Failed to update sent_count:", err);
     }
 
-    console.log(
-      `📬 Email campaign ${campaignId} finished: sent=${sent}, failed=${failures.length}`
-    );
+    if (process.env.NODE_ENV !== "production") {
+      console.log(
+        `📬 Email campaign ${campaignId} finished: sent=${sent}, failed=${failures.length}`
+      );
+    }
 
     return res.json({
       ok: true,
@@ -777,6 +790,7 @@ router.post("/email", async (req, res) => {
       db: { tablesOk, dbInsertOk },
     });
   } catch (err) {
+    // Keep: Useful for production debugging
     console.error("🔥 Campaign email route error:", err);
     return res.status(400).json({
       ok: false,
@@ -927,6 +941,7 @@ router.get("/stats/last", async (req, res) => {
       sent_at: camp.sent_at,
     });
    } catch (err) {
+    // Keep: Useful for production debugging
     console.error("❌ stats/last error:", err);
     return res.json({
       ok: true,
@@ -1091,6 +1106,7 @@ router.get("/list", async (req, res) => {
     );
     rows = r?.rows || [];
   } catch (err) {
+    // Keep: Useful for production debugging
     console.error("⚠️ campaigns/list DB query failed:", err);
   }
 
@@ -1185,6 +1201,7 @@ router.get("/events/recent", async (req, res) => {
 
     res.json({ ok: true, db: r?.rows || [], memory: mem });
   } catch (e) {
+    // Keep: Useful for production debugging
     console.error("❌ events/recent error:", e);
     res.json({ ok: true, db: [], memory: [] });
   }
@@ -1360,6 +1377,7 @@ router.post("/whatsapp", authMiddleware, async (req, res) => {
         insertedAt = ins.rows[0].sent_at || insertedAt;
       }
     } catch (err) {
+      // Keep: Useful for production debugging
       console.error("❌ Failed to insert WhatsApp campaign:", err);
     }
 
@@ -1386,11 +1404,13 @@ router.post("/whatsapp", authMiddleware, async (req, res) => {
           );
           rememberEvent(campaignId, "sent", normalized);
         } catch (err) {
+          // Keep: Useful for production debugging
           console.warn("⚠️ Failed to insert campaign_event for", normalized, err);
         }
       } catch (err) {
         failureCount += 1;
         const errMsg = err?.response?.data?.error?.message || err?.message || String(err);
+        // Keep: Useful for production debugging
         console.warn(`⚠️ WhatsApp send failed for ${normalized}:`, errMsg);
         results.push({ phone: normalized, status: "failed", error: errMsg });
       }
@@ -1405,6 +1425,7 @@ router.post("/whatsapp", authMiddleware, async (req, res) => {
         );
       }
     } catch (err) {
+      // Keep: Useful for production debugging
       console.warn("⚠️ Failed to update WhatsApp campaign sent_count:", err);
     }
 
@@ -1417,6 +1438,7 @@ router.post("/whatsapp", authMiddleware, async (req, res) => {
       results,
     });
   } catch (err) {
+    // Keep: Useful for production debugging
     console.error("❌ WhatsApp campaign send error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1449,6 +1471,7 @@ router.get("/whatsapp/qr", authMiddleware, async (req, res) => {
       return res.json({ ok: true, status: "waiting" });
     }
   } catch (err) {
+    // Keep: Useful for production debugging
     console.error("❌ QR fetch error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1489,6 +1512,7 @@ router.delete("/clear-all", authMiddleware, async (req, res) => {
       message: "All campaigns cleared successfully.",
     });
   } catch (err) {
+    // Keep: Useful for production debugging
     console.error("❌ Failed to clear campaigns:", err);
     return res.status(500).json({ ok: false, error: err.message });
   }

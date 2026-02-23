@@ -3,7 +3,14 @@ const { pool } = require("../db");
 const { getIO } = require("../utils/socket");
 
 function startKitchenTimersJob() {
-  setInterval(async () => {
+  const BASE_INTERVAL_MS = 5000;
+  const MAX_BACKOFF_MS = 60000;
+  let isRunning = false;
+  let failureCount = 0;
+
+  const tick = async () => {
+    if (isRunning) return;
+    isRunning = true;
     try {
       const { rows: restaurants } = await pool.query(
         `SELECT DISTINCT restaurant_id FROM kitchen_timers`
@@ -26,10 +33,22 @@ function startKitchenTimersJob() {
 
         getIO().to(`restaurant_${restaurant_id}`).emit("kitchen_timers_update", timers);
       }
+      failureCount = 0;
     } catch (err) {
+      failureCount += 1;
       console.error("Kitchen timer tick job error:", err.message);
+    } finally {
+      isRunning = false;
+      const backoffFactor = Math.min(failureCount, 4);
+      const nextDelay = Math.min(
+        BASE_INTERVAL_MS * Math.pow(2, backoffFactor),
+        MAX_BACKOFF_MS
+      );
+      setTimeout(tick, nextDelay);
     }
-  }, 5000); // broadcast every 5s
+  };
+
+  setTimeout(tick, BASE_INTERVAL_MS);
 }
 
 module.exports = { startKitchenTimersJob };

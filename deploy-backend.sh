@@ -116,7 +116,7 @@ case $choice in
         echo "   https://dashboard.render.com"
         echo ""
         echo -e "${BLUE}Backend API endpoint:${NC}"
-        echo "   https://hurrypos-backend.onrender.com/api"
+        echo "   https://api.beypro.com/api"
         echo ""
         echo "⏱️  Expected deployment time: 2-5 minutes"
         ;;
@@ -154,7 +154,7 @@ case $choice in
         
         # Verify connectivity
         echo "Testing backend connectivity..."
-        if curl -s https://hurrypos-backend.onrender.com/api/printer-settings/status > /dev/null; then
+        if curl -s https://api.beypro.com/api/printer-settings/status > /dev/null; then
             echo -e "${GREEN}✅ Backend is online${NC}"
         else
             echo -e "${RED}❌ Backend is offline${NC}"
@@ -196,7 +196,7 @@ case $choice in
         
         echo ""
         echo "Backend connectivity:"
-        if curl -s https://hurrypos-backend.onrender.com/api/printer-settings/status > /dev/null 2>&1; then
+        if curl -s https://api.beypro.com/api/printer-settings/status > /dev/null 2>&1; then
             echo -e "  ${GREEN}✅ Online${NC}"
         else
             echo -e "  ${RED}❌ Offline${NC}"

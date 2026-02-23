@@ -4,7 +4,11 @@ const { pool } = require("../db");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const authMiddleware = require("../middleware/authMiddleware");
+const { generateUniqueRestaurantSlug } = require("../utils/restaurantSlug");
 
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
 
 /* ----------------------------- REGISTER ----------------------------- */
 router.post("/register", async (req, res) => {
@@ -16,7 +20,10 @@ router.post("/register", async (req, res) => {
       return res.status(400).json({ success: false, error: "Missing required fields" });
     }
 
-    const existing = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    const normalizedEmail = normalizeEmail(email);
+    const existing = await pool.query("SELECT id FROM users WHERE LOWER(TRIM(email)) = $1", [
+      normalizedEmail,
+    ]);
     if (existing.rowCount > 0) {
       return res.status(409).json({ success: false, error: "Email already registered" });
     }
@@ -29,16 +36,17 @@ router.post("/register", async (req, res) => {
       `INSERT INTO users (email, full_name, password_hash, business_name, subscription_plan, role)
        VALUES ($1,$2,$3,$4,$5,'admin')
        RETURNING id`,
-      [email, full_name, password_hash, business_name, subscription_plan || "free"]
+      [normalizedEmail, full_name, password_hash, business_name, subscription_plan || "free"]
     );
     const userId = userRes.rows[0].id;
 
     // Create restaurant
+    const restaurantSlug = await generateUniqueRestaurantSlug(client, business_name);
     const restRes = await client.query(
-      `INSERT INTO restaurants (name, plan, billing_cycle, owner_id)
-       VALUES ($1,$2,'monthly',$3)
+      `INSERT INTO restaurants (name, slug, plan, billing_cycle, owner_id)
+       VALUES ($1,$2,$3,'monthly',$4)
        RETURNING id`,
-      [business_name, subscription_plan || "free", userId]
+      [business_name, restaurantSlug, subscription_plan || "free", userId]
     );
     const restaurantId = restRes.rows[0].id;
 
@@ -85,7 +93,10 @@ router.post("/register", async (req, res) => {
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
   try {
-    const userRes = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    const normalizedEmail = normalizeEmail(email);
+    const userRes = await pool.query("SELECT * FROM users WHERE LOWER(TRIM(email))=$1", [
+      normalizedEmail,
+    ]);
     const user = userRes.rows[0];
     if (!user) return res.status(401).json({ success: false, error: "User not found" });
 
@@ -198,7 +209,7 @@ router.put("/me", authMiddleware, async (req, res) => {
     fullName,
     email,
     businessName,
-    billingCycle,
+    billingCycle: billingCycleRaw,
     activePlan,
     password,
     cardNumber,
@@ -214,6 +225,15 @@ router.put("/me", authMiddleware, async (req, res) => {
     taxOffice,
     invoiceType,
   } = req.body;
+
+  const billingCycle =
+    typeof billingCycleRaw === "string"
+      ? billingCycleRaw.trim().toLowerCase()
+      : typeof req.body?.billing_cycle === "string"
+        ? req.body.billing_cycle.trim().toLowerCase()
+        : null;
+  const normalizedBillingCycle =
+    billingCycle === "yearly" || billingCycle === "monthly" ? billingCycle : null;
 
   try {
     const userRes = await pool.query("SELECT * FROM users WHERE id=$1", [userId]);
@@ -276,7 +296,7 @@ router.put("/me", authMiddleware, async (req, res) => {
        WHERE id=$8`,
       [
         businessName || existing.business_name,
-        billingCycle || "monthly",
+        normalizedBillingCycle || "monthly",
         activePlan || existing.subscription_plan,
         posLocation || null,
         posLocationLat || null,
@@ -308,7 +328,7 @@ router.put("/me", authMiddleware, async (req, res) => {
         cardNumber || null,
         expiry || null,
         cvv || null,
-        billingCycle || "monthly",
+        normalizedBillingCycle || "monthly",
         efatura || false,
         invoiceTitle || null,
         taxOffice || null,
@@ -318,7 +338,7 @@ router.put("/me", authMiddleware, async (req, res) => {
 
     const updated = await pool.query(
       `SELECT u.id, u.full_name, u.email, u.business_name, u.phone,
-              r.name AS restaurant_name, r.billing_cycle, r.plan,
+              r.name AS restaurant_name, COALESCE(s.billing_cycle, r.billing_cycle, 'monthly') AS billing_cycle, r.plan,
               r.pos_location, r.usage_type,
               s.efatura, s.invoice_title, s.tax_office, s.invoice_type
        FROM users u

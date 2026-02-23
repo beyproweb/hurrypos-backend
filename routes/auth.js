@@ -5,13 +5,21 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
 
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
+  const normalizedEmail = normalizeEmail(email);
 
-  console.log("🔑 Login Debug");
-  console.log("➡️ Incoming email:", email);
-  console.log("➡️ DB URL exists?", !!process.env.DATABASE_URL);
-  console.log("➡️ JWT_SECRET exists?", !!process.env.JWT_SECRET);
+    if (process.env.NODE_ENV !== "production") {
+      console.log("🔑 Login Debug");
+      console.log("➡️ Incoming email:", email);
+      console.log("➡️ Normalized email:", normalizedEmail);
+      console.log("➡️ DB URL exists?", !!process.env.DATABASE_URL);
+      console.log("➡️ JWT_SECRET exists?", !!process.env.JWT_SECRET);
+    }
 
   if (!email || !password) {
     return res.status(400).json({
@@ -24,38 +32,47 @@ router.post("/login", async (req, res) => {
     let user;
     let source = null;
 
-    console.log("🛠️ Querying users table…");
+      if (process.env.NODE_ENV !== "production") {
+        console.log("🛠️ Querying users table…");
+      }
     const userRes = await pool.query(
       `SELECT id, full_name, email, password_hash, role, restaurant_id
        FROM users
-       WHERE email = $1`,
-      [email]
+       WHERE LOWER(TRIM(email)) = $1`,
+      [normalizedEmail]
     );
 
     if (userRes.rows.length > 0) {
       user = userRes.rows[0];
       source = "users";
-      console.log("✅ Found user in users table:", user.email);
+        if (process.env.NODE_ENV !== "production") {
+          console.log("✅ Found user in users table:", user.email);
+        }
     }
 
     // fallback: staff table
     if (!user) {
-      console.log("🛠️ Querying staff table…");
+        if (process.env.NODE_ENV !== "production") {
+          console.log("🛠️ Querying staff table…");
+        }
       const staffRes = await pool.query(
         `SELECT id, name, email, pin, restaurant_id, role
-         FROM staff WHERE email = $1 LIMIT 1`,
-        [email]
+         FROM staff WHERE LOWER(TRIM(email)) = $1 LIMIT 1`,
+        [normalizedEmail]
       );
 
       if (staffRes.rows.length > 0) {
         user = staffRes.rows[0];
         source = "staff";
-        console.log("✅ Found user in staff table:", user.email);
+          if (process.env.NODE_ENV !== "production") {
+            console.log("✅ Found user in staff table:", user.email);
+          }
       }
     }
 
     if (!user) {
-      console.warn("❌ No user found for email:", email);
+        // Keep: Useful for production debugging (no PII, just normalized email)
+        console.warn("❌ No user found for email:", normalizedEmail);
       return res.status(401).json({
         success: false,
         error: "User not found or invalid credentials",
@@ -74,7 +91,8 @@ router.post("/login", async (req, res) => {
     }
 
     if (!passwordMatch) {
-      console.warn("❌ Invalid password for:", email);
+        // Keep: Useful for production debugging (no PII, just email)
+        console.warn("❌ Invalid password for:", email);
       return res.status(401).json({
         success: false,
         error: "Invalid password",
@@ -93,12 +111,16 @@ router.post("/login", async (req, res) => {
       { expiresIn: "7d" }
     );
 
-    console.log(`✅ ${source} login success:`, user.email);
+      if (process.env.NODE_ENV !== "production") {
+        console.log(`✅ ${source} login success:`, user.email);
+      }
 
     // ✅ Fetch role permissions (prefer new user_settings table, fallback to legacy settings)
     let permissions = [];
     const roleKey = user.role?.toLowerCase();
-    console.log("🔍 Looking for role permissions for roleKey:", roleKey);
+      if (process.env.NODE_ENV !== "production") {
+        console.log("🔍 Looking for role permissions for roleKey:", roleKey);
+      }
 
     let mergedRoles = {};
     let overridePermissions = null;
@@ -117,7 +139,9 @@ router.post("/login", async (req, res) => {
       if (modernResult.rows.length > 0) {
         const modernSettings = modernResult.rows[0].settings || {};
         const modernKeys = Object.keys(modernSettings || {});
-        console.log("🆕 user_settings payload keys:", modernKeys);
+          if (process.env.NODE_ENV !== "production") {
+            console.log("🆕 user_settings payload keys:", modernKeys);
+          }
 
         if (modernSettings.roles && typeof modernSettings.roles === "object" && Object.keys(modernSettings.roles).length > 0) {
           hasModernConfig = true;
@@ -132,10 +156,12 @@ router.post("/login", async (req, res) => {
           );
 
           mergedRoles = { ...mergedRoles, ...normalizedModernRoles };
-          console.log(
-            "🆕 Loaded role definitions from user_settings:",
-            Object.keys(normalizedModernRoles)
-          );
+            if (process.env.NODE_ENV !== "production") {
+              console.log(
+                "🆕 Loaded role definitions from user_settings:",
+                Object.keys(normalizedModernRoles)
+              );
+            }
         }
 
         // Optional: handle per-user overrides if present
@@ -177,15 +203,18 @@ router.post("/login", async (req, res) => {
 
           if (overrideSource && Array.isArray(overrideSource) && overrideSource.length > 0) {
             overridePermissions = overrideSource;
-            console.log(
-              "✅ Applying individual permission override from user_settings:",
-              overridePermissions
-            );
+              if (process.env.NODE_ENV !== "production") {
+                console.log(
+                  "✅ Applying individual permission override from user_settings:",
+                  overridePermissions
+                );
+              }
           }
         }
       }
     } catch (err) {
-      console.error("⚠️ Error loading permissions from user_settings:", err);
+        // Keep: Useful for production debugging
+        console.error("⚠️ Error loading permissions from user_settings:", err);
     }
 
     // 2) Only use legacy settings if NO modern config exists
@@ -199,9 +228,13 @@ router.post("/login", async (req, res) => {
           [user.restaurant_id]
         );
 
-        console.log("📊 Legacy settings rows:", legacyResult.rows.length, "rows");
+          if (process.env.NODE_ENV !== "production") {
+            console.log("📊 Legacy settings rows:", legacyResult.rows.length, "rows");
+          }
         legacyResult.rows.forEach((row) => {
-          console.log(`  - legacy key: ${row.key}, has value: ${!!row.value}, has users: ${!!row.users}`);
+            if (process.env.NODE_ENV !== "production") {
+              console.log(`  - legacy key: ${row.key}, has value: ${!!row.value}, has users: ${!!row.users}`);
+            }
         });
 
         let valueConfig = {};
@@ -230,12 +263,17 @@ router.post("/login", async (req, res) => {
         );
 
         mergedRoles = { ...normalizedLegacyRoles, ...mergedRoles };
-        console.log("🔎 Using legacy settings (no modern config found):", Object.keys(mergedRoles));
+          if (process.env.NODE_ENV !== "production") {
+            console.log("🔎 Using legacy settings (no modern config found):", Object.keys(mergedRoles));
+          }
       } catch (err) {
-        console.error("⚠️ Error loading permissions from legacy settings:", err);
+          // Keep: Useful for production debugging
+          console.error("⚠️ Error loading permissions from legacy settings:", err);
       }
     } else {
-      console.log("✅ Modern config exists - skipping legacy settings. Roles:", Object.keys(mergedRoles));
+        if (process.env.NODE_ENV !== "production") {
+          console.log("✅ Modern config exists - skipping legacy settings. Roles:", Object.keys(mergedRoles));
+        }
     }
 
     const availableRoles = Object.keys(mergedRoles || {});
@@ -243,21 +281,30 @@ router.post("/login", async (req, res) => {
 
     if (overridePermissions && overridePermissions.length > 0) {
       resolvedPermissions = overridePermissions;
-      console.log("✅ Using individual override permissions:", resolvedPermissions);
+        if (process.env.NODE_ENV !== "production") {
+          console.log("✅ Using individual override permissions:", resolvedPermissions);
+        }
     } else if (roleKey && mergedRoles?.[roleKey]) {
       resolvedPermissions = mergedRoles[roleKey];
-      console.log(`✅ Found role permissions for '${roleKey}':`, resolvedPermissions);
+        if (process.env.NODE_ENV !== "production") {
+          console.log(`✅ Found role permissions for '${roleKey}':`, resolvedPermissions);
+        }
     } else if (mergedRoles?.boss) {
       resolvedPermissions = mergedRoles.boss;
-      console.log(`✅ Role '${roleKey}' not found, using boss role:`, resolvedPermissions);
+        if (process.env.NODE_ENV !== "production") {
+          console.log(`✅ Role '${roleKey}' not found, using boss role:`, resolvedPermissions);
+        }
     } else if (roleKey === "boss" && mergedRoles?.admin) {
       resolvedPermissions = mergedRoles.admin;
-      console.log("✅ Boss role maps to admin:", resolvedPermissions);
+        if (process.env.NODE_ENV !== "production") {
+          console.log("✅ Boss role maps to admin:", resolvedPermissions);
+        }
     } else {
-      console.warn(
-        `⚠️ No permissions found for role '${roleKey}', available roles:`,
-        availableRoles
-      );
+        // Keep: Useful for production debugging
+        console.warn(
+          `⚠️ No permissions found for role '${roleKey}', available roles:`,
+          availableRoles
+        );
     }
 
     permissions = Array.from(new Set((resolvedPermissions || []).map((perm) => {
@@ -265,7 +312,9 @@ router.post("/login", async (req, res) => {
       // e.g., "staff-checkin" -> "staff.checkin"
       return String(perm).toLowerCase().replace(/-/g, ".");
     })));
-    console.log(`✅ Final permissions for ${roleKey}:`, permissions);
+      if (process.env.NODE_ENV !== "production") {
+        console.log(`✅ Final permissions for ${roleKey}:`, permissions);
+      }
 
     // ✅ Respond with token and normalized user data
     res.json({
@@ -283,7 +332,8 @@ router.post("/login", async (req, res) => {
       token,
     });
   } catch (err) {
-    console.error("❌ Login error:", err.message, err.stack);
+      // Keep: Useful for production debugging
+      console.error("❌ Login error:", err.message, err.stack);
     res.status(500).json({
       success: false,
       error: "Internal server error during login",

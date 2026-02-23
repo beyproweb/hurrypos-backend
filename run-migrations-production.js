@@ -24,7 +24,9 @@ async function runMigrations() {
   const migrations = [
     'migrations/add_coordinates_to_orders.js',
     'migrations/update_restaurant_coords.js',
-    'migrations/fix_existing_orders.js'
+    'migrations/fix_existing_orders.js',
+    'migrations/add_external_callback_fields.js',
+    'migrations/add_external_expedition_type.js',
   ];
 
   for (const migration of migrations) {

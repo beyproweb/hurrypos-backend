@@ -3,7 +3,7 @@ module.exports = function (io) {
   const router = express.Router();
   const { pool } = require("../db");
   const authMiddleware = require("../middleware/authMiddleware");
-  const { emitOrderUpdate } = require("../utils/realtime");
+  const { emitOrderUpdate, emitDriverOnRoad } = require("../utils/realtime");
 
   // ✅ Safe Redis handling — disable when not configured
   let redis = null;
@@ -33,12 +33,26 @@ module.exports = function (io) {
       if (driver_status === "picked_up") fields.push("picked_up_at = NOW()");
       if (driver_status === "delivered") fields.push("delivered_at = NOW()");
 
+      // Fetch order details for notification
+      const orderResult = await pool.query(
+        `SELECT id, customer_name, order_type FROM orders WHERE restaurant_id = $1 AND id = $2`,
+        [restaurantId, id]
+      );
+      const order = orderResult.rows[0];
+
       const sql = `
         UPDATE orders
         SET driver_status = $1${fields.length ? "," + fields.join(",") : ""}
         WHERE restaurant_id = $2 AND id = $3
       `;
       await pool.query(sql, [driver_status, restaurantId, id]);
+
+      // Emit notification when driver is on road
+      if (driver_status === "on_road" && order) {
+        emitDriverOnRoad(io, restaurantId, Number(id), {
+          customer_name: order.customer_name,
+        });
+      }
 
       emitOrderUpdate(io, restaurantId);
       res.json({ success: true });
@@ -68,6 +82,43 @@ module.exports = function (io) {
 
   // In-memory driver locations (could later move to Redis)
   const driverLocations = {};
+
+  // Utility: decode an encoded polyline string (Google format)
+  // Returns array of [lat, lng]
+  function decodePolyline(encoded) {
+    if (!encoded || typeof encoded !== 'string') return [];
+    let index = 0;
+    const len = encoded.length;
+    const path = [];
+    let lat = 0;
+    let lng = 0;
+
+    while (index < len) {
+      let result = 0;
+      let shift = 0;
+      let b;
+      do {
+        b = encoded.charCodeAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      const dlat = (result & 1) ? ~(result >> 1) : result >> 1;
+      lat += dlat;
+
+      result = 0;
+      shift = 0;
+      do {
+        b = encoded.charCodeAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      const dlng = (result & 1) ? ~(result >> 1) : result >> 1;
+      lng += dlng;
+
+      path.push([lat / 1e5, lng / 1e5]);
+    }
+    return path;
+  }
 
   router.post("/location", async (req, res) => {
   const { driver_id, lat, lng } = req.body;
@@ -193,12 +244,12 @@ router.get("/location/:driver_id", async (req, res) => {
       const query = `
         SELECT 
           o.id,
-          o.order_number,
+          o.id as order_number,
           o.customer_name,
           o.customer_address,
-          o.delivery_address,
-          o.delivery_lat,
-          o.delivery_lng,
+          o.customer_address AS delivery_address,
+          NULL::numeric AS delivery_lat,
+          NULL::numeric AS delivery_lng,
           o.driver_id,
           o.driver_status,
           o.status,
@@ -276,98 +327,159 @@ router.get("/location/:driver_id", async (req, res) => {
     }
   });
 
-  // 🆕 POST /api/drivers/calculate-route
-  // Calculate total distance and duration for multi-stop routes
-  router.post("/calculate-route", async (req, res) => {
-    const { waypoints } = req.body;
-    if (!waypoints || waypoints.length === 0) {
-      return res.status(400).json({ error: "Missing waypoints" });
-    }
+  router.get("/google-directions", async (req, res) => {
+    const { origin, destination, waypoints } = req.query;
+    if (!origin || !destination)
+      return res.status(400).json({ error: "Missing origin/destination" });
 
     try {
-      const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-      
-      // For multi-stop routes, use first point as origin and last as destination
-      // with intermediate points as waypoints
-      const origin = `${waypoints[0].lat},${waypoints[0].lng}`;
-      const destination = `${waypoints[waypoints.length - 1].lat},${waypoints[waypoints.length - 1].lng}`;
-      
-      let url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(
-        origin
-      )}&destination=${encodeURIComponent(
-        destination
-      )}&mode=driving&key=${GOOGLE_API_KEY}`;
-      
-      // Add intermediate waypoints
-      if (waypoints.length > 2) {
-        const intermediateWaypoints = waypoints
-          .slice(1, -1)
-          .map((wp) => `${wp.lat},${wp.lng}`)
-          .join("|");
-        url += `&waypoints=${encodeURIComponent(intermediateWaypoints)}`;
+      // Parse origin and destination (format: "lat,lng")
+      const [originLat, originLng] = origin.split(',').map(Number);
+      const [destLat, destLng] = destination.split(',').map(Number);
+
+      if (!Number.isFinite(originLat) || !Number.isFinite(originLng) || 
+          !Number.isFinite(destLat) || !Number.isFinite(destLng)) {
+        return res.status(400).json({ error: "Invalid coordinates" });
       }
 
-      const result = await fetch(url);
+      // Build OSRM URL (free, open-source routing)
+      // Format: /route/v1/driving/lng1,lat1;lng2,lat2
+      let osrmUrl = `https://router.project-osrm.org/route/v1/driving/${originLng},${originLat};${destLng},${destLat}?overview=full&geometries=geojson`;
+
+      // Add waypoints if provided (format: "lat1,lng1|lat2,lng2|...")
+      if (waypoints) {
+        const wpArray = waypoints.split('|').map(wp => {
+          const [lat, lng] = wp.split(',').map(Number);
+          if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            return `${lng},${lat}`;
+          }
+          return null;
+        }).filter(Boolean);
+        
+        if (wpArray.length > 0) {
+          osrmUrl = `https://router.project-osrm.org/route/v1/driving/${originLng},${originLat};${wpArray.join(';')};${destLng},${destLat}?overview=full&geometries=geojson`;
+        }
+      }
+
+      const result = await fetch(osrmUrl);
       const data = await result.json();
 
-      if (data.status !== "OK" || !data.routes || data.routes.length === 0) {
-        console.warn("⚠️ Google Directions API returned:", data.status);
-        // Fallback estimation
+      if (data.code !== "Ok" || !data.routes || !data.routes[0]) {
+        console.warn("⚠️ OSRM routing failed:", data.code || "Unknown error");
         return res.json({
-          distance: waypoints.length * 2,
-          duration: Math.ceil((waypoints.length * 2) / 30) * 60 + waypoints.length * 3,
+          decoded_polyline: [],
+          distance: 0,
+          duration: 0,
+          error: "No route found",
         });
       }
 
       const route = data.routes[0];
-      const distance = (route.legs.reduce((sum, leg) => sum + leg.distance.value, 0) / 1000).toFixed(2); // km
-      const duration = Math.ceil(route.legs.reduce((sum, leg) => sum + leg.duration.value, 0) / 60); // minutes
+      
+      // Convert OSRM GeoJSON coordinates to {lat, lng} array
+      const decoded_polyline = (route.geometry && route.geometry.coordinates)
+        ? route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }))
+        : [];
 
-      console.log(`✅ Route calculated: ${distance} km, ${duration} min`);
+      const distance = route.distance / 1000; // km
+      const duration = Math.ceil(route.duration / 60); // minutes
+
+      console.log(`✅ OSRM route: ${distance.toFixed(1)} km, ${duration} min, ${decoded_polyline.length} points`);
+
       res.json({
-        distance: parseFloat(distance),
+        decoded_polyline,
+        distance: parseFloat(distance.toFixed(2)),
         duration,
+        routes: [{
+          overview_polyline: { points: "dummy" },
+          legs: [],
+          distance: { value: route.distance },
+          duration: { value: route.duration },
+        }],
       });
     } catch (err) {
-      console.error("❌ Route calculation failed:", err);
-      // Fallback estimation
-      const { waypoints } = req.body;
-      const estimatedDistance = waypoints.length * 2;
-      const estimatedDuration = Math.ceil(estimatedDistance / 30) * 60;
+      console.error("❌ Routing failed:", err && err.message);
       res.json({
-        distance: estimatedDistance,
-        duration: estimatedDuration,
+        decoded_polyline: [],
+        distance: 0,
+        duration: 0,
+        error: err && err.message,
       });
     }
   });
 
-  router.get("/google-directions", async (req, res) => {
-    const { origin, destination, waypoints, language, traffic } = req.query;
-    if (!origin || !destination)
-      return res.status(400).json({ error: "Missing origin/destination" });
-    const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-    let url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(
-      origin
-    )}&destination=${encodeURIComponent(
-      destination
-    )}&mode=driving&key=${GOOGLE_API_KEY}`;
-    if (waypoints) url += `&waypoints=${encodeURIComponent(waypoints)}`;
-    if (language) url += `&language=${encodeURIComponent(language)}`;
-
-    // If traffic param is truthy, request traffic-aware ETA by setting departure_time and traffic_model
-    // departure_time expects seconds since epoch
-    if (String(traffic).toLowerCase() === "true") {
-      const departure = Math.floor(Date.now() / 1000);
-      url += `&departure_time=${departure}&traffic_model=best_guess`;
+  // 🆕 POST /api/drivers/optimize-route
+  // Optimize multi-stop route using OSRM Table API (Traveling Salesman Problem)
+  // Reorders stops for fastest/shortest total distance
+  router.post("/optimize-route", async (req, res) => {
+    const { waypoints } = req.body;
+    if (!waypoints || waypoints.length < 2) {
+      return res.status(400).json({ error: "Need at least 2 waypoints" });
     }
 
     try {
-      const result = await fetch(url);
+      // Build OSRM Table API URL to get distance matrix
+      const coordinates = waypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+      const tableUrl = `https://router.project-osrm.org/table/v1/driving/${coordinates}?annotations=distance,duration`;
+
+      const result = await fetch(tableUrl);
       const data = await result.json();
-      res.json(data);
-    } catch (e) {
-      console.error("❌ Failed to fetch directions:", e);
-      res.status(500).json({ error: "Failed to fetch directions" });
+
+      if (data.code !== "Ok" || !data.distances) {
+        console.warn("⚠️ OSRM Table API failed:", data.code);
+        return res.json({ optimized_order: waypoints.map((_, i) => i), message: "Could not optimize" });
+      }
+
+      // Nearest-neighbor TSP solver: start at first stop, always go to nearest unvisited stop
+      const distances = data.distances;
+      const n = waypoints.length;
+      const visited = new Array(n).fill(false);
+      const order = [0]; // Start at first stop (restaurant)
+      visited[0] = true;
+
+      let current = 0;
+      for (let i = 1; i < n; i++) {
+        let nearest = -1;
+        let minDist = Infinity;
+
+        for (let j = 0; j < n; j++) {
+          if (!visited[j] && distances[current][j] < minDist) {
+            minDist = distances[current][j];
+            nearest = j;
+          }
+        }
+
+        if (nearest !== -1) {
+          order.push(nearest);
+          visited[nearest] = true;
+          current = nearest;
+        }
+      }
+
+      // Reorder waypoints by the optimized order
+      const optimized_waypoints = order.map(idx => ({
+        ...waypoints[idx],
+        original_index: idx,
+      }));
+
+      // Calculate total distance and duration for the optimized route
+      let totalDist = 0;
+      let totalDur = 0;
+      for (let i = 0; i < order.length - 1; i++) {
+        totalDist += distances[order[i]][order[i + 1]];
+        totalDur += data.durations[order[i]][order[i + 1]];
+      }
+
+      console.log(`✅ Optimized route: ${(totalDist / 1000).toFixed(1)} km, ${Math.ceil(totalDur / 60)} min`);
+      res.json({
+        optimized_waypoints,
+        optimized_order: order,
+        total_distance: (totalDist / 1000).toFixed(2),
+        total_duration: Math.ceil(totalDur / 60),
+      });
+    } catch (err) {
+      console.error("❌ Route optimization failed:", err && err.message);
+      res.status(500).json({ error: "Optimization failed", details: err && err.message });
     }
   });
 

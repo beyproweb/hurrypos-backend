@@ -26,6 +26,7 @@ async function loadRegisterSettings(restaurantId) {
     try {
       return JSON.parse(raw);
     } catch (err) {
+      // Keep: Useful for production debugging
       console.warn("⚠️ Failed to parse register settings JSON:", err.message);
       return null;
     }
@@ -73,6 +74,7 @@ router.post("/cashdrawer/open", authMiddleware, async (req, res) => {
         printer.close();
         return res.json({ success: true });
       } catch (printerErr) {
+        // Keep: Useful for production debugging
         console.error("❌ Cash drawer pulse failed:", printerErr);
         return res.status(500).json({
           error: "Pulse command failed: " + cleanErr(printerErr),
@@ -80,6 +82,7 @@ router.post("/cashdrawer/open", authMiddleware, async (req, res) => {
       }
     });
   } catch (err) {
+    // Keep: Useful for production debugging
     console.error("❌ cashdrawer/open error:", err);
     return res
       .status(500)

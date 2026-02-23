@@ -16,7 +16,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # API endpoints
-API_BASE="https://hurrypos-backend.onrender.com/api"
+API_BASE="https://api.beypro.com/api"
 
 # Helper function to test endpoint
 test_endpoint() {
