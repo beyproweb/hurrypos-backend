@@ -29,6 +29,7 @@ router.post("/call-waiter/:identifier", async (req, res) => {
     const identifier = String(req.params.identifier || "").trim();
     const tableNumber = Number(req.body?.table_number ?? req.body?.tableNumber);
     const note = String(req.body?.note || "").trim();
+    const requestedSource = String(req.body?.source || "").trim().toLowerCase();
 
     if (!identifier) {
       return res.status(400).json({ error: "Missing identifier" });
@@ -85,7 +86,7 @@ router.post("/call-waiter/:identifier", async (req, res) => {
       table_label: tableRows[0]?.label || null,
       note: note || null,
       requested_at: new Date(now).toISOString(),
-      source: "qr_menu",
+      source: requestedSource === "qr_menu_order_status" ? "qr_menu_order_status" : "qr_menu",
     };
 
     try {

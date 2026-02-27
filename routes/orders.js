@@ -4334,6 +4334,14 @@ router.get("/:id/items", async (req, res) => {
       : cancellationColumns.hasCancelledAt
         ? "AND oi.cancelled_at IS NULL"
         : "AND COALESCE(oi.kitchen_status, '') <> 'cancelled'";
+    const cancellationSelect = [
+      cancellationColumns.hasCancelledAt
+        ? "oi.cancelled_at"
+        : "NULL::timestamp AS cancelled_at",
+      cancellationColumns.hasCancellationReason
+        ? "oi.cancellation_reason"
+        : "NULL::text AS cancellation_reason",
+    ].join(",\n     ");
     const result = await pool.query(
   `SELECT
      oi.id,
@@ -4350,6 +4358,7 @@ router.get("/:id/items", async (req, res) => {
      oi.receipt_id,
      oi.note,
      oi.kitchen_status,
+     ${cancellationSelect},
      oi.discount_type,
      oi.discount_value,
      oi.name AS order_item_name,
@@ -6019,6 +6028,9 @@ router.delete("/reservations/:id", async (req, res) => {
   const { id } = req.params;
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
+  const deleteReason = String(
+    req.body?.delete_reason ?? req.body?.cancellation_reason ?? req.body?.reason ?? ""
+  ).trim();
 
   try {
     const result = await pool.query(
@@ -6034,6 +6046,12 @@ router.delete("/reservations/:id", async (req, res) => {
              WHEN LOWER(COALESCE(o.status, '')) = 'reserved' THEN 'confirmed'
              ELSE o.status
            END,
+           cancellation_reason = CASE
+             WHEN COALESCE(o.total, 0) <= 0
+               AND NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id LIMIT 1)
+             THEN NULLIF($3, '')
+             ELSE o.cancellation_reason
+           END,
            order_type = CASE
              WHEN LOWER(COALESCE(o.order_type, '')) = 'reservation' THEN 'table'
              ELSE o.order_type
@@ -6045,8 +6063,8 @@ router.delete("/reservations/:id", async (req, res) => {
            LOWER(COALESCE(o.status, '')) = 'reserved'
            OR LOWER(COALESCE(o.order_type, '')) = 'reservation'
          )
-       RETURNING o.id, o.table_number, o.status, o.order_type`,
-      [restaurantId, id]
+       RETURNING o.id, o.table_number, o.status, o.order_type, o.cancellation_reason`,
+      [restaurantId, id, deleteReason]
     );
 
     if (result.rowCount === 0) {
@@ -6061,6 +6079,7 @@ router.delete("/reservations/:id", async (req, res) => {
       table_number: cancelledReservation.table_number,
       status: cancelledReservation.status,
       order_type: cancelledReservation.order_type,
+      cancellation_reason: cancelledReservation.cancellation_reason || null,
     };
     io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", payload);
     io.to(`restaurant_${restaurantId}`).emit("reservation_deleted", payload);
@@ -6167,6 +6186,9 @@ router.delete("/:id/reservations", async (req, res) => {
   const { id } = req.params;
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
+  const deleteReason = String(
+    req.body?.delete_reason ?? req.body?.cancellation_reason ?? req.body?.reason ?? ""
+  ).trim();
 
   const orderId = Number(id);
   if (!Number.isFinite(orderId)) {
@@ -6205,6 +6227,10 @@ router.delete("/:id/reservations", async (req, res) => {
                 WHEN LOWER(COALESCE(status,'')) = 'reserved' THEN 'confirmed'
                 ELSE status
               END,
+              cancellation_reason = CASE
+                WHEN $3 THEN NULLIF($4, '')
+                ELSE cancellation_reason
+              END,
               order_type = CASE
                 WHEN LOWER(COALESCE(order_type,'')) = 'reservation' THEN 'table'
                 ELSE order_type
@@ -6212,7 +6238,7 @@ router.delete("/:id/reservations", async (req, res) => {
               updated_at = NOW()
         WHERE restaurant_id = $1 AND id = $2
         RETURNING *`,
-      [restaurantId, orderId, shouldClose]
+      [restaurantId, orderId, shouldClose, deleteReason]
     );
 
     const updatedOrder = updated.rows[0];
@@ -6223,6 +6249,7 @@ router.delete("/:id/reservations", async (req, res) => {
         table_number: updatedOrder.table_number,
         status: updatedOrder.status,
         order_type: updatedOrder.order_type,
+        cancellation_reason: updatedOrder.cancellation_reason || null,
       };
       io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", reservationPayload);
       io.to(`restaurant_${restaurantId}`).emit("reservation_deleted", reservationPayload);
