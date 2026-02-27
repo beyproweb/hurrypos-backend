@@ -15,9 +15,13 @@ async function runZReportOcr(filePath) {
       : "python3");
 
   return new Promise((resolve, reject) => {
+    const systemPathPrefix = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    const runtimePath = process.env.PATH
+      ? `${systemPathPrefix}:${process.env.PATH}`
+      : systemPathPrefix;
     const safeEnv = {
       ...process.env,
-      PATH: `/usr/local/bin:${process.env.PATH || ""}`,
+      PATH: runtimePath,
     };
 
     const proc = spawn(preferredPython, [scriptPath, filePath], {

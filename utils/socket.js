@@ -1,5 +1,6 @@
 // utils/socket.js
 const { Server } = require("socket.io");
+const { saveNotification } = require("./realtime");
 let io = null;
 
 function initSocket(server) {
@@ -105,6 +106,66 @@ function initSocket(server) {
       socket.join(`restaurant_${restaurantId}`);
       socket.data.restaurantId = restaurantId;
       console.log(`👥 ${socket.id} joined restaurant_${restaurantId}`);
+    });
+
+    socket.on("customer_call_acknowledge", async (payload = {}) => {
+      try {
+        const restaurantId = Number(
+          socket.data?.restaurantId || payload?.restaurant_id || payload?.restaurantId
+        );
+        const tableNumber = Number(payload?.table_number ?? payload?.tableNumber);
+        if (!Number.isFinite(restaurantId) || restaurantId <= 0) return;
+        if (!Number.isFinite(tableNumber) || tableNumber <= 0) return;
+
+        const data = {
+          event: "customer_call_acknowledged",
+          restaurant_id: restaurantId,
+          table_number: tableNumber,
+          acknowledged_at: new Date().toISOString(),
+          acknowledged_by: payload?.acknowledged_by || payload?.staff_id || null,
+        };
+        io.to(`restaurant_${restaurantId}`).emit("customer_call_acknowledged", data);
+
+        await saveNotification({
+          restaurantId,
+          message: `Waiter call acknowledged on Table ${tableNumber}`,
+          type: "customer_call",
+          stockId: null,
+          extra: data,
+        });
+      } catch (err) {
+        console.warn("⚠️ customer_call_acknowledge failed:", err?.message || err);
+      }
+    });
+
+    socket.on("customer_call_resolve", async (payload = {}) => {
+      try {
+        const restaurantId = Number(
+          socket.data?.restaurantId || payload?.restaurant_id || payload?.restaurantId
+        );
+        const tableNumber = Number(payload?.table_number ?? payload?.tableNumber);
+        if (!Number.isFinite(restaurantId) || restaurantId <= 0) return;
+        if (!Number.isFinite(tableNumber) || tableNumber <= 0) return;
+
+        const data = {
+          event: "customer_call_resolved",
+          restaurant_id: restaurantId,
+          table_number: tableNumber,
+          resolved_at: new Date().toISOString(),
+          resolved_by: payload?.resolved_by || payload?.staff_id || null,
+        };
+        io.to(`restaurant_${restaurantId}`).emit("customer_call_resolved", data);
+
+        await saveNotification({
+          restaurantId,
+          message: `Waiter call resolved on Table ${tableNumber}`,
+          type: "customer_call",
+          stockId: null,
+          extra: data,
+        });
+      } catch (err) {
+        console.warn("⚠️ customer_call_resolve failed:", err?.message || err);
+      }
     });
 
     // 2️⃣ Auto join from auth handshake (if JWT decoded on frontend)

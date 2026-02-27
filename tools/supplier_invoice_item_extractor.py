@@ -374,6 +374,13 @@ def extract_ocr_text(image_path: str) -> Dict[str, Any]:
                 return tesseract_result
             except Exception as tesseract_err:
                 warnings.append(f"Tesseract failed: {str(tesseract_err)}")
+                tesseract_missing = "binary not found" in str(tesseract_err).lower()
+                can_force_paddle_fallback = (not force_tesseract) and mode != "tesseract"
+
+                # Safety net: if Tesseract is missing, try Paddle unless Tesseract is explicitly forced.
+                if tesseract_missing and can_force_paddle_fallback:
+                    allow_paddle_fallback = True
+
                 if force_tesseract or mode == "tesseract" or not allow_paddle_fallback:
                     return {
                         "error": str(tesseract_err),

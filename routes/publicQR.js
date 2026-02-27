@@ -2,6 +2,11 @@
 const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
+const { getIO } = require("../utils/socket");
+const { saveNotification } = require("../utils/realtime");
+
+const CALL_WAITER_COOLDOWN_MS = 15000;
+const callWaiterRateLimit = new Map();
 
 router.get("/qr-resolve/:code", async (req, res) => {
   try {
@@ -14,6 +19,93 @@ router.get("/qr-resolve/:code", async (req, res) => {
     res.json(rows[0]); // send { id, slug, qr_token }
   } catch (err) {
     console.error("❌ QR resolve failed:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ✅ Public Call Waiter endpoint (used by QR Menu)
+router.post("/call-waiter/:identifier", async (req, res) => {
+  try {
+    const identifier = String(req.params.identifier || "").trim();
+    const tableNumber = Number(req.body?.table_number ?? req.body?.tableNumber);
+    const note = String(req.body?.note || "").trim();
+
+    if (!identifier) {
+      return res.status(400).json({ error: "Missing identifier" });
+    }
+    if (!Number.isFinite(tableNumber) || tableNumber <= 0) {
+      return res.status(400).json({ error: "Missing or invalid table_number" });
+    }
+
+    const { rows: restaurantRows } = await pool.query(
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
+      LIMIT 1
+      `,
+      [identifier]
+    );
+    if (!restaurantRows.length) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    const restaurantId = Number(restaurantRows[0].id);
+    const { rows: tableRows } = await pool.query(
+      `
+      SELECT number, label
+      FROM tables
+      WHERE restaurant_id = $1
+        AND number = $2
+      LIMIT 1
+      `,
+      [restaurantId, tableNumber]
+    );
+    if (!tableRows.length) {
+      return res.status(404).json({ error: "Table not found" });
+    }
+
+    const rateKey = `${restaurantId}:${tableNumber}`;
+    const now = Date.now();
+    const lastHit = Number(callWaiterRateLimit.get(rateKey) || 0);
+    if (now - lastHit < CALL_WAITER_COOLDOWN_MS) {
+      const retryAfterMs = CALL_WAITER_COOLDOWN_MS - (now - lastHit);
+      return res.status(429).json({
+        error: "Too many call waiter requests",
+        retry_after_ms: retryAfterMs,
+      });
+    }
+    callWaiterRateLimit.set(rateKey, now);
+
+    const payload = {
+      event: "customer_call_requested",
+      request_id: `cw_${restaurantId}_${tableNumber}_${now}`,
+      restaurant_id: restaurantId,
+      table_number: tableNumber,
+      table_label: tableRows[0]?.label || null,
+      note: note || null,
+      requested_at: new Date(now).toISOString(),
+      source: "qr_menu",
+    };
+
+    try {
+      const io = getIO();
+      io.to(`restaurant_${restaurantId}`).emit("customer_call", payload);
+    } catch (socketErr) {
+      console.warn("⚠️ customer_call socket emit skipped:", socketErr?.message || socketErr);
+    }
+
+    await saveNotification({
+      restaurantId,
+      message: `Customer called waiter on Table ${tableNumber}`,
+      type: "customer_call",
+      stockId: null,
+      extra: payload,
+    });
+
+    res.json({ success: true, payload });
+  } catch (err) {
+    console.error("❌ Public call waiter failed:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -100,6 +192,51 @@ router.get("/restaurant-info", async (req, res) => {
   }
 });
 
+// ✅ Public shop-hours for QR menu (slug | qr_code_id | numeric id)
+router.get("/shop-hours/:identifier", async (req, res) => {
+  try {
+    const identifier = String(req.params.identifier || "").trim();
+    if (!identifier) {
+      return res.status(400).json({ error: "Missing identifier" });
+    }
+
+    const { rows } = await pool.query(
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
+      LIMIT 1
+      `,
+      [identifier]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+    const restaurantId = rows[0].id;
+
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("Surrogate-Control", "no-store");
+
+    const { rows: hours } = await pool.query(
+      `
+      SELECT day, open_time, close_time
+      FROM shop_hours
+      WHERE restaurant_id = $1
+      ORDER BY id
+      `,
+      [restaurantId]
+    );
+
+    res.json(hours);
+  } catch (err) {
+    console.error("❌ Public shop-hours failed:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // ✅ Public QR link endpoint (no auth required)
 router.get("/qr-link/:slug", async (req, res) => {
   try {
@@ -163,6 +300,101 @@ router.get("/tables/:identifier", async (req, res) => {
   } catch (err) {
     console.error("❌ Public tables failed:", err);
     res.json([]);
+  }
+});
+
+// 🔹 Public unavailable table numbers (occupied or reserved)
+router.get("/unavailable-tables/:identifier", async (req, res) => {
+  try {
+    const identifier = (req.params.identifier || "").trim();
+    if (!identifier) return res.json({ table_numbers: [], reserved_table_numbers: [] });
+
+    const { rows } = await pool.query(
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
+      LIMIT 1
+      `,
+      [identifier]
+    );
+
+    if (!rows.length) return res.json({ table_numbers: [], reserved_table_numbers: [] });
+    const restaurantId = rows[0].id;
+
+    const { rows: busyRows } = await pool.query(
+      `
+      SELECT DISTINCT
+             table_number,
+             status,
+             order_type,
+             reservation_date,
+             reservation_time
+      FROM orders
+      WHERE restaurant_id = $1
+        AND table_number IS NOT NULL
+        AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
+      ORDER BY table_number ASC
+      `,
+      [restaurantId]
+    );
+
+    const isReservationLikeRow = (row) => {
+      const status = String(row?.status || "").toLowerCase();
+      const orderType = String(row?.order_type || "").toLowerCase();
+      return (
+        status === "reserved" ||
+        orderType === "reservation" ||
+        row?.reservation_date != null ||
+        row?.reservation_time != null
+      );
+    };
+
+    const parseReservationMs = (dateValue, timeValue) => {
+      if (!dateValue) return NaN;
+      const dateRaw = String(dateValue).trim();
+      if (!dateRaw) return NaN;
+      const timeRaw = timeValue ? String(timeValue).trim() : "00:00:00";
+      const parsed = new Date(`${dateRaw}T${timeRaw || "00:00:00"}`).getTime();
+      return Number.isFinite(parsed) ? parsed : NaN;
+    };
+
+    const isReservationDueNow = (row) => {
+      if (!isReservationLikeRow(row)) return false;
+      if (!row?.reservation_date) return true;
+      const scheduledMs = parseReservationMs(row.reservation_date, row.reservation_time);
+      if (!Number.isFinite(scheduledMs)) return true;
+      return Date.now() >= scheduledMs;
+    };
+
+    const unavailableSet = new Set();
+    const reservedSet = new Set();
+
+    busyRows.forEach((row) => {
+      const tableNumber = Number(row?.table_number);
+      if (!Number.isFinite(tableNumber) || tableNumber <= 0) return;
+
+      if (!isReservationLikeRow(row)) {
+        unavailableSet.add(tableNumber);
+        return;
+      }
+
+      if (!isReservationDueNow(row)) return;
+
+      unavailableSet.add(tableNumber);
+      reservedSet.add(tableNumber);
+    });
+
+    const tableNumbers = Array.from(unavailableSet);
+    const reservedTableNumbers = Array.from(reservedSet);
+
+    return res.json({
+      table_numbers: tableNumbers,
+      reserved_table_numbers: reservedTableNumbers,
+    });
+  } catch (err) {
+    console.error("❌ Public unavailable tables failed:", err);
+    return res.json({ table_numbers: [], reserved_table_numbers: [] });
   }
 });
 

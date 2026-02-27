@@ -169,9 +169,13 @@ const {
 // POST /settings/shop-hours
 router.post("/shop-hours/all", async (req, res) => {
   const { hours } = req.body;
+  const restaurantId = Number(req.user?.restaurant_id);
 
   if (!hours || typeof hours !== "object") {
     return res.status(400).json({ error: "Invalid payload" });
+  }
+  if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+    return res.status(400).json({ error: "Missing restaurant context" });
   }
 
   const client = await pool.connect();
@@ -179,16 +183,48 @@ router.post("/shop-hours/all", async (req, res) => {
     await client.query("BEGIN");
 
     for (const [day, { open, close }] of Object.entries(hours)) {
-      await client.query(`
-        INSERT INTO shop_hours (day, open_time, close_time)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (day) DO UPDATE
-        SET open_time = EXCLUDED.open_time,
-            close_time = EXCLUDED.close_time
-      `, [day, open, close]);
+      const openValue = typeof open === "string" ? open.trim() : "";
+      const closeValue = typeof close === "string" ? close.trim() : "";
+      const isDisabledDay = !openValue || !closeValue;
+
+      // Keep exactly one row per (restaurant, day) without relying on legacy conflict keys.
+      await client.query(
+        `
+        DELETE FROM shop_hours
+        WHERE restaurant_id = $1 AND day = $2
+        `,
+        [restaurantId, day]
+      );
+      if (isDisabledDay) {
+        continue;
+      }
+      await client.query(
+        `
+        INSERT INTO shop_hours (restaurant_id, day, open_time, close_time)
+        VALUES ($1, $2, $3, $4)
+        `,
+        [restaurantId, day, openValue, closeValue]
+      );
     }
 
     await client.query("COMMIT");
+
+    try {
+      const io = req.app?.get?.("io");
+      if (io && Number.isFinite(restaurantId) && restaurantId > 0) {
+        const payload = {
+          restaurant_id: restaurantId,
+          updated_at: new Date().toISOString(),
+        };
+        // Tenant-scoped event for authenticated clients in the same restaurant room.
+        io.to(`restaurant_${restaurantId}`).emit("shop_hours_updated", payload);
+        // Public QR pages may not be joined to a tenant room yet; this keeps them in sync instantly.
+        io.emit("shop_hours_updated_public", payload);
+      }
+    } catch (socketErr) {
+      console.warn("⚠️ shop_hours_updated socket emit skipped:", socketErr?.message || socketErr);
+    }
+
     res.json({ message: "Shop hours updated" });
 
   } catch (err) {
@@ -320,11 +356,26 @@ router.get("/logs/:type", async (req, res) => {
 
 router.get("/shop-hours/all", async (req, res) => {
   try {
-    const result = await pool.query(`
+    const restaurantId = Number(req.user?.restaurant_id);
+    if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+      return res.status(400).json({ error: "Missing restaurant context" });
+    }
+
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("Surrogate-Control", "no-store");
+
+    const result = await pool.query(
+      `
       SELECT day, open_time, close_time
       FROM shop_hours
+      WHERE restaurant_id = $1
       ORDER BY id
-    `);
+      `,
+      [restaurantId]
+    );
+
     res.json(result.rows);
   } catch (err) {
     console.error("❌ Failed to load shop hours:", err);
@@ -816,6 +867,8 @@ const result = await pool.query(
       notifications: {
         enabled: true,
         defaultSound: "ding",
+        enableCallWaiterAlerts: true,
+        enableCallWaiterVibration: false,
         channels: { kitchen: "app", cashier: "app", manager: "app" },
         escalation: { enabled: true, delayMinutes: 3 },
         eventSounds: {
@@ -829,6 +882,7 @@ const result = await pool.query(
         driver_assigned: "horn",
         order_delayed: "alarm",
       driver_arrived: "horn",
+      call_waiter: "alarm.mp3",
     },
   }
 };
@@ -893,6 +947,8 @@ router.post("/:section", async (req, res) => {
     const defaults = {
       enabled: true,
       defaultSound: "ding.mp3",
+      enableCallWaiterAlerts: true,
+      enableCallWaiterVibration: false,
       channels: { kitchen: "app", cashier: "app", manager: "app" },
       escalation: { enabled: true, delayMinutes: 3 },
       stockAlert: { enabled: true, cooldownMinutes: 30 },
@@ -907,6 +963,7 @@ router.post("/:section", async (req, res) => {
         driver_assigned: "horn.mp3",
         order_delayed: "alarm.mp3",
         driver_arrived: "horn.mp3",
+        call_waiter: "alarm.mp3",
       },
     };
 

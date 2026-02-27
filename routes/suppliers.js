@@ -1146,11 +1146,11 @@ const parseCurrency = (text) => {
       const rowStartRegex = /^\s*\d{1,3}(?:[.)-])?\s+(?:\d{5,8}\s+)?[A-Za-zÇĞİÖŞÜçğıöşü]/i;
       const tableLines = lines
         .slice(headerIdx + 1, endIdx)
-        .map((l) => String(l || "").trim())
+        .map((line) => String(line || "").trim())
         .filter(Boolean);
+
       const rowChunks = [];
       let current = [];
-
       for (const line of tableLines) {
         if (rowStartRegex.test(line)) {
           if (current.length > 0) rowChunks.push(current.join(" "));
@@ -1162,170 +1162,89 @@ const parseCurrency = (text) => {
       if (current.length > 0) rowChunks.push(current.join(" "));
 
       const dedupe = new Set();
-      for (let chunkIdx = 0; chunkIdx < rowChunks.length; chunkIdx += 1) {
-        const chunk = rowChunks[chunkIdx];
-        const raw = String(chunk || "").replace(/\s+/g, " ").trim();
-        if (!raw) continue;
+      for (const chunk of rowChunks) {
+        const rawLine = String(chunk || "").replace(/\s+/g, " ").trim();
+        if (!rawLine) continue;
 
-        const rowStart = raw.match(/^\s*(\d+)\b/);
-        if (!rowStart) {
-          rejected.push({ line: raw, reason: "no row start" });
-          continue;
-        }
-        const codeMatch = raw.match(/\b(\d{5,8})\b/);
+        const codeMatch = rawLine.match(/\b(\d{5,8})\b/);
         const code = codeMatch ? codeMatch[1] : null;
-        const koliMatch = raw.match(KOLI_QTY_REGEX);
-        if (!koliMatch) {
-          rejected.push({ line: raw, reason: "no koli quantity" });
+        if (!code) {
+          rejected.push({ line: rawLine, reason: "no code" });
           continue;
         }
 
-        const qtyCases = parseOcrNumber(koliMatch[1]);
+        const koliMatch = rawLine.match(KOLI_QTY_REGEX);
+        const qtyCases = parseOcrNumber(koliMatch?.[1]);
         if (!Number.isFinite(qtyCases) || qtyCases <= 0) {
-          rejected.push({ line: raw, reason: "koli quantity invalid" });
+          rejected.push({ line: rawLine, reason: "no koli quantity" });
           continue;
         }
 
-        const prevLine = String(scanLines[idx - 1] || "");
-        const nextLine = String(scanLines[idx + 1] || "");
-        const prevKey = normalizeTextKey(prevLine);
-        const nextKey = normalizeTextKey(nextLine);
-        const prevLooksLikeName =
-          prevLine &&
-          !containsAny(prevKey, blockTokens) &&
-          !/\b\d{5,8}\b/.test(prevLine) &&
-          !KOLI_QTY_REGEX.test(prevLine);
-        const nextLooksLikeName =
-          nextLine &&
-          !containsAny(nextKey, blockTokens) &&
-          !/\b\d{5,8}\b/.test(nextLine) &&
-          !KOLI_QTY_REGEX.test(nextLine);
-        const nextLooksLikeAmountTail =
-          nextLine &&
-          !containsAny(nextKey, blockTokens) &&
-          !/\b\d{5,8}\b/.test(nextLine) &&
-          !KOLI_QTY_REGEX.test(nextLine) &&
-          /(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?:\s*tl|\s*₺)?\s*$/i.test(nextLine);
-
+        const packMatch = rawLine.match(/\b(\d+(?:[.,]\d+)?)\s*[xX]\s*(\d+(?:[.,]\d+)?)\b/);
         let unitsPerCase = parseOcrNumber(packMatch?.[2]);
         if (!Number.isFinite(unitsPerCase) || unitsPerCase <= 1 || unitsPerCase > 200) {
           unitsPerCase = null;
         }
 
-        const amountContext = `${prevLooksLikeName ? `${prevLine} ` : ""}${rawLine}${nextLooksLikeAmountTail ? ` ${nextLine}` : ""}`.trim();
-        const amountTokensWithIdx = extractNumbersWithIdx(amountContext).filter(
+        const numberTokens = extractNumbersWithIdx(rawLine).filter(
           (n) => Number.isFinite(n.value) && n.value > 0
         );
-        const tlValues = [];
+        const tlTokens = [];
         const tlRegex =
           /(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?=\s*tl|\s*₺)/gi;
         let tMatch;
-        while ((tMatch = tlRegex.exec(amountContext)) !== null) {
-          const v = parseOcrNumber(tMatch[1]);
-          if (Number.isFinite(v) && v > 0) {
-            tlValues.push(v);
+        while ((tMatch = tlRegex.exec(rawLine)) !== null) {
+          const value = parseOcrNumber(tMatch[1]);
+          if (Number.isFinite(value) && value > 0) {
+            tlTokens.push({ value, index: tMatch.index });
           }
         }
-        const allNumbers = amountTokensWithIdx.map((n) => n.value).filter((n) => n < 10000);
-        const maxSimpleAmount = allNumbers.length > 0 ? Math.max(...allNumbers) : null;
 
-        let unitPrice = tlValues.length > 0 ? tlValues[0] : null;
-        let lineTotal = tlValues.length > 0 ? tlValues[tlValues.length - 1] : null;
-        if (!Number.isFinite(lineTotal)) {
-          const numbers = extractNumbersWithIdx(rawLine)
-            .map((n) => n.value)
-            .filter((n) => Number.isFinite(n) && n > 0);
-          unitPrice = numbers.find((n) => n >= 5 && n <= 5000) || unitPrice;
-          lineTotal = numbers.length ? numbers[numbers.length - 1] : null;
-        }
-        const excluded = [qtyCases, parseOcrNumber(packMatch?.[1]), parseOcrNumber(packMatch?.[2])].filter(
-          (n) => Number.isFinite(n)
-        );
-        const pctValues = [...rawLine.matchAll(/%\s*([0-9]{1,2}(?:[.,]\d+)?)/gi)]
-          .map((x) => parseOcrNumber(x[1]))
-          .filter((x) => Number.isFinite(x));
-        const amountCandidates = allNumbers.filter(
-          (n) =>
-            n.value >= 1 &&
-            !excluded.some((ex) => Math.abs(ex - n.value) <= 0.01) &&
-            !pctValues.some((pv) => Math.abs(pv - n.value) <= 0.01)
-        );
-
-        const rightmostAmount = amountCandidates.length
-          ? amountCandidates[amountCandidates.length - 1]
-          : null;
-        const maxAmount = amountCandidates.length
-          ? amountCandidates.reduce((best, cur) => (cur.value > best.value ? cur : best), amountCandidates[0])
-          : null;
-
-        let lineTotalToken = tlValues.length > 0 ? tlValues[tlValues.length - 1] : null;
-        if (!lineTotalToken && rightmostAmount) lineTotalToken = rightmostAmount;
-        if (
-          rightmostAmount &&
-          (
-            !lineTotalToken ||
-            rightmostAmount.index > lineTotalToken.index ||
-            rightmostAmount.value > lineTotalToken.value * 1.15
-          )
-        ) {
-          lineTotalToken = rightmostAmount;
-        }
-        if (
-          maxAmount &&
-          lineTotalToken &&
-          maxAmount.value > lineTotalToken.value * 1.8 &&
-          maxAmount.value >= 30
-        ) {
-          lineTotalToken = maxAmount;
-        }
-        lineTotal = lineTotalToken?.value || null;
-        const targetUnitPrice = Number.isFinite(lineTotal) && qtyCases > 0 ? lineTotal / qtyCases : null;
-        const unitPriceCandidates = amountCandidates.filter(
-          (n) =>
-            (!lineTotalToken || n.index < lineTotalToken.index) &&
-            n.value >= 0.5 &&
-            n.value <= 100000
-        );
-        if (unitPriceCandidates.length > 0) {
-          if (Number.isFinite(targetUnitPrice) && targetUnitPrice > 0) {
-            unitPrice = unitPriceCandidates
-              .slice()
-              .sort((a, b) => Math.abs(a.value - targetUnitPrice) - Math.abs(b.value - targetUnitPrice))[0]
-              ?.value ?? null;
-          } else {
-            unitPrice = unitPriceCandidates[0]?.value ?? null;
-          }
-        } else if (tlValues.length > 0) {
-          unitPrice = tlValues[0]?.value ?? null;
-        }
-
+        let lineTotal = tlTokens.length > 0
+          ? tlTokens[tlTokens.length - 1].value
+          : numberTokens.length > 0
+            ? numberTokens[numberTokens.length - 1].value
+            : null;
         if (!Number.isFinite(lineTotal) || lineTotal <= 0) {
           rejected.push({ line: rawLine, reason: "no total" });
           continue;
         }
 
-        const vatMatches = [...rawLine.matchAll(/%\s*([0-9]{1,2}(?:[.,]\d+)?)/gi)];
-        const vatRate =
-          vatMatches.length > 0
-            ? parseOcrNumber(vatMatches[vatMatches.length - 1][1])
-            : null;
-        if (!Number.isFinite(vatRate) && amountTokens.length >= 2) {
-          const midSegment = rawLine.slice(
-            amountTokens[0].index + String(amountTokens[0].raw || "").length,
-            amountTokens[amountTokens.length - 1].index
-          );
-          const midNumbers = extractNumbersWithIdx(midSegment)
-            .map((n) => n.value)
-            .filter((n) => Number.isFinite(n) && n >= 0 && n <= 100);
-          if (midNumbers.length > 0) {
-            vatRate = midNumbers[0];
-          }
-        }
-        if (Number.isFinite(vatRate) && vatRate > 50 && vatRate <= 100) {
-          vatRate = vatRate / 100;
+        const lineTotalIdx = tlTokens.length > 0
+          ? tlTokens[tlTokens.length - 1].index
+          : numberTokens.length > 0
+            ? numberTokens[numberTokens.length - 1].index
+            : Number.MAX_SAFE_INTEGER;
+        const amountCandidates = numberTokens.filter((n) => n.index < lineTotalIdx);
+        const targetUnitPrice = lineTotal / qtyCases;
+        let unitPrice = null;
+        if (amountCandidates.length > 0) {
+          unitPrice = amountCandidates
+            .slice()
+            .sort((a, b) => Math.abs(a.value - targetUnitPrice) - Math.abs(b.value - targetUnitPrice))[0]
+            ?.value ?? null;
+        } else if (tlTokens.length > 1) {
+          unitPrice = tlTokens[0].value;
         }
 
-        const dedupeKey = `${normalizeTextKey(name)}|${qtyCases}|${lineTotal || 0}`;
+        const nameStart = (codeMatch.index || 0) + code.length;
+        const nameEnd = koliMatch?.index || lineTotalIdx || rawLine.length;
+        const name = normalizeNameCandidate(rawLine.slice(nameStart, nameEnd));
+        if (!hasStrongName(name)) {
+          rejected.push({ line: rawLine, reason: "name weak" });
+          continue;
+        }
+
+        let vatRate = null;
+        const vatMatches = [...rawLine.matchAll(/%\s*([0-9]{1,2}(?:[.,]\d+)?)/gi)];
+        if (vatMatches.length > 0) {
+          vatRate = parseOcrNumber(vatMatches[vatMatches.length - 1][1]);
+          if (Number.isFinite(vatRate) && vatRate > 50 && vatRate <= 100) {
+            vatRate = vatRate / 100;
+          }
+        }
+
+        const dedupeKey = `${normalizeTextKey(name)}|${qtyCases}|${lineTotal.toFixed(2)}`;
         if (dedupe.has(dedupeKey)) continue;
         dedupe.add(dedupeKey);
 
@@ -1339,7 +1258,7 @@ const parseCurrency = (text) => {
           unit_price_ex_vat: Number.isFinite(unitPrice) ? unitPrice : null,
           discount_rate: null,
           vat_rate: Number.isFinite(vatRate) ? vatRate : null,
-          line_total_inc_vat: Number.isFinite(lineTotal) ? lineTotal : null,
+          line_total_inc_vat: lineTotal,
         });
       }
 
@@ -3191,24 +3110,36 @@ const parseCurrency = (text) => {
       // Call Python script to extract items
       const pythonScript = path.join(__dirname, "..", "tools", "supplier_invoice_item_extractor.py");
       const pythonExe = process.env.OCR_PYTHON || "python3";
+      const systemPathPrefix = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+      const runtimePath = process.env.PATH
+        ? `${systemPathPrefix}:${process.env.PATH}`
+        : systemPathPrefix;
       
-      const runPythonExtractor = ({ timeoutMs, forceTesseract = false }) =>
+      const runPythonExtractor = ({ timeoutMs, forceTesseract = false, forcePaddle = false }) =>
         new Promise((resolve, reject) => {
           const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 180000;
           console.log(
-            `📍 Starting OCR extraction with ${timeout / 1000}s timeout${forceTesseract ? " (forced tesseract)" : ""}`
+            `📍 Starting OCR extraction with ${timeout / 1000}s timeout${forceTesseract ? " (forced tesseract)" : forcePaddle ? " (forced paddle)" : ""}`
           );
           const startTime = Date.now();
           const childEnv = {
             ...process.env,
             // Ensure system-installed binaries like tesseract are discoverable on EB
-            PATH: `/usr/local/bin:${process.env.PATH || ""}`,
-            SUPPLIER_OCR_MODE: process.env.SUPPLIER_OCR_MODE || "safe",
+            PATH: runtimePath,
+            // Force resilient defaults for primary pass; allow explicit overrides per retry strategy.
+            SUPPLIER_OCR_MODE: forcePaddle ? "paddle" : "safe",
+            SUPPLIER_OCR_ALLOW_PADDLE_FALLBACK: forceTesseract ? "false" : "true",
           };
           if (forceTesseract) {
             childEnv.SUPPLIER_OCR_FORCE_TESSERACT = "true";
             childEnv.SUPPLIER_OCR_ALLOW_PADDLE_FALLBACK = "false";
             childEnv.SUPPLIER_OCR_MODE = "safe";
+          } else {
+            childEnv.SUPPLIER_OCR_FORCE_TESSERACT = "false";
+            if (forcePaddle) {
+              childEnv.SUPPLIER_OCR_MODE = "paddle";
+              childEnv.SUPPLIER_OCR_ALLOW_PADDLE_FALLBACK = "true";
+            }
           }
 
           execFile(
@@ -3240,6 +3171,7 @@ const parseCurrency = (text) => {
                 stderr_bytes: Buffer.byteLength(stderrText, "utf8"),
                 python_executable: pythonExe,
                 force_tesseract: forceTesseract,
+                force_paddle: forcePaddle,
               };
 
               console.log("📊 OCR process summary:", processSummary);
@@ -3310,34 +3242,62 @@ const parseCurrency = (text) => {
       try {
         ocrOutput = await runPythonExtractor({ timeoutMs: primaryTimeout, forceTesseract: false });
       } catch (primaryErr) {
-        if (!shouldRetryWithForcedTesseract(primaryErr?.python)) {
-          throw primaryErr;
-        }
+        const primaryErrorText = String(
+          primaryErr?.python?.parsed_error?.error || primaryErr?.message || ""
+        ).toLowerCase();
+        const missingTesseract =
+          primaryErrorText.includes("tesseract binary not found") ||
+          primaryErrorText.includes("tesseract failed") ||
+          primaryErrorText.includes("engine: 'tesseract'");
 
-        const fallbackTimeoutCandidate = Number(process.env.SUPPLIER_OCR_TESSERACT_TIMEOUT_MS);
-        const fallbackTimeout =
-          Number.isFinite(fallbackTimeoutCandidate) && fallbackTimeoutCandidate > 0
-            ? fallbackTimeoutCandidate
-            : 90000;
-        console.warn("⚠️ Retrying OCR with forced Tesseract fallback", {
-          reason: primaryErr?.message,
-          python: primaryErr?.python,
-        });
-
-        try {
-          ocrOutput = await runPythonExtractor({
-            timeoutMs: fallbackTimeout,
-            forceTesseract: true,
+        if (missingTesseract) {
+          console.warn("⚠️ Retrying OCR with forced Paddle due to missing/broken Tesseract", {
+            reason: primaryErr?.message,
+            python: primaryErr?.python,
           });
-        } catch (fallbackErr) {
-          const combined = new Error(
-            `OCR failed after forced Tesseract fallback. Primary: ${primaryErr?.message}. Fallback: ${fallbackErr?.message}`
-          );
-          combined.python = {
-            primary: primaryErr?.python || null,
-            fallback: fallbackErr?.python || null,
-          };
-          throw combined;
+          try {
+            ocrOutput = await runPythonExtractor({
+              timeoutMs: primaryTimeout,
+              forcePaddle: true,
+            });
+          } catch (paddleErr) {
+            const combined = new Error(
+              `OCR failed after forced Paddle retry. Primary: ${primaryErr?.message}. Paddle: ${paddleErr?.message}`
+            );
+            combined.python = {
+              primary: primaryErr?.python || null,
+              paddle: paddleErr?.python || null,
+            };
+            throw combined;
+          }
+        } else if (!shouldRetryWithForcedTesseract(primaryErr?.python)) {
+          throw primaryErr;
+        } else {
+          const fallbackTimeoutCandidate = Number(process.env.SUPPLIER_OCR_TESSERACT_TIMEOUT_MS);
+          const fallbackTimeout =
+            Number.isFinite(fallbackTimeoutCandidate) && fallbackTimeoutCandidate > 0
+              ? fallbackTimeoutCandidate
+              : 90000;
+          console.warn("⚠️ Retrying OCR with forced Tesseract fallback", {
+            reason: primaryErr?.message,
+            python: primaryErr?.python,
+          });
+
+          try {
+            ocrOutput = await runPythonExtractor({
+              timeoutMs: fallbackTimeout,
+              forceTesseract: true,
+            });
+          } catch (fallbackErr) {
+            const combined = new Error(
+              `OCR failed after forced Tesseract fallback. Primary: ${primaryErr?.message}. Fallback: ${fallbackErr?.message}`
+            );
+            combined.python = {
+              primary: primaryErr?.python || null,
+              fallback: fallbackErr?.python || null,
+            };
+            throw combined;
+          }
         }
       }
 
@@ -3387,7 +3347,7 @@ const parseCurrency = (text) => {
                 maxBuffer: 8 * 1024 * 1024,
                 env: {
                   ...process.env,
-                  PATH: `/usr/local/bin:${process.env.PATH || ""}`,
+                  PATH: runtimePath,
                   OMP_NUM_THREADS: process.env.OMP_NUM_THREADS || "1",
                 },
               },
@@ -3483,7 +3443,7 @@ const parseCurrency = (text) => {
               maxBuffer: 12 * 1024 * 1024,
               env: {
                 ...process.env,
-                PATH: `/usr/local/bin:${process.env.PATH || ""}`,
+                PATH: runtimePath,
                 OMP_NUM_THREADS: process.env.OMP_NUM_THREADS || "1",
               },
             },

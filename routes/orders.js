@@ -680,16 +680,147 @@ module.exports = function(io) {
     return hasPaymentMethodChangesTracking;
   }
 
-  ensureCustomerDebtColumn();
-  ensureOrderDebtTracking();
-  ensurePaymentChangeTracking();
-  ensurePaymentMethodChangesTracking();
-
   const toMoney = (value) => {
     const num = Number.parseFloat(value);
     if (!Number.isFinite(num)) return 0;
     return Math.round(num * 100) / 100;
   };
+
+  const ORDER_LIST_COLUMNS = Object.freeze([
+    "id",
+    "restaurant_id",
+    "table_number",
+    "status",
+    "total",
+    "order_type",
+    "customer_name",
+    "customer_phone",
+    "customer_address",
+    "payment_method",
+    "receipt_id",
+    "is_paid",
+    "tax_type",
+    "tax_value",
+    "discount_type",
+    "discount_value",
+    "driver_id",
+    "driver_status",
+    "picked_up_at",
+    "delivered_at",
+    "kitchen_delivered_at",
+    "pickup_time",
+    "takeaway_notes",
+    "reservation_date",
+    "reservation_time",
+    "reservation_clients",
+    "reservation_notes",
+    "external_id",
+    "external_source",
+    "external_expedition_type",
+    "cancelled_at",
+    "cancellation_reason",
+    "created_at",
+    "updated_at",
+  ]);
+  let orderListSelectCache = null;
+  let orderListSelectPromise = null;
+
+  async function getOrderListSelectSql() {
+    if (orderListSelectCache) return orderListSelectCache;
+    if (!orderListSelectPromise) {
+      orderListSelectPromise = (async () => {
+        const { rows } = await pool.query(
+          `
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'orders'
+          `
+        );
+        const existingCols = new Set(rows.map((row) => String(row.column_name || "").toLowerCase()));
+        const plain = ORDER_LIST_COLUMNS.map((col) =>
+          existingCols.has(col.toLowerCase()) ? col : `NULL AS ${col}`
+        ).join(", ");
+        const aliased = ORDER_LIST_COLUMNS.map((col) =>
+          existingCols.has(col.toLowerCase()) ? `o.${col}` : `NULL AS ${col}`
+        ).join(", ");
+        orderListSelectCache = { plain, aliased };
+        return orderListSelectCache;
+      })().catch((err) => {
+        console.warn("⚠️ Failed to introspect orders columns for list projection:", err?.message || err);
+        const fallbackCols = [
+          "id",
+          "restaurant_id",
+          "table_number",
+          "status",
+          "total",
+          "order_type",
+          "customer_name",
+          "customer_phone",
+          "customer_address",
+          "payment_method",
+          "receipt_id",
+          "is_paid",
+          "created_at",
+          "updated_at",
+        ];
+        orderListSelectCache = {
+          plain: fallbackCols.join(", "),
+          aliased: fallbackCols.map((col) => `o.${col}`).join(", "),
+        };
+        return orderListSelectCache;
+      });
+    }
+    return orderListSelectPromise;
+  }
+
+  const IDENTIFIER_CACHE_TTL_MS = 60_000;
+  const IDENTIFIER_CACHE_MAX = 1000;
+  const restaurantIdentifierCache = new Map();
+
+  const getIdentifierCacheKey = (identifier) => String(identifier || "").trim();
+
+  function readIdentifierCache(identifier) {
+    const key = getIdentifierCacheKey(identifier);
+    if (!key) return null;
+    const cached = restaurantIdentifierCache.get(key);
+    if (!cached) return null;
+    if (cached.expiresAt <= Date.now()) {
+      restaurantIdentifierCache.delete(key);
+      return null;
+    }
+    return cached.restaurantId;
+  }
+
+  function writeIdentifierCache(identifier, restaurantId) {
+    const key = getIdentifierCacheKey(identifier);
+    if (!key) return;
+    if (!restaurantIdentifierCache.has(key) && restaurantIdentifierCache.size >= IDENTIFIER_CACHE_MAX) {
+      const oldestKey = restaurantIdentifierCache.keys().next().value;
+      if (oldestKey) restaurantIdentifierCache.delete(oldestKey);
+    }
+    restaurantIdentifierCache.set(key, {
+      restaurantId: restaurantId ?? null,
+      expiresAt: Date.now() + IDENTIFIER_CACHE_TTL_MS,
+    });
+  }
+
+  async function lookupRestaurantIdByIdentifier(identifier) {
+    const normalized = String(identifier || "").trim();
+    if (!normalized) return null;
+    if (/^\d+$/.test(normalized)) return Number(normalized);
+
+    const cached = readIdentifierCache(normalized);
+    if (cached !== null) return cached;
+
+    const { rows } = await pool.query(
+      "SELECT id FROM restaurants WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1 LIMIT 1",
+      [normalized]
+    );
+    const restaurantId = rows[0]?.id ? Number(rows[0].id) : null;
+    writeIdentifierCache(normalized, restaurantId);
+    return restaurantId;
+  }
 
   const PUBLIC_GET_PATTERNS = [/^\/$/, /^\/\d+$/, /^\/\d+\/items$/];
 
@@ -768,14 +899,10 @@ module.exports = function(io) {
     ) {
       return (async () => {
         try {
-          const { rows } = await pool.query(
-            "SELECT id FROM restaurants WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1 LIMIT 1",
-            [identifier]
-          );
-          if (!rows.length) {
+          const restaurant_id = await lookupRestaurantIdByIdentifier(identifier);
+          if (!restaurant_id) {
             return res.status(404).json({ error: "Invalid restaurant" });
           }
-          const restaurant_id = rows[0].id;
           req.user = {
             id: null,
             name: "qr-guest",
@@ -815,16 +942,9 @@ async function resolveRestaurantId(req) {
   let restaurant_id = req.user?.restaurant_id;
 
   if (identifier) {
-    if (/^\d+$/.test(identifier)) {
-      restaurant_id = Number(identifier);
-    } else {
-      const result = await pool.query(
-        "SELECT id FROM restaurants WHERE slug = $1 OR qr_code_id = $1 LIMIT 1",
-        [identifier]
-      );
-      // If identifier doesn't match, don't clobber an already-authenticated restaurant_id.
-      restaurant_id = result.rows[0]?.id ?? restaurant_id;
-    }
+    const resolvedByIdentifier = await lookupRestaurantIdByIdentifier(identifier);
+    // If identifier doesn't match, don't clobber an already-authenticated restaurant_id.
+    restaurant_id = resolvedByIdentifier ?? restaurant_id;
   }
 
   return restaurant_id;
@@ -844,26 +964,6 @@ const OPEN_ORDER_MODES = Object.freeze({
   kitchen: ["table", "phone", "packet", "takeaway"],
   both: ["table", "phone", "packet", "takeaway"],
 });
-
-let openOrderBatchIndexesEnsured = false;
-async function ensureOpenOrderBatchIndexes() {
-  if (openOrderBatchIndexesEnsured) return true;
-  try {
-    await pool.query(
-      `CREATE INDEX IF NOT EXISTS idx_orders_restaurant_status_type
-         ON orders(restaurant_id, status, order_type)`
-    );
-    await pool.query(
-      `CREATE INDEX IF NOT EXISTS idx_order_items_order_id
-         ON order_items(order_id)`
-    );
-    openOrderBatchIndexesEnsured = true;
-    return true;
-  } catch (err) {
-    console.warn("⚠️ Unable to ensure open-order batch indexes:", err?.message || err);
-    return false;
-  }
-}
 
 async function closeStaleReservations(restaurantId) {
   if (!restaurantId) return [];
@@ -1145,9 +1245,6 @@ async function logCustomerTraffic(client, { restaurantId, orderId, tableNumber, 
     return { skipped: true, reason: "no_delta" };
   }
 
-  await ensureOrdersTrafficLoggedColumn();
-  await ensureCustomerTrafficTables(client);
-
   const ymd = toLocalYmd(forDate || undefined);
 
   try {
@@ -1314,8 +1411,6 @@ async function ensureCancellationFields() {
   }
 }
 
-ensureCancellationFields();
-
 let orderItemsHasCancellationFields = null;
 let orderItemsCancellationColumns = null;
 
@@ -1372,7 +1467,35 @@ async function ensureOrderItemCancellationFields() {
   }
 }
 
-ensureOrderItemCancellationFields();
+let ordersRouteSchemaBootstrapPromise = null;
+function bootstrapOrdersRouteSchema() {
+  if (ordersRouteSchemaBootstrapPromise) return ordersRouteSchemaBootstrapPromise;
+  ordersRouteSchemaBootstrapPromise = (async () => {
+    const bootstrapSteps = [
+      ["ensureCustomerDebtColumn", () => ensureCustomerDebtColumn()],
+      ["ensureOrderDebtTracking", () => ensureOrderDebtTracking()],
+      ["ensurePaymentChangeTracking", () => ensurePaymentChangeTracking()],
+      ["ensurePaymentMethodChangesTracking", () => ensurePaymentMethodChangesTracking()],
+      ["ensureTakeawayFields", () => ensureTakeawayFields()],
+      ["ensureOrdersTrafficLoggedColumn", () => ensureOrdersTrafficLoggedColumn()],
+      ["ensureCustomerTrafficTables", () => ensureCustomerTrafficTables()],
+      ["ensureKitchenTimingFields", () => ensureKitchenTimingFields()],
+      ["ensureCancellationFields", () => ensureCancellationFields()],
+      ["ensureOrderItemCancellationFields", () => ensureOrderItemCancellationFields()],
+      ["ensureOrderItemsStockDeductedColumn", () => ensureOrderItemsStockDeductedColumn()],
+    ];
+    for (const [name, runner] of bootstrapSteps) {
+      try {
+        await runner();
+      } catch (err) {
+        console.warn(`⚠️ ${name} bootstrap failed:`, err?.message || err);
+      }
+    }
+  })();
+  return ordersRouteSchemaBootstrapPromise;
+}
+
+bootstrapOrdersRouteSchema();
 
 
 // ---- Shared payload builder for printer (no order_number) ----
@@ -1459,6 +1582,7 @@ async function buildFullOrderPayload(orderId, restaurantId) {
 // Supports: ?status=open_phone to return ONLY non-closed phone/packet orders
 router.get("/", async (req, res) => {
   try {
+    const orderSelect = await getOrderListSelectSql();
     const restaurantId = await requireRestaurantId(req, res);
     if (!restaurantId) return;
     const { status, table_number, type } = req.query;
@@ -1471,7 +1595,7 @@ router.get("/", async (req, res) => {
     // 🔐 Special mode: always and only open phone/packet
     if (String(status).toLowerCase() === "open_phone") {
       const { rows } = await pool.query(
-        `SELECT *
+        `SELECT ${orderSelect.plain}
            FROM orders
           WHERE restaurant_id = $1
             AND order_type IN ('phone','packet')
@@ -1483,7 +1607,7 @@ router.get("/", async (req, res) => {
     }
 
     // 🔎 default behavior
-    let sql = "SELECT * FROM orders WHERE restaurant_id = $1";
+    let sql = `SELECT ${orderSelect.plain} FROM orders WHERE restaurant_id = $1`;
     const params = [restaurantId];
     let idx = 2;
 
@@ -1513,8 +1637,7 @@ router.get("/", async (req, res) => {
 // Batched open-order payload used by TableOverview kitchen/packet views.
 router.get("/open/with-items", async (req, res) => {
   try {
-    await ensureOpenOrderBatchIndexes();
-
+    const orderSelect = await getOrderListSelectSql();
     const modeRaw = String(req.query.mode || "both").trim().toLowerCase();
     const mode = OPEN_ORDER_MODES[modeRaw] ? modeRaw : "both";
     const allowedTypes = OPEN_ORDER_MODES[mode];
@@ -1565,7 +1688,7 @@ router.get("/open/with-items", async (req, res) => {
     const { rows } = await pool.query(
       `
       SELECT
-        o.*,
+        ${orderSelect.aliased},
         COALESCE(oi.items, '[]'::json) AS items,
         COALESCE(rm.receipt_methods, '[]'::json) AS receipt_methods
       FROM orders o
@@ -1689,29 +1812,23 @@ router.get("/receipt-methods/bulk", async (req, res) => {
 router.post("/", async (req, res) => {
   console.log("💬 /orders payload:", req.body);
 
-  // --- TIMEZONE-SAFE REGISTER OPEN LOGIC ---
-  const { rows: openLogs } = await pool.query(`
-    SELECT * FROM cash_register_logs WHERE type = 'open' ORDER BY created_at DESC LIMIT 1
-  `);
-  const lastOpen = openLogs[0];
-
-  if (!lastOpen) {
-    return res.status(403).json({ error: "Register is closed. Cannot place order." });
-  }
-
-  const { rows: closeLogs } = await pool.query(
-    `SELECT * FROM cash_register_logs WHERE type = 'close' AND created_at > $1 ORDER BY created_at ASC LIMIT 1`,
-    [lastOpen.created_at]
-  );
-  const lastClose = closeLogs[0] || null;
-
-  if (lastClose) {
-    return res.status(403).json({ error: "Register is closed. Cannot place order." });
-  }
-  // --- END REGISTER CHECK ---
-
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
+  const { rows: registerStateRows } = await pool.query(
+    `
+      SELECT type
+      FROM cash_register_logs
+      WHERE restaurant_id = $1
+        AND type IN ('open', 'close')
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `,
+    [restaurantId]
+  );
+  const lastRegisterEventType = String(registerStateRows[0]?.type || "").toLowerCase();
+  if (lastRegisterEventType !== "open") {
+    return res.status(403).json({ error: "Register is closed. Cannot place order." });
+  }
 
   const client = await pool.connect();
   try {
@@ -1724,7 +1841,29 @@ router.post("/", async (req, res) => {
       customer_phone,
       customer_address,
       payment_method,
+      reservation_clients,
     } = req.body;
+    const hasReservationClientsInPayload =
+      Object.prototype.hasOwnProperty.call(req.body || {}, "reservation_clients") ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, "reservationClients");
+    const reservationClientsRaw =
+      reservation_clients ?? req.body?.reservationClients ?? null;
+    let reservationClientsValue = null;
+    if (hasReservationClientsInPayload) {
+      if (reservationClientsRaw === null || reservationClientsRaw === "") {
+        reservationClientsValue = null;
+      } else {
+        const parsedReservationClients = Number(reservationClientsRaw);
+        if (
+          !Number.isFinite(parsedReservationClients) ||
+          parsedReservationClients < 0 ||
+          parsedReservationClients > 500
+        ) {
+          return res.status(400).json({ error: "Invalid reservation_clients" });
+        }
+        reservationClientsValue = Math.trunc(parsedReservationClients);
+      }
+    }
 
     // When coming from a QR table token, lock the table_number to the token
     let effectiveTableNumber = table_number || null;
@@ -1795,7 +1934,7 @@ router.post("/", async (req, res) => {
       null;
 
     console.log("ORDER TYPE from payload:", order_type);
-    const includeTakeawayFields = await ensureTakeawayFields();
+    const includeTakeawayFields = ordersHasTakeawayFields === true;
     const hasCreatedByColumn = await hasOrdersCreatedByColumn();
     await client.query("BEGIN");
 
@@ -2038,6 +2177,7 @@ router.post("/", async (req, res) => {
       "pickup_lng",
       "delivery_lat",
       "delivery_lng",
+      "reservation_clients",
     ];
     const insertValues = [
       restaurantId,
@@ -2053,6 +2193,7 @@ router.post("/", async (req, res) => {
       pickupLng,
       deliveryLat,
       deliveryLng,
+      reservationClientsValue,
     ];
 
     if (includeTakeawayFields) {
@@ -2075,6 +2216,36 @@ router.post("/", async (req, res) => {
 const orderResult = await client.query(orderInsertQuery, insertValues);
 
 const order = orderResult.rows[0];
+
+// Keep table guests in sync for QR/table orders that send reservation_clients.
+if (
+  String(order_type || "").toLowerCase() === "table" &&
+  Number.isFinite(Number(order?.table_number)) &&
+  hasReservationClientsInPayload
+) {
+  const tableNumber = Number(order.table_number);
+  try {
+    const updateGuestsRes = await client.query(
+      `UPDATE tables
+          SET guests = $1
+        WHERE restaurant_id = $2 AND number = $3`,
+      [reservationClientsValue, restaurantId, tableNumber]
+    );
+
+    if (updateGuestsRes.rowCount === 0 && reservationClientsValue !== null) {
+      await client.query(
+        `INSERT INTO tables (restaurant_id, number, guests)
+         SELECT $1, $2, $3
+         WHERE NOT EXISTS (
+           SELECT 1 FROM tables WHERE restaurant_id = $1 AND number = $2
+         )`,
+        [restaurantId, tableNumber, reservationClientsValue]
+      );
+    }
+  } catch (tableGuestsErr) {
+    console.warn("⚠️ Failed syncing table guests from order create:", tableGuestsErr.message);
+  }
+}
 
 // ✅ Immediately persist customer + address (so it shows on frontend top bar)
 if (customer_phone && customer_address) {
@@ -2221,7 +2392,6 @@ router.put("/:id/pay", async (req, res) => {
 
   const client = await pool.connect();
   try {
-    await ensureOrderDebtTracking();
     await client.query("BEGIN");
 
     const hasCreatedByColumn = await hasOrdersCreatedByColumn();
@@ -2366,7 +2536,7 @@ router.put("/:id/pay", async (req, res) => {
 
 router.put("/:id/status", async (req, res) => {
   const { id } = req.params;
-  const { status, total, payment_method, payment_status } = req.body; // ✅ added payment_status
+  const { status, total, payment_method, payment_status, reservation_clients } = req.body; // ✅ added payment_status
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
 
@@ -2379,9 +2549,6 @@ router.put("/:id/status", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await ensureOrderDebtTracking();
-    await ensureKitchenTimingFields();
-    await ensureOrdersTrafficLoggedColumn();
     await client.query("BEGIN");
 
     const { rows: existingRows } = await client.query(
@@ -2426,6 +2593,28 @@ router.put("/:id/status", async (req, res) => {
       typeof payment_status === "string" && payment_status.trim() !== ""
         ? payment_status.trim().toLowerCase()
         : null;
+    const hasReservationClientsInPayload =
+      Object.prototype.hasOwnProperty.call(req.body || {}, "reservation_clients") ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, "reservationClients");
+    const reservationClientsRaw =
+      reservation_clients ?? req.body?.reservationClients ?? null;
+    let reservationClientsValue = null;
+    if (hasReservationClientsInPayload) {
+      if (reservationClientsRaw === null || reservationClientsRaw === "") {
+        reservationClientsValue = null;
+      } else {
+        const parsedReservationClients = Number(reservationClientsRaw);
+        if (
+          !Number.isFinite(parsedReservationClients) ||
+          parsedReservationClients < 0 ||
+          parsedReservationClients > 500
+        ) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Invalid reservation_clients" });
+        }
+        reservationClientsValue = Math.trunc(parsedReservationClients);
+      }
+    }
     const paidRequested = normalizedStatus === "paid" || normalizedPaymentStatus === "paid";
     const closedRequested = normalizedStatus === "closed";
 
@@ -2453,6 +2642,10 @@ router.put("/:id/status", async (req, res) => {
          total = COALESCE($2, total),
          payment_method = COALESCE($3, payment_method),
          payment_status = COALESCE($4, payment_status),       -- ✅ added this
+         reservation_clients = CASE
+           WHEN $5::boolean THEN $6::integer
+           ELSE reservation_clients
+         END,
          kitchen_delivered_at = CASE
            WHEN ($1 = 'paid' OR $4 = 'paid' OR $1 = 'closed')
              THEN COALESCE(kitchen_delivered_at, NOW())
@@ -2463,13 +2656,15 @@ router.put("/:id/status", async (req, res) => {
                      WHEN $1 IN ('confirmed') THEN false
                      ELSE is_paid
                    END
-       WHERE id = $5 AND restaurant_id = $6
+       WHERE id = $7 AND restaurant_id = $8
        RETURNING *`,
       [
         normalizedStatus,
         nextTotal,
         payment_method,
         normalizedPaymentStatus,
+        hasReservationClientsInPayload,
+        reservationClientsValue,
         parsedId,
         restaurantId,
       ]
@@ -2481,6 +2676,35 @@ router.put("/:id/status", async (req, res) => {
     }
 
     const updatedOrder = result.rows[0];
+
+    if (
+      hasReservationClientsInPayload &&
+      Number.isFinite(Number(updatedOrder?.table_number)) &&
+      String(updatedOrder?.order_type || "").toLowerCase() === "table"
+    ) {
+      const tableNumber = Number(updatedOrder.table_number);
+      try {
+        const updateGuestsRes = await client.query(
+          `UPDATE tables
+              SET guests = $1
+            WHERE restaurant_id = $2 AND number = $3`,
+          [reservationClientsValue, restaurantId, tableNumber]
+        );
+
+        if (updateGuestsRes.rowCount === 0 && reservationClientsValue !== null) {
+          await client.query(
+            `INSERT INTO tables (restaurant_id, number, guests)
+             SELECT $1, $2, $3
+             WHERE NOT EXISTS (
+               SELECT 1 FROM tables WHERE restaurant_id = $1 AND number = $2
+             )`,
+            [restaurantId, tableNumber, reservationClientsValue]
+          );
+        }
+      } catch (tableGuestsErr) {
+        console.warn("⚠️ Failed syncing table guests from order status:", tableGuestsErr.message);
+      }
+    }
     const becamePaid = updatedOrder.is_paid && !existingOrder.is_paid;
     const shouldLogTraffic =
       !existingOrder.traffic_logged_at &&
@@ -2733,45 +2957,68 @@ router.get("/driver-report", async (req, res) => {
   }
 
   try {
-    // 👇 Add customer_name, customer_address to SELECT
-    const ordersRes = await pool.query(`
-      SELECT
-        id, payment_method, status, driver_status,
-        created_at, picked_up_at, delivered_at, kitchen_delivered_at,
-        customer_name, customer_address
-      FROM orders
-      WHERE driver_id = $1
-        AND DATE(delivered_at) = $2
-        AND driver_status = 'delivered'
-        AND status = 'closed'
-      ORDER BY delivered_at ASC
-    `, [driver_id, date]);
-    const orders = ordersRes.rows;
+    const restaurantId = await requireRestaurantId(req, res);
+    if (!restaurantId) return;
+    const ordersRes = await pool.query(
+      `
+        SELECT
+          o.id,
+          o.payment_method,
+          o.status,
+          o.driver_status,
+          o.created_at,
+          o.picked_up_at,
+          o.delivered_at,
+          o.kitchen_delivered_at,
+          o.customer_name,
+          o.customer_address,
+          COALESCE(
+            SUM(
+              COALESCE(oi.price::numeric, 0) * COALESCE(oi.quantity::numeric, 0)
+            ),
+            0
+          ) AS total,
+          CASE
+            WHEN o.picked_up_at IS NOT NULL AND o.delivered_at IS NOT NULL
+              THEN EXTRACT(EPOCH FROM (o.delivered_at - o.picked_up_at))
+            ELSE NULL
+          END AS delivery_time_seconds,
+          CASE
+            WHEN o.kitchen_delivered_at IS NOT NULL AND o.delivered_at IS NOT NULL
+              THEN EXTRACT(EPOCH FROM (o.delivered_at - o.kitchen_delivered_at))
+            ELSE NULL
+          END AS kitchen_to_delivery_seconds
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+        WHERE o.restaurant_id = $1
+          AND o.driver_id = $2
+          AND o.delivered_at::date = $3::date
+          AND o.driver_status = 'delivered'
+          AND o.status = 'closed'
+        GROUP BY o.id
+        ORDER BY o.delivered_at ASC
+      `,
+      [restaurantId, driver_id, date]
+    );
+    const orders = ordersRes.rows.map((row) => ({
+      ...row,
+      total: Number(row.total || 0),
+      delivery_time_seconds:
+        row.delivery_time_seconds == null ? null : Number(row.delivery_time_seconds),
+      kitchen_to_delivery_seconds:
+        row.kitchen_to_delivery_seconds == null ? null : Number(row.kitchen_to_delivery_seconds),
+    }));
 
     let total_sales = 0;
     const sales_by_method = {};
     const order_details = [];
     for (const order of orders) {
-      const { rows: items } = await pool.query(
-        "SELECT price, quantity FROM order_items WHERE order_id = $1",
-        [order.id]
-      );
-      const orderTotal = items.reduce((sum, i) => sum + parseFloat(i.price) * i.quantity, 0);
+      const orderTotal = Number(order.total || 0);
       total_sales += orderTotal;
-      order_details.push({
-        ...order,
-        total: orderTotal,
-        delivery_time_seconds:
-          order.picked_up_at && order.delivered_at
-            ? (new Date(order.delivered_at) - new Date(order.picked_up_at)) / 1000
-            : null,
-        kitchen_to_delivery_seconds:
-          order.kitchen_delivered_at && order.delivered_at
-            ? (new Date(order.delivered_at) - new Date(order.kitchen_delivered_at)) / 1000
-            : null,
-      });
+      order_details.push(order);
       if (order.payment_method) {
-        sales_by_method[order.payment_method] = (sales_by_method[order.payment_method] || 0) + orderTotal;
+        sales_by_method[order.payment_method] =
+          (sales_by_method[order.payment_method] || 0) + orderTotal;
       }
     }
 
@@ -3160,7 +3407,6 @@ const result = await pool.query(
       old_method !== undefined &&
       _payment_method !== old_method
     ) {
-      await ensurePaymentMethodChangesTracking();
       await pool.query(
         `INSERT INTO payment_method_changes (order_id, old_method, new_method, changed_by, changed_at)
          VALUES ($1, $2, $3, $4, NOW())`,
@@ -3214,8 +3460,6 @@ router.post("/:id/close", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   const client = await pool.connect();
   try {
-    await ensureOrderDebtTracking();
-    await ensureKitchenTimingFields();
     await client.query("BEGIN");
 
     const { rows } = await client.query(
@@ -3785,7 +4029,6 @@ router.post("/:id/add-debt", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   const client = await pool.connect();
   try {
-    await ensureOrderDebtTracking();
     await client.query("BEGIN");
 
     const payload = req.body || {};
@@ -4007,12 +4250,7 @@ router.get("/:id", async (req, res, next) => {
 
     // Allow public QR menu with ?identifier=
     if (!restaurant_id && identifier) {
-      if (/^\d+$/.test(identifier)) {
-        restaurant_id = Number(identifier);
-      } else {
-        const r = await pool.query("SELECT id FROM restaurants WHERE slug = $1", [identifier]);
-        restaurant_id = r.rows[0]?.id || null;
-      }
+      restaurant_id = await lookupRestaurantIdByIdentifier(identifier);
     }
 
     if (!restaurant_id) {
@@ -4558,7 +4796,6 @@ async function insertReceiptMethods(receiptId, methodAmounts = {}) {
 	  let { receipt_id, methods, order_id } = req.body;
 	
 	  try {
-	    await ensurePaymentMethodChangesTracking();
     // If missing, generate new receipt_id and update order
     if ((!receipt_id || receipt_id === "null") && order_id) {
       const { rows } = await pool.query(
@@ -4704,7 +4941,6 @@ router.put("/order-items/kitchen-status", async (req, res) => {
 
   const client = await pool.connect();
   try {
-    await ensureKitchenTimingFields();
     await client.query("BEGIN");
 
     // 1. Update kitchen_status for all items (tenant-safe, no reliance on order_items.restaurant_id)
@@ -5320,7 +5556,6 @@ const restaurantId = req.user.restaurant_id;
 
 if (order.external_source === "yemeksepeti") {
   try {
-    await ensureOrderItemsStockDeductedColumn();
     const { rows: orderItems } = await pool.query(
       `SELECT id, product_id, quantity, ingredients, extras,
               COALESCE(stock_deducted, FALSE) AS stock_deducted
@@ -5381,14 +5616,17 @@ else ioRef.to(`restaurant_${restaurantId}`).emit("orders_updated");
 // GET /api/orders/:id/payment-changes
 router.get('/:id/payment-changes', async (req, res) => {
   const { id } = req.params;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
   try {
-    await ensurePaymentMethodChangesTracking();
     const result = await pool.query(
       `SELECT old_method, new_method, changed_by, changed_at
-         FROM payment_method_changes
-         WHERE order_id = $1
+         FROM payment_method_changes pmc
+         JOIN orders o ON o.id = pmc.order_id
+         WHERE pmc.order_id = $1
+           AND o.restaurant_id = $2
          ORDER BY changed_at ASC`,
-      [id]
+      [id, restaurantId]
     );
     res.json(result.rows);
   } catch (err) {
@@ -5397,86 +5635,6 @@ router.get('/:id/payment-changes', async (req, res) => {
   }
 });
 
-router.get("/:raw", async (req, res, next) => {
-  const raw = String(req.params.raw || "").trim();
-  // Defer to more specific routes (e.g., /reservations, /reservations/:id)
-  if (!/^\d+$/.test(raw)) return next();
-  console.log(`🧪 [orders] GET /api/orders/${raw} — resolver start`);
-
-  try {
-    const restaurantId = await requireRestaurantId(req, res);
-    if (!restaurantId) return;
-    // Only allow numeric ID now (order_number column removed/not used)
-    if (!/^\d+$/.test(raw)) {
-      return res.status(400).json({ error: "Order id must be numeric", raw });
-    }
-    const internalId = parseInt(raw, 10);
-
-    // 3) Fetch header
-    const { rows: orderRows } = await pool.query(
-      `SELECT
-         id,
-         status,
-         table_number,
-         order_type,
-         total,
-         created_at,
-         customer_name,
-         customer_phone,
-         customer_address,
-         payment_method,
-         takeaway_notes,
-         receipt_id,
-         external_id,
-         external_source,
-         external_expedition_type
-       FROM orders WHERE restaurant_id = $1 AND id = $2`,
-[restaurantId, internalId]
-
-    );
-    if (!orderRows.length) {
-      return res.status(404).json({ error: "Order not found", id: internalId });
-    }
-
-    // 4) Fetch items
-    const { rows: itemRows } = await pool.query(
-      `SELECT
-         oi.product_id,
-         oi.unique_id,
-         oi.name AS order_item_name,
-         p.name  AS product_name,
-         oi.quantity,
-         oi.price,
-         oi.extras,
-         oi.note,
-         oi.kitchen_status,
-         oi.paid_at
-       FROM order_items oi
-       LEFT JOIN products p ON oi.product_id = p.id
-       WHERE oi.order_id = $1
-       ORDER BY oi.id ASC`,
-      [internalId]
-    );
-
-    const items = itemRows.map((it) => ({
-      ...it,
-      name: it.order_item_name || it.product_name || "Item",
-      extras:
-        typeof it.extras === "string"
-          ? (() => {
-              try { return JSON.parse(it.extras); } catch { return []; }
-            })()
-          : (it.extras || []),
-      total: (parseFloat(it.price) || 0) * (it.quantity || 1),
-    }));
-
-    console.log(`✅ [orders] resolver success id=${internalId} items=${items.length}`);
-    return res.json({ ...orderRows[0], items });
-  } catch (e) {
-    console.error("🔥 [orders] resolver failed", e);
-    return res.status(500).json({ error: "Failed to fetch order" });
-  }
-});
 // ✅ Merge all open orders with the same customer_name into one
 router.patch("/merge-by-customer", async (req, res) => {
   const { customer_name } = req.body;
@@ -5527,7 +5685,16 @@ router.patch("/merge-by-customer", async (req, res) => {
 // ✅ POST /reservations - Create a new reservation
 // Creates or updates a reservation with date, time, client count, and notes
 router.post("/reservations", async (req, res) => {
-  const { reservation_date, reservation_time, reservation_clients, reservation_notes, order_id, table_number } = req.body;
+  const {
+    reservation_date,
+    reservation_time,
+    reservation_clients,
+    reservation_notes,
+    order_id,
+    table_number,
+    customer_name,
+    customer_phone,
+  } = req.body;
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
 
@@ -5542,21 +5709,44 @@ router.post("/reservations", async (req, res) => {
 
     // If order_id provided, update that order with reservation fields
     if (order_id) {
+      const safeTableNumber = Number.isFinite(Number(table_number))
+        ? Number(table_number)
+        : null;
+      const safeCustomerName = (customer_name || "").trim() || null;
+      const safeCustomerPhone = (customer_phone || "").trim() || null;
+
       const result = await pool.query(
         `UPDATE orders
          SET reservation_date = $1,
              reservation_time = $2,
              reservation_clients = $3,
              reservation_notes = $4,
+             table_number = COALESCE($5::int, table_number),
+             customer_name = COALESCE($6::text, customer_name),
+             customer_phone = COALESCE($7::text, customer_phone),
+             order_type = CASE
+               WHEN LOWER(COALESCE(order_type,'')) = 'reservation' THEN 'table'
+               ELSE COALESCE(order_type, 'table')
+             END,
              status = CASE 
                WHEN LOWER(COALESCE(status,'')) IN ('closed', 'cancelled', 'canceled') THEN 'reserved'
                WHEN status = 'confirmed' THEN 'reserved'
                ELSE COALESCE(status, 'reserved')
              END,
              updated_at = NOW()
-         WHERE restaurant_id = $5 AND id = $6
+         WHERE restaurant_id = $8 AND id = $9
          RETURNING *`,
-        [reservation_date, reservation_time, clientCount, notes, restaurantId, order_id]
+        [
+          reservation_date,
+          reservation_time,
+          clientCount,
+          notes,
+          safeTableNumber,
+          safeCustomerName,
+          safeCustomerPhone,
+          restaurantId,
+          order_id,
+        ]
       );
 
       if (result.rowCount === 0) {
@@ -5582,6 +5772,8 @@ router.post("/reservations", async (req, res) => {
 
     // If table_number provided, create a standalone reservation (new order)
     if (table_number) {
+      const safeCustomerName = (customer_name || "").trim() || null;
+      const safeCustomerPhone = (customer_phone || "").trim() || null;
       const newOrderResult = await pool.query(
         `INSERT INTO orders (
           restaurant_id,
@@ -5589,15 +5781,26 @@ router.post("/reservations", async (req, res) => {
           status,
           total,
           order_type,
+          customer_name,
+          customer_phone,
           reservation_date,
           reservation_time,
           reservation_clients,
           reservation_notes,
           created_at
         )
-        VALUES ($1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, NOW())
+        VALUES ($1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, $7, $8, NOW())
         RETURNING *`,
-        [restaurantId, table_number, reservation_date, reservation_time, clientCount, notes]
+        [
+          restaurantId,
+          table_number,
+          safeCustomerName,
+          safeCustomerPhone,
+          reservation_date,
+          reservation_time,
+          clientCount,
+          notes,
+        ]
       );
 
       const reservation = newOrderResult.rows[0];
@@ -5819,15 +6022,30 @@ router.delete("/reservations/:id", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `UPDATE orders
-       SET status = 'cancelled',
-           reservation_date = NULL,
+      `UPDATE orders o
+       SET reservation_date = NULL,
            reservation_time = NULL,
            reservation_clients = NULL,
            reservation_notes = NULL,
+           status = CASE
+             WHEN COALESCE(o.total, 0) <= 0
+               AND NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id LIMIT 1)
+             THEN 'closed'
+             WHEN LOWER(COALESCE(o.status, '')) = 'reserved' THEN 'confirmed'
+             ELSE o.status
+           END,
+           order_type = CASE
+             WHEN LOWER(COALESCE(o.order_type, '')) = 'reservation' THEN 'table'
+             ELSE o.order_type
+           END,
            updated_at = NOW()
-       WHERE restaurant_id = $1 AND id = $2 AND (status = 'reserved' OR order_type = 'reservation')
-       RETURNING id`,
+       WHERE o.restaurant_id = $1
+         AND o.id = $2
+         AND (
+           LOWER(COALESCE(o.status, '')) = 'reserved'
+           OR LOWER(COALESCE(o.order_type, '')) = 'reservation'
+         )
+       RETURNING o.id, o.table_number, o.status, o.order_type`,
       [restaurantId, id]
     );
 
@@ -5837,14 +6055,20 @@ router.delete("/reservations/:id", async (req, res) => {
 
     // Emit cancellation to frontend
     io.to(`restaurant_${restaurantId}`).emit("orders_updated");
-    io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", {
-      reservation_id: id,
-    });
+    const cancelledReservation = result.rows[0];
+    const payload = {
+      reservation_id: cancelledReservation.id,
+      table_number: cancelledReservation.table_number,
+      status: cancelledReservation.status,
+      order_type: cancelledReservation.order_type,
+    };
+    io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", payload);
+    io.to(`restaurant_${restaurantId}`).emit("reservation_deleted", payload);
 
     res.json({
       success: true,
-      message: "✅ Reservation cancelled",
-      reservation_id: id,
+      message: "✅ Reservation removed",
+      reservation: cancelledReservation,
     });
   } catch (err) {
     console.error("❌ Error cancelling reservation:", err);
@@ -5981,18 +6205,33 @@ router.delete("/:id/reservations", async (req, res) => {
                 WHEN LOWER(COALESCE(status,'')) = 'reserved' THEN 'confirmed'
                 ELSE status
               END,
+              order_type = CASE
+                WHEN LOWER(COALESCE(order_type,'')) = 'reservation' THEN 'table'
+                ELSE order_type
+              END,
               updated_at = NOW()
         WHERE restaurant_id = $1 AND id = $2
         RETURNING *`,
       [restaurantId, orderId, shouldClose]
     );
 
+    const updatedOrder = updated.rows[0];
     io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+    if (updatedOrder) {
+      const reservationPayload = {
+        reservation_id: updatedOrder.id,
+        table_number: updatedOrder.table_number,
+        status: updatedOrder.status,
+        order_type: updatedOrder.order_type,
+      };
+      io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", reservationPayload);
+      io.to(`restaurant_${restaurantId}`).emit("reservation_deleted", reservationPayload);
+    }
 
     return res.json({
       success: true,
       message: "✅ Reservation removed",
-      order: updated.rows[0],
+      order: updatedOrder,
     });
   } catch (err) {
     console.error("❌ Error deleting reservation for order:", err);

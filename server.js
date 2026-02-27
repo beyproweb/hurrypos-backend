@@ -534,11 +534,18 @@ async function startServer() {
       // Run a simple warm-up script to initialize PaddleOCR
       await new Promise((resolve, reject) => {
         const pythonScript = path.join(__dirname, "tools", "ocr_warmup.py");
-        const pythonExe = path.join(__dirname, ".venv", "bin", "python");
+        const venvPython = path.join(__dirname, ".venv", "bin", "python");
+        const pythonExe = fs.existsSync(venvPython)
+          ? venvPython
+          : (process.env.OCR_PYTHON || "python3");
+        const systemPathPrefix = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+        const runtimePath = process.env.PATH
+          ? `${systemPathPrefix}:${process.env.PATH}`
+          : systemPathPrefix;
 
         const safeEnv = {
           ...process.env,
-          PATH: `/usr/local/bin:${process.env.PATH || ""}`,
+          PATH: runtimePath,
         };
 
         execFile(
