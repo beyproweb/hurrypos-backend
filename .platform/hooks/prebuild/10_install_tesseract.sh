@@ -28,15 +28,24 @@ else
     [[ "${installed}" == "true" ]]
   }
 
+  enable_crb_if_available() {
+    # AL2023 often does not expose a "crb" repo; skip quietly in that case.
+    if ${PM} repolist all 2>/dev/null | awk '{print $1}' | grep -qx 'crb'; then
+      ${PM} config-manager --set-enabled crb || true
+    else
+      echo "[prebuild] Repo 'crb' not present on this platform, skipping"
+    fi
+  }
+
   echo "[prebuild] Installing via ${PM}"
   if ! install_tesseract_pkg; then
     echo "[prebuild] Default repos do not include tesseract, trying EPEL"
     ${PM} install -y dnf-plugins-core || true
-    ${PM} config-manager --set-enabled crb || true
+    enable_crb_if_available
     ${PM} install -y epel-release || \
     ${PM} install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm || true
     ${PM} makecache || true
-    install_tesseract_pkg
+    install_tesseract_pkg || true
   fi
 
   # Language package names differ across repos; try both naming schemes.

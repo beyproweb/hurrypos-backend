@@ -882,7 +882,7 @@ const result = await pool.query(
         driver_assigned: "horn",
         order_delayed: "alarm",
       driver_arrived: "horn",
-      call_waiter: "alarm.mp3",
+      call_waiter: "none",
     },
   }
 };
@@ -963,7 +963,7 @@ router.post("/:section", async (req, res) => {
         driver_assigned: "horn.mp3",
         order_delayed: "alarm.mp3",
         driver_arrived: "horn.mp3",
-        call_waiter: "alarm.mp3",
+        call_waiter: "none",
       },
     };
 
