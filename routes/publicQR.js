@@ -374,6 +374,7 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
     busyRows.forEach((row) => {
       const tableNumber = Number(row?.table_number);
       if (!Number.isFinite(tableNumber) || tableNumber <= 0) return;
+      const status = String(row?.status || "").toLowerCase();
 
       if (!isReservationLikeRow(row)) {
         unavailableSet.add(tableNumber);
@@ -383,7 +384,9 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
       if (!isReservationDueNow(row)) return;
 
       unavailableSet.add(tableNumber);
-      reservedSet.add(tableNumber);
+      if (status !== "checked_in") {
+        reservedSet.add(tableNumber);
+      }
     });
 
     const tableNumbers = Array.from(unavailableSet);

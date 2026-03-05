@@ -965,6 +965,45 @@ const OPEN_ORDER_MODES = Object.freeze({
   both: ["table", "phone", "packet", "takeaway"],
 });
 
+const getReservationFinalizeResetSql = (statusSqlExpr, options = {}) => {
+  const { includeClients = true } = options;
+  const assignments = [
+    `reservation_date = CASE
+                WHEN ${statusSqlExpr} IN ('closed', 'completed')
+                  AND LOWER(COALESCE(order_type, '')) <> 'reservation'
+                THEN NULL
+                ELSE reservation_date
+              END`,
+    `reservation_time = CASE
+                WHEN ${statusSqlExpr} IN ('closed', 'completed')
+                  AND LOWER(COALESCE(order_type, '')) <> 'reservation'
+                THEN NULL
+                ELSE reservation_time
+              END`,
+    `reservation_notes = CASE
+                WHEN ${statusSqlExpr} IN ('closed', 'completed')
+                  AND LOWER(COALESCE(order_type, '')) <> 'reservation'
+                THEN NULL
+                ELSE reservation_notes
+              END`,
+  ];
+
+  if (includeClients) {
+    assignments.splice(
+      2,
+      0,
+      `reservation_clients = CASE
+                WHEN ${statusSqlExpr} IN ('closed', 'completed')
+                  AND LOWER(COALESCE(order_type, '')) <> 'reservation'
+                THEN NULL
+                ELSE reservation_clients
+              END`
+    );
+  }
+
+  return assignments.join(",\n              ");
+};
+
 async function closeStaleReservations(restaurantId) {
   if (!restaurantId) return [];
   try {
@@ -972,6 +1011,7 @@ async function closeStaleReservations(restaurantId) {
       `
         UPDATE orders o
            SET status = 'closed',
+               ${getReservationFinalizeResetSql("'closed'")},
                total = 0,
                updated_at = NOW()
          WHERE o.restaurant_id = $1
@@ -4400,7 +4440,10 @@ if (itemCount === 0) {
 
   if (type !== 'quick') {
     await client.query(
-      "UPDATE orders SET status = 'closed' WHERE restaurant_id = $1 AND id = $2",
+      `UPDATE orders
+          SET status = 'closed',
+              ${getReservationFinalizeResetSql("'closed'")}
+        WHERE restaurant_id = $1 AND id = $2`,
       [req.user.restaurant_id, id]
     );
     io.to(`restaurant_${req.user.restaurant_id}`).emit("order_closed", { orderId: parseInt(id, 10) });
@@ -5476,7 +5519,11 @@ router.patch("/:orderId/merge-table", async (req, res) => {
 
     // 6️⃣ Close and zero the source
     await client.query(
-      `UPDATE orders SET status='closed', total=0 WHERE id=$1`,
+      `UPDATE orders
+          SET status = 'closed',
+              ${getReservationFinalizeResetSql("'closed'")},
+              total = 0
+        WHERE id = $1`,
       [sourceOrder.id]
     );
 
@@ -5672,7 +5719,14 @@ router.patch("/merge-by-customer", async (req, res) => {
     for (const order of others) {
       await client.query(`UPDATE order_items SET order_id = $1 WHERE order_id = $2`, [target.id, order.id]);
       await client.query(`UPDATE sub_orders SET order_id = $1 WHERE order_id = $2`, [target.id, order.id]);
-      await client.query(`UPDATE orders SET status='closed', total=0 WHERE id=$1`, [order.id]);
+      await client.query(
+        `UPDATE orders
+            SET status = 'closed',
+                ${getReservationFinalizeResetSql("'closed'")},
+                total = 0
+          WHERE id = $1`,
+        [order.id]
+      );
       await client.query(`UPDATE orders SET total = total + $2 WHERE id=$1`, [target.id, order.total || 0]);
     }
 
@@ -6023,6 +6077,90 @@ router.get("/reservations/:id", async (req, res) => {
   }
 });
 
+const emitReservationStateUpdate = (restaurantId, reservationOrder, extraPayload = {}) => {
+  if (!reservationOrder || !restaurantId) return;
+  const payload = {
+    reservation_id: reservationOrder.id,
+    order_id: reservationOrder.id,
+    table_number: reservationOrder.table_number,
+    status: reservationOrder.status,
+    order_type: reservationOrder.order_type,
+    reservation_date: reservationOrder.reservation_date,
+    reservation_time: reservationOrder.reservation_time,
+    reservation_clients: reservationOrder.reservation_clients,
+    reservation_notes: reservationOrder.reservation_notes,
+    customer_name: reservationOrder.customer_name || null,
+    customer_phone: reservationOrder.customer_phone || null,
+    ...extraPayload,
+  };
+
+  io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+  io.to(`restaurant_${restaurantId}`).emit("reservation_updated", payload);
+  return payload;
+};
+
+const checkInReservationOrder = async ({ restaurantId, orderId }) => {
+  const result = await pool.query(
+    `UPDATE orders o
+        SET status = 'checked_in',
+            order_type = CASE
+              WHEN LOWER(COALESCE(o.order_type, '')) = 'reservation' THEN 'table'
+              ELSE COALESCE(o.order_type, 'table')
+            END,
+            updated_at = NOW()
+      WHERE o.restaurant_id = $1
+        AND o.id = $2
+        AND LOWER(COALESCE(o.status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
+        AND (
+          LOWER(COALESCE(o.status, '')) IN ('reserved', 'checked_in')
+          OR LOWER(COALESCE(o.order_type, '')) = 'reservation'
+          OR o.reservation_date IS NOT NULL
+          OR o.reservation_time IS NOT NULL
+        )
+      RETURNING o.*`,
+    [restaurantId, orderId]
+  );
+
+  return result.rows[0] || null;
+};
+
+// ✅ POST /reservations/:id/checkin - Mark a reservation guest as checked in
+router.post("/reservations/:id/checkin", async (req, res) => {
+  const { id } = req.params;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  const reservationId = Number(id);
+  if (!Number.isFinite(reservationId)) {
+    return res.status(400).json({ error: "Invalid reservation id" });
+  }
+
+  try {
+    const updatedReservation = await checkInReservationOrder({
+      restaurantId,
+      orderId: reservationId,
+    });
+
+    if (!updatedReservation) {
+      return res.status(404).json({ error: "Reservation not found or cannot be checked in" });
+    }
+
+    const payload = emitReservationStateUpdate(restaurantId, updatedReservation, {
+      event: "checked_in",
+    });
+    io.to(`restaurant_${restaurantId}`).emit("reservation_checked_in", payload);
+
+    return res.json({
+      success: true,
+      message: "✅ Guest checked in",
+      reservation: updatedReservation,
+    });
+  } catch (err) {
+    console.error("❌ Error checking in reservation:", err);
+    return res.status(500).json({ error: "Failed to check in reservation" });
+  }
+});
+
 // ✅ DELETE /reservations/:id - Cancel a reservation
 router.delete("/reservations/:id", async (req, res) => {
   const { id } = req.params;
@@ -6263,6 +6401,44 @@ router.delete("/:id/reservations", async (req, res) => {
   } catch (err) {
     console.error("❌ Error deleting reservation for order:", err);
     return res.status(500).json({ error: "Failed to delete reservation" });
+  }
+});
+
+// ✅ POST /orders/:id/reservations/checkin - Mark reservation guest as checked in
+router.post("/:id/reservations/checkin", async (req, res) => {
+  const { id } = req.params;
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  const orderId = Number(id);
+  if (!Number.isFinite(orderId)) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+
+  try {
+    const updatedOrder = await checkInReservationOrder({
+      restaurantId,
+      orderId,
+    });
+
+    if (!updatedOrder) {
+      return res.status(404).json({ error: "Reservation not found or cannot be checked in" });
+    }
+
+    const payload = emitReservationStateUpdate(restaurantId, updatedOrder, {
+      event: "checked_in",
+    });
+    io.to(`restaurant_${restaurantId}`).emit("reservation_checked_in", payload);
+
+    return res.json({
+      success: true,
+      message: "✅ Guest checked in",
+      order: updatedOrder,
+      reservation: updatedOrder,
+    });
+  } catch (err) {
+    console.error("❌ Error checking in reservation for order:", err);
+    return res.status(500).json({ error: "Failed to check in reservation" });
   }
 });
 
