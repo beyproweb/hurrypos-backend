@@ -243,6 +243,7 @@ app.use("/api/standalone/qr", require("./routes/standaloneQr"));
 app.use("/api/standalone/kitchen", require("./routes/standaloneKitchen"));
 app.use("/api/standalone/tables", require("./routes/standaloneTables"));
 app.use("/api/public", require("./routes/publicQR"));
+app.use("/api/public/concerts", require("./routes/publicConcerts"));
 app.use("/api/public", require("./routes/publicRegistrations"));
 
 const { startKitchenTimersJob } = require("./routes/timerScheduler");
@@ -377,6 +378,7 @@ app.use("/api", require("./routes/voice"));
 app.use("/api/drinks", requirePosCore, require("./routes/drinks")(io));
 app.use("/api/category-images", requirePosCore, require("./routes/categoryImages"));
 app.use("/api/settings", require("./routes/settings"));
+app.use("/api/concerts", require("./routes/concerts"));
 app.use("/api/extras-groups", requirePosCore, require("./routes/extras-groups"));
 app.use("/api/phoneorders", requirePosCore, require("./routes/phoneorders"));
 app.use("/api/customerAddresses", requirePosCore, require("./routes/customerAddresses"));

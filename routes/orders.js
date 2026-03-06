@@ -23,6 +23,7 @@ module.exports = function(io) {
   } = require("../utils/customerDebt");
   const { emitAlert } = require("../utils/realtime");
   const { updateStockForOrder } = require("../utils/orderStock");
+  const { ensureConcertTables } = require("../utils/concertsService");
   const { attachAllowedModules } = require("../middleware/moduleGuard");
   const DEFAULT_TZ = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
 
@@ -1040,6 +1041,68 @@ async function closeStaleReservations(restaurantId) {
   }
 }
 
+const STALE_RESERVATION_CLEANUP_INTERVAL_MS = (() => {
+  const raw = Number.parseInt(
+    String(process.env.STALE_RESERVATION_CLEANUP_INTERVAL_MS || ""),
+    10
+  );
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 5 * 60 * 1000; // default: 5 minutes
+})();
+const staleReservationCleanupState = new Map();
+
+const isConnectionTimeoutError = (err) => {
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    message.includes("timeout exceeded when trying to connect") ||
+    message.includes("connection terminated unexpectedly") ||
+    message.includes("connect etimedout")
+  );
+};
+
+function scheduleCloseStaleReservations(restaurantId, options = {}) {
+  const normalizedRestaurantId = Number(restaurantId);
+  if (!Number.isFinite(normalizedRestaurantId) || normalizedRestaurantId <= 0) return;
+
+  const force = options?.force === true;
+  const now = Date.now();
+  const previousState = staleReservationCleanupState.get(normalizedRestaurantId) || {
+    inFlight: false,
+    lastAttemptAt: 0,
+  };
+
+  if (previousState.inFlight) return;
+  if (!force && now - Number(previousState.lastAttemptAt || 0) < STALE_RESERVATION_CLEANUP_INTERVAL_MS) {
+    return;
+  }
+
+  staleReservationCleanupState.set(normalizedRestaurantId, {
+    ...previousState,
+    inFlight: true,
+    lastAttemptAt: now,
+  });
+
+  closeStaleReservations(normalizedRestaurantId)
+    .then((rows) => {
+      staleReservationCleanupState.set(normalizedRestaurantId, {
+        inFlight: false,
+        lastAttemptAt: now,
+      });
+      if (Array.isArray(rows) && rows.length > 0) {
+        console.log(
+          `🧹 Closed ${rows.length} stale reservations for restaurant ${normalizedRestaurantId}`
+        );
+      }
+    })
+    .catch((err) => {
+      console.warn("⚠️ closeStaleReservations (throttled) failed:", err?.message || err);
+      staleReservationCleanupState.set(normalizedRestaurantId, {
+        inFlight: false,
+        lastAttemptAt: now,
+      });
+    });
+}
+
 function parseGeoValue(value) {
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
@@ -1627,10 +1690,8 @@ router.get("/", async (req, res) => {
     if (!restaurantId) return;
     const { status, table_number, type } = req.query;
 
-    // Fire-and-forget to avoid blocking order fetch on slow cleanup
-    closeStaleReservations(restaurantId).catch((err) =>
-      console.warn("⚠️ closeStaleReservations (non-blocking) failed:", err?.message || err)
-    );
+    // Fire-and-forget, throttled to avoid opening extra DB connections on every poll.
+    scheduleCloseStaleReservations(restaurantId);
 
     // 🔐 Special mode: always and only open phone/packet
     if (String(status).toLowerCase() === "open_phone") {
@@ -1668,6 +1729,13 @@ router.get("/", async (req, res) => {
     const result = await pool.query(sql, params);
     res.json(result.rows);
   } catch (err) {
+    if (isConnectionTimeoutError(err)) {
+      console.warn(
+        "⚠️ Orders fetch timeout. Returning empty list to keep client responsive.",
+        err?.message || err
+      );
+      return res.json([]);
+    }
     console.error("❌ Orders fetch failed:", err);
     res.status(500).json({ error: "Database error" });
   }
@@ -2595,6 +2663,12 @@ router.put("/:id/status", async (req, res) => {
       `SELECT
          total,
          is_paid,
+         status,
+         order_type,
+         reservation_date,
+         reservation_time,
+         reservation_clients,
+         reservation_notes,
          customer_phone,
          table_number,
          traffic_logged_at,
@@ -2657,6 +2731,22 @@ router.put("/:id/status", async (req, res) => {
     }
     const paidRequested = normalizedStatus === "paid" || normalizedPaymentStatus === "paid";
     const closedRequested = normalizedStatus === "closed";
+    const existingStatus = String(existingOrder?.status || "").toLowerCase();
+    const hasReservationSignalOnOrder = Boolean(
+      existingOrder?.reservation_date ||
+        existingOrder?.reservation_time ||
+        Number(existingOrder?.reservation_clients || 0) > 0 ||
+        String(existingOrder?.reservation_notes || "").trim() ||
+        String(existingOrder?.order_type || "").toLowerCase() === "reservation"
+    );
+    const shouldPreserveCheckedInStatusOnPaid =
+      paidRequested &&
+      normalizedStatus === "paid" &&
+      existingStatus === "checked_in" &&
+      hasReservationSignalOnOrder;
+    const nextStatusForUpdate = shouldPreserveCheckedInStatusOnPaid
+      ? "checked_in"
+      : normalizedStatus;
 
     // Always persist the full order total when completing payment/closing.
     // This prevents partial-payment flows from overwriting `orders.total` and breaking reports.
@@ -2699,7 +2789,7 @@ router.put("/:id/status", async (req, res) => {
        WHERE id = $7 AND restaurant_id = $8
        RETURNING *`,
       [
-        normalizedStatus,
+        nextStatusForUpdate,
         nextTotal,
         payment_method,
         normalizedPaymentStatus,
@@ -3498,6 +3588,9 @@ const result = await pool.query(
 router.post("/:id/close", async (req, res) => {
   const { id } = req.params;
   const restaurantId = req.user.restaurant_id;
+  const preserveReservationCheckoutBadge =
+    req.body?.preserve_reservation_checkout_badge === true ||
+    String(req.query?.preserve_reservation_checkout_badge || "").trim() === "1";
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -3506,6 +3599,7 @@ router.post("/:id/close", async (req, res) => {
       `SELECT
          id,
          status,
+         order_type,
          total,
          is_paid,
          table_number,
@@ -3514,6 +3608,10 @@ router.post("/:id/close", async (req, res) => {
          kitchen_delivered_at,
          external_source,
          payment_method,
+         reservation_date,
+         reservation_time,
+         reservation_clients,
+         reservation_notes,
          COALESCE(debt_recorded_total, 0) AS debt_recorded_total
        FROM orders
       WHERE restaurant_id = $1 AND id = $2
@@ -3670,6 +3768,7 @@ router.post("/:id/close", async (req, res) => {
           SET status = 'closed',
               total = $3,
               kitchen_delivered_at = COALESCE(kitchen_delivered_at, NOW()),
+              cancellation_reason = NULL,
               debt_recorded_total = $4
         WHERE restaurant_id = $1 AND id = $2
         RETURNING *`,
@@ -3677,6 +3776,57 @@ router.post("/:id/close", async (req, res) => {
     );
 
     const order = updated.rows[0];
+    let reservationClearedOrder = null;
+    let reservationCheckedOutPayload = null;
+    const hadReservationContext = Boolean(
+      existing?.reservation_date ||
+        existing?.reservation_time ||
+        existing?.reservation_clients ||
+        existing?.reservation_notes ||
+        String(existing?.order_type || "").toLowerCase() === "reservation" ||
+        ["reserved", "checked_in"].includes(String(existing?.status || "").toLowerCase())
+    );
+    const shouldClearReservationOnClose =
+      hadReservationContext &&
+      (
+        String(existing?.status || "").toLowerCase() === "checked_in" ||
+        preserveReservationCheckoutBadge
+      );
+
+    if (shouldClearReservationOnClose) {
+      const clearedReservationResult = await client.query(
+        `UPDATE orders
+            SET reservation_date = NULL,
+                reservation_time = NULL,
+                reservation_clients = NULL,
+                reservation_notes = NULL,
+                order_type = CASE
+                  WHEN LOWER(COALESCE(order_type, '')) = 'reservation' THEN 'table'
+                  ELSE order_type
+                END,
+                updated_at = NOW()
+          WHERE restaurant_id = $1 AND id = $2
+          RETURNING id, table_number, status, order_type, cancellation_reason`,
+        [restaurantId, id]
+      );
+      reservationClearedOrder = clearedReservationResult.rows[0] || null;
+      if (preserveReservationCheckoutBadge) {
+        reservationCheckedOutPayload = {
+          reservation_id: Number(existing.id),
+          order_id: Number(existing.id),
+          table_number: existing.table_number,
+          status: "checked_out",
+          order_type: "reservation",
+          reservation_date: existing.reservation_date,
+          reservation_time: existing.reservation_time,
+          reservation_clients: existing.reservation_clients,
+          reservation_notes: existing.reservation_notes,
+          customer_name: existing.customer_name || null,
+          customer_phone: existing.customer_phone || null,
+          checked_out_at: new Date().toISOString(),
+        };
+      }
+    }
 
     if (needsDebtAdjustment) {
       if (delta > 0) {
@@ -3699,6 +3849,24 @@ router.post("/:id/close", async (req, res) => {
     await client.query("COMMIT");
 
     io.to(`restaurant_${restaurantId}`).emit("order_closed", { orderId: Number(order.id) });
+    if (reservationClearedOrder) {
+      const reservationPayload = {
+        reservation_id: reservationClearedOrder.id,
+        order_id: reservationClearedOrder.id,
+        table_number: reservationClearedOrder.table_number,
+        status: reservationClearedOrder.status,
+        order_type: reservationClearedOrder.order_type,
+        cancellation_reason: reservationClearedOrder.cancellation_reason || null,
+      };
+      io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", reservationPayload);
+      io.to(`restaurant_${restaurantId}`).emit("reservation_deleted", reservationPayload);
+      if (reservationCheckedOutPayload) {
+        io.to(`restaurant_${restaurantId}`).emit(
+          "reservation_checked_out",
+          reservationCheckedOutPayload
+        );
+      }
+    }
     res.json({
       message: needsDebtAdjustment
         ? delta > 0
@@ -4297,8 +4465,51 @@ router.get("/:id", async (req, res, next) => {
       return res.status(400).json({ error: "Missing restaurant ID" });
     }
 
-    const orderRes = await pool.query(
-      `
+    let canJoinConcertBooking = false;
+    try {
+      await ensureConcertTables(pool);
+      canJoinConcertBooking = true;
+    } catch (concertErr) {
+      console.warn("⚠️ Failed to ensure concert tables in /orders/:id:", concertErr?.message || concertErr);
+    }
+
+    const orderSqlWithConcert = `
+      SELECT
+        o.*,
+        r.name AS restaurant_name,
+        r.slug AS restaurant_slug,
+        r.logo_url AS restaurant_logo_url,
+        r.pos_location AS restaurant_pos_location,
+        r.pos_location_lat AS restaurant_pos_location_lat,
+        r.pos_location_lng AS restaurant_pos_location_lng,
+        cb.id AS concert_booking_id,
+        cb.payment_status AS concert_booking_payment_status,
+        cb.booking_status AS concert_booking_status,
+        cb.updated_at AS concert_booking_updated_at,
+        cb.booking_type AS concert_booking_type,
+        cb.reserved_table_number AS concert_reserved_table_number,
+        cb.event_id AS concert_event_id,
+        ce.artist_name AS concert_artist_name,
+        ce.event_title AS concert_event_title,
+        ce.event_date AS concert_event_date,
+        ce.event_time AS concert_event_time
+      FROM orders o
+      LEFT JOIN restaurants r ON r.id = o.restaurant_id
+      LEFT JOIN LATERAL (
+        SELECT *
+        FROM concert_bookings
+        WHERE restaurant_id = o.restaurant_id
+          AND reservation_order_id = o.id
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
+        LIMIT 1
+      ) cb ON TRUE
+      LEFT JOIN concert_events ce
+        ON ce.id = cb.event_id
+       AND ce.restaurant_id = o.restaurant_id
+      WHERE o.id = $1 AND o.restaurant_id = $2
+      LIMIT 1
+    `;
+    const orderSqlPlain = `
       SELECT
         o.*,
         r.name AS restaurant_name,
@@ -4311,7 +4522,10 @@ router.get("/:id", async (req, res, next) => {
       LEFT JOIN restaurants r ON r.id = o.restaurant_id
       WHERE o.id = $1 AND o.restaurant_id = $2
       LIMIT 1
-      `,
+    `;
+
+    const orderRes = await pool.query(
+      canJoinConcertBooking ? orderSqlWithConcert : orderSqlPlain,
       [id, restaurant_id]
     );
 
@@ -5900,9 +6114,8 @@ router.get("/reservations", async (req, res) => {
   const { start_date, end_date, table_number } = req.query;
 
   try {
-    closeStaleReservations(restaurantId).catch((err) =>
-      console.warn("⚠️ closeStaleReservations (non-blocking) failed:", err?.message || err)
-    );
+    // Fire-and-forget, throttled to avoid opening extra DB connections on every poll.
+    scheduleCloseStaleReservations(restaurantId);
 
     let query = `
       SELECT
@@ -5958,6 +6171,17 @@ router.get("/reservations", async (req, res) => {
       reservations: result.rows,
     });
   } catch (err) {
+    if (isConnectionTimeoutError(err)) {
+      console.warn(
+        "⚠️ Reservations fetch timeout. Returning empty list to keep client responsive.",
+        err?.message || err
+      );
+      return res.json({
+        success: true,
+        count: 0,
+        reservations: [],
+      });
+    }
     console.error("❌ Error fetching reservations:", err);
     res.status(500).json({ error: "Failed to fetch reservations" });
   }
@@ -6100,6 +6324,48 @@ const emitReservationStateUpdate = (restaurantId, reservationOrder, extraPayload
 };
 
 const checkInReservationOrder = async ({ restaurantId, orderId }) => {
+  try {
+    await ensureConcertTables(pool);
+    const concertBookingResult = await pool.query(
+      `SELECT
+         id,
+         payment_status,
+         booking_status
+       FROM concert_bookings
+       WHERE restaurant_id = $1
+         AND reservation_order_id = $2
+         AND LOWER(COALESCE(booking_type, '')) = 'table'
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
+       LIMIT 1`,
+      [restaurantId, orderId]
+    );
+    const linkedConcertBooking = concertBookingResult.rows?.[0] || null;
+    if (linkedConcertBooking) {
+      const paymentStatus = String(linkedConcertBooking.payment_status || "").toLowerCase();
+      const bookingStatus = String(linkedConcertBooking.booking_status || "").toLowerCase();
+      if (paymentStatus !== "confirmed") {
+        const err = new Error(
+          paymentStatus === "cancelled"
+            ? "Concert booking is cancelled. Check-in is blocked."
+            : "Concert booking is not confirmed yet. Please confirm booking before check-in."
+        );
+        err.status = 409;
+        err.code = "concert_booking_unconfirmed";
+        err.paymentStatus = paymentStatus || null;
+        err.bookingStatus = bookingStatus || null;
+        throw err;
+      }
+    }
+  } catch (err) {
+    if (err?.code === "concert_booking_unconfirmed") {
+      throw err;
+    }
+    console.warn(
+      "⚠️ Failed to validate concert booking confirmation before check-in:",
+      err?.message || err
+    );
+  }
+
   const result = await pool.query(
     `UPDATE orders o
         SET status = 'checked_in',
@@ -6156,6 +6422,14 @@ router.post("/reservations/:id/checkin", async (req, res) => {
       reservation: updatedReservation,
     });
   } catch (err) {
+    if (Number(err?.status) === 409 && err?.code === "concert_booking_unconfirmed") {
+      return res.status(409).json({
+        error: err.message,
+        code: err.code,
+        payment_status: err.paymentStatus || null,
+        booking_status: err.bookingStatus || null,
+      });
+    }
     console.error("❌ Error checking in reservation:", err);
     return res.status(500).json({ error: "Failed to check in reservation" });
   }
@@ -6437,6 +6711,14 @@ router.post("/:id/reservations/checkin", async (req, res) => {
       reservation: updatedOrder,
     });
   } catch (err) {
+    if (Number(err?.status) === 409 && err?.code === "concert_booking_unconfirmed") {
+      return res.status(409).json({
+        error: err.message,
+        code: err.code,
+        payment_status: err.paymentStatus || null,
+        booking_status: err.bookingStatus || null,
+      });
+    }
     console.error("❌ Error checking in reservation for order:", err);
     return res.status(500).json({ error: "Failed to check in reservation" });
   }

@@ -1,0 +1,241 @@
+const express = require("express");
+const router = express.Router();
+const { pool } = require("../db");
+const authMiddleware = require("../middleware/authMiddleware");
+const { attachAllowedModules } = require("../middleware/moduleGuard");
+const {
+  ensureConcertTables,
+  listEvents,
+  getEventById,
+  createEvent,
+  updateEvent,
+  deleteEvent,
+  listAreas,
+  createBooking,
+  listBookingsForEvent,
+  updateBookingPaymentStatus,
+  mapBookingResponse,
+} = require("../utils/concertsService");
+
+router.use(authMiddleware);
+router.use(async (req, res, next) => {
+  const allowed = await attachAllowedModules(req);
+  if (
+    Array.isArray(allowed) &&
+    !allowed.includes("pos_core") &&
+    !allowed.includes("qr_kitchen") &&
+    !allowed.includes("qr_menu")
+  ) {
+    return res.status(403).json({ error: "MODULE_NOT_ALLOWED" });
+  }
+  return next();
+});
+
+const getRestaurantId = (req) => Number(req.user?.restaurant_id || 0);
+
+router.get("/areas", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+    return res.status(401).json({ error: "Missing restaurant context" });
+  }
+  try {
+    const areas = await listAreas(pool, restaurantId);
+    res.json({ success: true, areas });
+  } catch (err) {
+    console.error("❌ Failed to load concert areas:", err);
+    res.status(500).json({ error: "Failed to load areas" });
+  }
+});
+
+router.get("/events", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+    return res.status(401).json({ error: "Missing restaurant context" });
+  }
+  try {
+    await ensureConcertTables(pool);
+    const includeHidden = String(req.query.include_hidden || "").toLowerCase() === "true";
+    const events = await listEvents(pool, restaurantId, {
+      includeHidden,
+      upcomingOnly: false,
+    });
+    res.json({ success: true, events });
+  } catch (err) {
+    console.error("❌ Failed to load concert events:", err);
+    res.status(500).json({ error: "Failed to load events" });
+  }
+});
+
+router.get("/events/:eventId", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  const eventId = Number(req.params.eventId);
+  if (!Number.isFinite(eventId) || eventId <= 0) {
+    return res.status(400).json({ error: "Invalid event id" });
+  }
+  try {
+    await ensureConcertTables(pool);
+    const event = await getEventById(pool, restaurantId, eventId);
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    res.json({ success: true, event });
+  } catch (err) {
+    console.error("❌ Failed to load concert event:", err);
+    res.status(500).json({ error: "Failed to load event" });
+  }
+});
+
+router.post("/events", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+    return res.status(401).json({ error: "Missing restaurant context" });
+  }
+  try {
+    const event = await createEvent(pool, restaurantId, req.body || {});
+    res.status(201).json({ success: true, event });
+  } catch (err) {
+    console.error("❌ Failed to create concert event:", err);
+    res.status(400).json({ error: err?.message || "Failed to create event" });
+  }
+});
+
+router.put("/events/:eventId", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  const eventId = Number(req.params.eventId);
+  if (!Number.isFinite(eventId) || eventId <= 0) {
+    return res.status(400).json({ error: "Invalid event id" });
+  }
+  try {
+    const event = await updateEvent(pool, restaurantId, eventId, req.body || {});
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    res.json({ success: true, event });
+  } catch (err) {
+    console.error("❌ Failed to update concert event:", err);
+    res.status(400).json({ error: err?.message || "Failed to update event" });
+  }
+});
+
+router.delete("/events/:eventId", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  const eventId = Number(req.params.eventId);
+  if (!Number.isFinite(eventId) || eventId <= 0) {
+    return res.status(400).json({ error: "Invalid event id" });
+  }
+  try {
+    await ensureConcertTables(pool);
+    const deleted = await deleteEvent(pool, restaurantId, eventId);
+    if (!deleted) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Failed to delete concert event:", err);
+    res.status(500).json({ error: "Failed to delete event" });
+  }
+});
+
+router.get("/events/:eventId/bookings", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  const eventId = Number(req.params.eventId);
+  if (!Number.isFinite(eventId) || eventId <= 0) {
+    return res.status(400).json({ error: "Invalid event id" });
+  }
+  try {
+    await ensureConcertTables(pool);
+    const event = await getEventById(pool, restaurantId, eventId);
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    const bookings = await listBookingsForEvent(pool, restaurantId, eventId);
+    res.json({
+      success: true,
+      event,
+      bookings: bookings.map(mapBookingResponse),
+    });
+  } catch (err) {
+    console.error("❌ Failed to load concert bookings:", err);
+    res.status(500).json({ error: "Failed to load bookings" });
+  }
+});
+
+router.post("/events/:eventId/bookings", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  const eventId = Number(req.params.eventId);
+  if (!Number.isFinite(eventId) || eventId <= 0) {
+    return res.status(400).json({ error: "Invalid event id" });
+  }
+  try {
+    const result = await createBooking(pool, restaurantId, eventId, req.body || {});
+    if (result.status >= 400) {
+      return res.status(result.status).json({ error: result.error });
+    }
+
+    const io = req.app?.get?.("io");
+    if (result.data?.reservation?.table_number && io) {
+      io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+      io.to(`restaurant_${restaurantId}`).emit("reservation_created", {
+        reservation_id: result.data.reservation.id,
+        table_number: result.data.reservation.table_number,
+        reservation_date: result.data.reservation.reservation_date,
+        reservation_time: result.data.reservation.reservation_time,
+      });
+    }
+
+    res.status(result.status).json({
+      success: true,
+      ...result.data,
+    });
+  } catch (err) {
+    console.error("❌ Failed to create concert booking:", err);
+    res.status(500).json({ error: "Failed to create booking" });
+  }
+});
+
+router.patch("/bookings/:bookingId/payment-status", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  const bookingId = Number(req.params.bookingId);
+  if (!Number.isFinite(bookingId) || bookingId <= 0) {
+    return res.status(400).json({ error: "Invalid booking id" });
+  }
+  try {
+    const paymentStatus = req.body?.payment_status;
+    const result = await updateBookingPaymentStatus(
+      pool,
+      restaurantId,
+      bookingId,
+      paymentStatus
+    );
+    if (result.status >= 400) {
+      return res.status(result.status).json({ error: result.error });
+    }
+
+    const io = req.app?.get?.("io");
+    const reservationOrderId = Number(result.data?.booking?.reservation_order_id);
+    const reservationTable = Number(result.data?.booking?.reserved_table_number);
+    if (io && Number.isFinite(reservationTable) && reservationTable > 0) {
+      io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+      if ((result.data?.booking?.payment_status || "").toLowerCase() === "cancelled") {
+        io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", {
+          reservation_id: Number.isFinite(reservationOrderId) ? reservationOrderId : null,
+          table_number: reservationTable,
+          status: "cancelled",
+        });
+      } else if ((result.data?.booking?.payment_status || "").toLowerCase() === "confirmed") {
+        io.to(`restaurant_${restaurantId}`).emit("reservation_updated", {
+          reservation_id: Number.isFinite(reservationOrderId) ? reservationOrderId : null,
+          table_number: reservationTable,
+          status: "reserved",
+        });
+      }
+    }
+
+    res.json({ success: true, ...result.data });
+  } catch (err) {
+    console.error("❌ Failed to update concert booking payment status:", err);
+    res.status(500).json({ error: "Failed to update payment status" });
+  }
+});
+
+module.exports = router;
