@@ -353,7 +353,8 @@ async function getEventBookingCounters(client, restaurantId, eventId) {
     `
     SELECT
       booking_type,
-      COALESCE(SUM(quantity), 0)::int AS booked_quantity
+      COALESCE(SUM(quantity), 0)::int AS booked_quantity,
+      COUNT(*)::int AS booking_count
     FROM concert_bookings
     WHERE restaurant_id = $1
       AND event_id = $2
@@ -369,7 +370,7 @@ async function getEventBookingCounters(client, restaurantId, eventId) {
     const type = normalizeBookingType(row.booking_type);
     const qty = asInt(row.booked_quantity, 0);
     if (type === "table") {
-      bookedTables += qty;
+      bookedTables += asInt(row.booking_count, 0);
     } else {
       bookedTickets += qty;
     }
@@ -430,7 +431,10 @@ async function getAreaAllocationsWithAvailability(client, restaurantId, eventId)
         CASE
           WHEN LOWER(COALESCE(cb.payment_status, '')) <> 'cancelled'
            AND LOWER(COALESCE(cb.booking_status, '')) <> 'cancelled'
-          THEN cb.quantity
+          THEN CASE
+            WHEN LOWER(COALESCE(aa.allocation_type, '')) = 'table' THEN 1
+            ELSE cb.quantity
+          END
           ELSE 0
         END
       ), 0)::int AS sold_count
@@ -1041,8 +1045,7 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         : requestedType
       : requestedType;
 
-    let quantity = asInt(rawPayload.quantity, 1) || 1;
-    if (bookingType === "table") quantity = 1;
+    let quantity = Math.max(1, asInt(rawPayload.quantity, 1) || 1);
 
     const areaName = normalizeAreaName(rawPayload.area_name || ticketTypeRow?.area_name);
     const paymentMethod = "bank_transfer";
@@ -1050,10 +1053,17 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
     const customerName = asNullableText(rawPayload.customer_name);
     const customerPhone = asNullableText(rawPayload.customer_phone);
     const customerNote = asText(rawPayload.customer_note || rawPayload.note || "", "");
-    const guestsCount = asInt(
+    const requestedGuestsCount = asInt(
       rawPayload.guests_count || rawPayload.reservation_clients || rawPayload.guests || 0,
-      bookingType === "table" ? 1 : 0
+      0
     );
+    const guestsCount =
+      bookingType === "table"
+        ? Math.max(1, requestedGuestsCount || quantity)
+        : requestedGuestsCount;
+    if (bookingType === "table") {
+      quantity = guestsCount;
+    }
 
     let areaAllocationRow = null;
     if (areaName) {
@@ -1075,7 +1085,8 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
     const bookingCounters = await getEventBookingCounters(client, restaurantId, eventId);
     if (bookingType === "table") {
       const totalTableQty = asInt(eventRow.total_table_quantity, 0);
-      if (totalTableQty > 0 && bookingCounters.bookedTables + quantity > totalTableQty) {
+      const tableUnitsRequested = 1;
+      if (totalTableQty > 0 && bookingCounters.bookedTables + tableUnitsRequested > totalTableQty) {
         await client.query("ROLLBACK");
         return { status: 409, error: "Concert table stock is sold out" };
       }
@@ -1111,7 +1122,15 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
     if (areaAllocationRow) {
       const areaBookedResult = await client.query(
         `
-        SELECT COALESCE(SUM(quantity), 0)::int AS qty
+        SELECT COALESCE(
+          SUM(
+            CASE
+              WHEN LOWER(COALESCE(booking_type, '')) = 'table' THEN 1
+              ELSE quantity
+            END
+          ),
+          0
+        )::int AS qty
         FROM concert_bookings
         WHERE restaurant_id = $1
           AND event_id = $2
@@ -1124,7 +1143,8 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
       );
       const areaBooked = asInt(areaBookedResult.rows?.[0]?.qty, 0);
       const areaCapacity = asInt(areaAllocationRow.quantity_total, 0);
-      if (areaCapacity > 0 && areaBooked + quantity > areaCapacity) {
+      const areaUnitsRequested = bookingType === "table" ? 1 : quantity;
+      if (areaCapacity > 0 && areaBooked + areaUnitsRequested > areaCapacity) {
         await client.query("ROLLBACK");
         return { status: 409, error: `${areaAllocationRow.area_name} is sold out` };
       }
@@ -1353,7 +1373,7 @@ async function updateBookingPaymentStatus(pool, restaurantId, bookingId, payment
           `
           UPDATE orders
           SET status = CASE
-                WHEN LOWER(COALESCE(status, '')) IN ('cancelled', 'canceled', 'closed', 'completed')
+                WHEN LOWER(COALESCE(status, '')) IN ('cancelled', 'canceled')
                   THEN 'reserved'
                 ELSE status
               END,
