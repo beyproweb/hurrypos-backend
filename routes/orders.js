@@ -6329,12 +6329,13 @@ const checkInReservationOrder = async ({ restaurantId, orderId }) => {
     const concertBookingResult = await pool.query(
       `SELECT
          id,
+         booking_type,
          payment_status,
          booking_status
        FROM concert_bookings
        WHERE restaurant_id = $1
          AND reservation_order_id = $2
-         AND LOWER(COALESCE(booking_type, '')) = 'table'
+         AND LOWER(COALESCE(booking_type, '')) IN ('table', 'ticket')
        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
        LIMIT 1`,
       [restaurantId, orderId]
@@ -6382,6 +6383,15 @@ const checkInReservationOrder = async ({ restaurantId, orderId }) => {
           OR LOWER(COALESCE(o.order_type, '')) = 'reservation'
           OR o.reservation_date IS NOT NULL
           OR o.reservation_time IS NOT NULL
+          OR EXISTS (
+            SELECT 1
+            FROM concert_bookings cb
+            WHERE cb.restaurant_id = o.restaurant_id
+              AND cb.reservation_order_id = o.id
+              AND LOWER(COALESCE(cb.booking_type, '')) = 'ticket'
+              AND LOWER(COALESCE(cb.payment_status, '')) = 'confirmed'
+              AND LOWER(COALESCE(cb.booking_status, '')) <> 'cancelled'
+          )
         )
       RETURNING o.*`,
     [restaurantId, orderId]

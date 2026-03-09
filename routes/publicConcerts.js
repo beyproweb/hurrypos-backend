@@ -114,8 +114,11 @@ router.post("/:identifier/events/:eventId/bookings", async (req, res) => {
     }
 
     const io = req.app?.get?.("io");
-    if (result.data?.reservation?.table_number && io) {
+    const linkedOrderId = Number(result.data?.booking?.reservation_order_id);
+    if (io && Number.isFinite(linkedOrderId) && linkedOrderId > 0) {
       io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+    }
+    if (result.data?.reservation?.table_number && io) {
       io.to(`restaurant_${restaurantId}`).emit("reservation_created", {
         reservation_id: result.data.reservation.id,
         table_number: result.data.reservation.table_number,

@@ -8,6 +8,94 @@ const { saveNotification } = require("../utils/realtime");
 const CALL_WAITER_COOLDOWN_MS = 15000;
 const callWaiterRateLimit = new Map();
 
+const QR_BRANDING_DEFAULTS = {
+  app_icon: "",
+  app_icon_192: "",
+  app_icon_512: "",
+  apple_touch_icon: "",
+  splash_logo: "",
+  app_display_name: "",
+  pwa_primary_color: "#4F46E5",
+  pwa_background_color: "#FFFFFF",
+};
+
+function parseCustomizationPayload(row) {
+  if (!row) return {};
+  if (row.qr_menu_customization && typeof row.qr_menu_customization === "object") {
+    return row.qr_menu_customization;
+  }
+  if (row.value && typeof row.value === "object") {
+    return row.value;
+  }
+  if (typeof row.value === "string") {
+    try {
+      const parsed = JSON.parse(row.value);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function normalizeHexColor(value, fallback = "#4F46E5") {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^#([0-9a-f]{6}|[0-9a-f]{3})$/i);
+  if (!match) return fallback;
+  if (match[1].length === 6) return `#${match[1].toUpperCase()}`;
+  const expanded = match[1]
+    .split("")
+    .map((ch) => `${ch}${ch}`)
+    .join("")
+    .toUpperCase();
+  return `#${expanded}`;
+}
+
+function normalizeAssetPath(value, fallback = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return fallback;
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith("/")) return raw;
+  return `/${raw.replace(/^\/+/, "")}`;
+}
+
+function detectImageMimeType(src) {
+  const lower = String(src || "").toLowerCase();
+  if (lower.endsWith(".svg")) return "image/svg+xml";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp")) return "image/webp";
+  return "image/png";
+}
+
+async function resolveRestaurantForPublic(identifier) {
+  const key = String(identifier || "").trim();
+  if (!key) return null;
+  const { rows } = await pool.query(
+    `
+      SELECT id, name, slug, qr_code_id
+      FROM restaurants
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
+      LIMIT 1
+    `,
+    [key]
+  );
+  return rows[0] || null;
+}
+
+async function readQrMenuCustomization(restaurantId) {
+  const result = await pool.query(
+    `
+      SELECT qr_menu_customization, value
+      FROM settings
+      WHERE restaurant_id = $1 AND key = 'qr-menu-customization'
+      LIMIT 1
+    `,
+    [restaurantId]
+  );
+  if (!result.rows.length) return {};
+  return parseCustomizationPayload(result.rows[0]);
+}
+
 router.get("/qr-resolve/:code", async (req, res) => {
   try {
     const { code } = req.params;
@@ -176,7 +264,7 @@ router.get("/restaurant-info", async (req, res) => {
       `
       SELECT id, name, slug, description, banner_url, logo_url, tagline
       FROM restaurants
-      WHERE slug = $1 OR id::text = $1
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
       LIMIT 1
       `,
       [identifier]
@@ -259,6 +347,86 @@ router.get("/qr-link/:slug", async (req, res) => {
   } catch (err) {
     console.error("❌ Public qr-link error:", err);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/manifest.json", async (req, res) => {
+  try {
+    const identifier = String(req.query?.identifier || "").trim();
+    if (!identifier) {
+      return res.status(400).json({ error: "Missing identifier" });
+    }
+
+    const restaurant = await resolveRestaurantForPublic(identifier);
+    if (!restaurant) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    const customizationRaw = await readQrMenuCustomization(restaurant.id);
+    const customization = {
+      ...QR_BRANDING_DEFAULTS,
+      ...customizationRaw,
+    };
+
+    const appName = String(
+      customization.app_display_name ||
+        restaurant.name ||
+        customization.main_title ||
+        "Restaurant"
+    ).trim() || "Restaurant";
+    const shortName = appName.length > 18 ? `${appName.slice(0, 18).trim()}` : appName;
+    const themeColor = normalizeHexColor(
+      customization.pwa_primary_color || customization.primary_color,
+      "#4F46E5"
+    );
+    const backgroundColor = normalizeHexColor(customization.pwa_background_color, "#FFFFFF");
+    const fallbackIcon = "/Beylogo.svg";
+    const icon192 = normalizeAssetPath(
+      customization.app_icon_192 || customization.app_icon,
+      fallbackIcon
+    );
+    const icon512 = normalizeAssetPath(
+      customization.app_icon_512 || customization.app_icon,
+      fallbackIcon
+    );
+    const startUrl = restaurant.slug
+      ? `/${encodeURIComponent(restaurant.slug)}`
+      : `/qr-menu/${encodeURIComponent(String(restaurant.id))}/${encodeURIComponent(
+          String(restaurant.qr_code_id || "scan")
+        )}`;
+
+    const manifest = {
+      id: `/restaurant/${restaurant.id}`,
+      name: appName,
+      short_name: shortName || appName,
+      start_url: startUrl,
+      scope: "/",
+      display: "standalone",
+      background_color: backgroundColor,
+      theme_color: themeColor,
+      icons: [
+        {
+          src: icon192,
+          sizes: "192x192",
+          type: detectImageMimeType(icon192),
+        },
+        {
+          src: icon512,
+          sizes: "512x512",
+          type: detectImageMimeType(icon512),
+          purpose: "any maskable",
+        },
+      ],
+    };
+
+    res.set("Content-Type", "application/manifest+json");
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    return res.status(200).json(manifest);
+  } catch (err) {
+    console.error("❌ Public manifest generation failed:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -481,47 +649,13 @@ router.get("/category-images/:identifier", async (req, res) => {
 
 router.get("/qr-menu-customization/:slug", async (req, res) => {
   try {
-    const slug = req.params.slug;
-
-    // 1️⃣ Find restaurant ID
-    const r1 = await pool.query(
-      `
-      SELECT id
-      FROM restaurants
-      WHERE slug = $1
-         OR qr_code_id = $1
-         OR id::text = $1
-      LIMIT 1
-      `,
-      [slug]
-    );
-
-    if (!r1.rows.length) {
+    const slug = String(req.params.slug || "").trim();
+    const restaurant = await resolveRestaurantForPublic(slug);
+    if (!restaurant) {
       return res.status(404).json({ error: "Restaurant not found" });
     }
 
-    const restaurantId = r1.rows[0].id;
-
-    // 2️⃣ Load customization from settings
-    const r2 = await pool.query(
-      `
-      SELECT qr_menu_customization, value
-      FROM settings
-      WHERE restaurant_id = $1 AND key = 'qr-menu-customization'
-      LIMIT 1
-      `,
-      [restaurantId]
-    );
-
-    let data = {};
-
-    if (r2.rows.length) {
-      if (r2.rows[0].qr_menu_customization) {
-        data = r2.rows[0].qr_menu_customization;
-      } else if (r2.rows[0].value) {
-        data = r2.rows[0].value;   // << FIXED: no JSON.parse
-      }
-    }
+    const data = await readQrMenuCustomization(restaurant.id);
 
     const defaults = {
       main_title: "Welcome to Our Restaurant",
@@ -551,6 +685,8 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
       delivery_enabled: true,
       table_geo_enabled: false,
       table_geo_radius_meters: 150,
+      ...QR_BRANDING_DEFAULTS,
+      app_display_name: restaurant.name || "Restaurant",
     };
 
     res.json({
@@ -627,11 +763,8 @@ async function ensureLoyaltyTable() {
 }
 
 async function resolveRestaurantId(identifier) {
-  const { rows } = await pool.query(
-    `SELECT id FROM restaurants WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1 LIMIT 1`,
-    [identifier]
-  );
-  return rows[0]?.id || null;
+  const row = await resolveRestaurantForPublic(identifier);
+  return row?.id || null;
 }
 
 router.get("/loyalty/:identifier", async (req, res) => {

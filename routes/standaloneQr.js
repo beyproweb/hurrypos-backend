@@ -9,6 +9,7 @@ const allowedPaths = new Set([
   "/qr-menu-disabled",
   "/qr-menu-customization",
   "/qr-menu-delivery",
+  "/qr-menu-branding-assets",
 ]);
 
 router.use(requireModule("qr_kitchen"));

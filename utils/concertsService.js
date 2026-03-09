@@ -990,6 +990,75 @@ async function createReservationOrder(client, payload) {
   return result.rows?.[0] || null;
 }
 
+async function createConcertTicketOrder(client, payload) {
+  const orderResult = await client.query(
+    `
+    INSERT INTO orders (
+      restaurant_id,
+      status,
+      total,
+      order_type,
+      customer_name,
+      customer_phone,
+      created_at
+    )
+    VALUES (
+      $1, 'pending', $2, 'takeaway', $3, $4, NOW()
+    )
+    RETURNING id, status, order_type, total, customer_name, customer_phone, created_at
+    `,
+    [
+      payload.restaurant_id,
+      asMoney(payload.total_amount, 0),
+      payload.customer_name || null,
+      payload.customer_phone || null,
+    ]
+  );
+  const createdOrder = orderResult.rows?.[0] || null;
+  if (!createdOrder) return null;
+
+  const quantity = Math.max(1, asInt(payload.quantity, 1) || 1);
+  const unitPrice = asMoney(payload.unit_price, 0);
+  const itemName = "Ticket concert";
+  const itemNote = asText(payload.item_note, "");
+  const uniqueId = `concert-ticket-${createdOrder.id}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+
+  await client.query(
+    `
+    INSERT INTO order_items (
+      order_id,
+      product_id,
+      quantity,
+      price,
+      ingredients,
+      extras,
+      unique_id,
+      confirmed,
+      kitchen_status,
+      payment_method,
+      receipt_id,
+      note,
+      discount_type,
+      discount_value,
+      external_product_id,
+      external_product_name,
+      name
+    )
+    VALUES (
+      $1, NULL, $2, $3,
+      '[]'::jsonb, '[]'::jsonb, $4,
+      TRUE, 'delivered', NULL, NULL, $5,
+      NULL, 0, NULL, $6, $7
+    )
+    `,
+    [createdOrder.id, quantity, unitPrice, uniqueId, itemNote || null, itemName, itemName]
+  );
+
+  return createdOrder;
+}
+
 function makeConcertReservationNote(eventRow, customerNote) {
   const eventLabel = [asText(eventRow.event_title, ""), asText(eventRow.artist_name, "")]
     .filter(Boolean)
@@ -1160,6 +1229,7 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
     const totalAmount = asMoney(unitPrice * quantity, 0);
 
     let reservationOrder = null;
+    let linkedOrder = null;
     let reservedTableNumber = null;
     if (bookingType === "table") {
       const eventDate = normalizeDateInput(eventRow.event_date);
@@ -1211,6 +1281,24 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         await client.query("ROLLBACK");
         return { status: 500, error: "Failed to reserve a concert table" };
       }
+      linkedOrder = reservationOrder;
+    } else {
+      const eventLabel = [asText(eventRow.event_title, ""), asText(eventRow.artist_name, "")]
+        .filter(Boolean)
+        .join(" - ");
+      linkedOrder = await createConcertTicketOrder(client, {
+        restaurant_id: restaurantId,
+        total_amount: totalAmount,
+        quantity,
+        unit_price: unitPrice,
+        customer_name: customerName,
+        customer_phone: customerPhone,
+        item_note: eventLabel ? `Concert: ${eventLabel}` : "Concert ticket",
+      });
+      if (!linkedOrder) {
+        await client.query("ROLLBACK");
+        return { status: 500, error: "Failed to create concert ticket order" };
+      }
     }
 
     const insertResult = await client.query(
@@ -1257,7 +1345,7 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         customerNote || null,
         paymentMethod,
         paymentStatus,
-        reservationOrder?.id || null,
+        linkedOrder?.id || null,
         reservedTableNumber,
       ]
     );
@@ -1277,6 +1365,7 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
             "Please complete bank transfer and wait for venue confirmation.",
         },
         reservation: reservationOrder,
+        linked_order: linkedOrder,
         event: eventView,
       },
     };
@@ -1353,6 +1442,7 @@ async function updateBookingPaymentStatus(pool, restaurantId, bookingId, payment
     );
 
     if (booking.reservation_order_id) {
+      const bookingType = normalizeBookingType(booking.booking_type);
       if (normalizedStatus === "cancelled") {
         await client.query(
           `
@@ -1369,20 +1459,37 @@ async function updateBookingPaymentStatus(pool, restaurantId, bookingId, payment
           [restaurantId, booking.reservation_order_id]
         );
       } else if (normalizedStatus === "confirmed") {
-        await client.query(
-          `
-          UPDATE orders
-          SET status = CASE
-                WHEN LOWER(COALESCE(status, '')) IN ('cancelled', 'canceled')
-                  THEN 'reserved'
-                ELSE status
-              END,
-              updated_at = NOW()
-          WHERE restaurant_id = $1
-            AND id = $2
-          `,
-          [restaurantId, booking.reservation_order_id]
-        );
+        if (bookingType === "table") {
+          await client.query(
+            `
+            UPDATE orders
+            SET status = CASE
+                  WHEN LOWER(COALESCE(status, '')) IN ('cancelled', 'canceled')
+                    THEN 'reserved'
+                  ELSE status
+                END,
+                updated_at = NOW()
+            WHERE restaurant_id = $1
+              AND id = $2
+            `,
+            [restaurantId, booking.reservation_order_id]
+          );
+        } else {
+          await client.query(
+            `
+            UPDATE orders
+            SET status = CASE
+                  WHEN LOWER(COALESCE(status, '')) IN ('closed', 'completed')
+                    THEN status
+                  ELSE 'confirmed'
+                END,
+                updated_at = NOW()
+            WHERE restaurant_id = $1
+              AND id = $2
+            `,
+            [restaurantId, booking.reservation_order_id]
+          );
+        }
       }
     }
 

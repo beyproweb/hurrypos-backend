@@ -1,6 +1,10 @@
 const express = require("express");
 const router = express.Router();
 const { pool } = require("../db");
+const fs = require("fs");
+const path = require("path");
+const multer = require("multer");
+const sharp = require("sharp");
 const authMiddleware = require("../middleware/authMiddleware");
 const { attachAllowedModules } = require("../middleware/moduleGuard");
 const { ensureCashLogColumns } = require("../utils/registerLogColumns");
@@ -15,6 +19,7 @@ const standaloneQrAllowed = new Set([
   "/qr-menu-disabled",
   "/qr-menu-customization",
   "/qr-menu-delivery",
+  "/qr-menu-branding-assets",
 ]);
 const standaloneStaffAllowed = new Set([
   "/users",
@@ -52,6 +57,29 @@ const DEFAULT_TRANSACTIONS = {
   disableAutoPrintTable: false,
   disableAutoPrintPacket: false,
 };
+
+const BRANDING_UPLOAD_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/svg+xml",
+]);
+
+const brandingUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 6 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    const mime = String(file?.mimetype || "").toLowerCase();
+    const ext = String(path.extname(file?.originalname || "") || "").toLowerCase();
+    const extensionAllowed = [".png", ".jpg", ".jpeg", ".svg"].includes(ext);
+    if (BRANDING_UPLOAD_MIME_TYPES.has(mime) || extensionAllowed) {
+      return cb(null, true);
+    }
+    return cb(null, false);
+  },
+});
 
 async function ensureTransactionsColumn() {
   await pool.query(
@@ -148,7 +176,7 @@ router.get("/qr-link", async (req, res) => {
     // ✅ Final short link (easy to share/print)
     const link = `https://pos.beypro.com/${slug}`;
 
-    res.json({ success: true, link });
+    res.json({ success: true, link, name: name || "" });
   } catch (err) {
     console.error("❌ Failed to build QR link:", err);
     res.status(500).json({ error: "Failed to build QR link" });
@@ -674,10 +702,110 @@ router.delete("/roles/:role", async (req, res) => {
    Save + Fetch Customization (titles, story, hero slides, etc.)
    =========================================================== */
 
+const BRANDING_DEFAULTS = {
+  app_icon: "",
+  app_icon_192: "",
+  app_icon_512: "",
+  apple_touch_icon: "",
+  splash_logo: "",
+  app_display_name: "",
+  pwa_primary_color: "#4F46E5",
+  pwa_background_color: "#FFFFFF",
+};
+
+function parseCustomizationPayload(row) {
+  if (!row) return {};
+  if (row.qr_menu_customization && typeof row.qr_menu_customization === "object") {
+    return row.qr_menu_customization;
+  }
+  if (row.value && typeof row.value === "object") {
+    return row.value;
+  }
+  if (typeof row.value === "string") {
+    try {
+      const parsed = JSON.parse(row.value);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function sanitizeSlugForPath(value, fallback = "restaurant") {
+  const raw = String(value || "").trim().toLowerCase();
+  const normalized = raw.replace(/[^a-z0-9-_]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return normalized || fallback;
+}
+
+async function ensureRestaurantSlugForBranding(restaurantId, fallbackName = "restaurant") {
+  const { rows } = await pool.query(
+    "SELECT slug, name FROM restaurants WHERE id = $1 LIMIT 1",
+    [restaurantId]
+  );
+
+  if (!rows.length) {
+    return { slug: null, name: "" };
+  }
+
+  let slug = rows[0].slug;
+  const name = rows[0].name || fallbackName;
+  if (isMissingRestaurantSlug(slug)) {
+    const nextSlug = await generateUniqueRestaurantSlug(pool, name || `restaurant-${restaurantId}`);
+    await pool.query("UPDATE restaurants SET slug = $1 WHERE id = $2", [nextSlug, restaurantId]);
+    slug = nextSlug;
+  }
+
+  return { slug, name };
+}
+
+function colorHexToRgba(input, fallback = { r: 255, g: 255, b: 255, alpha: 1 }) {
+  const value = String(input || "").trim();
+  const match = value.match(/^#([0-9a-f]{6}|[0-9a-f]{3})$/i);
+  if (!match) return fallback;
+  const hex = match[1].length === 3
+    ? match[1].split("").map((ch) => ch + ch).join("")
+    : match[1];
+  return {
+    r: parseInt(hex.slice(0, 2), 16),
+    g: parseInt(hex.slice(2, 4), 16),
+    b: parseInt(hex.slice(4, 6), 16),
+    alpha: 1,
+  };
+}
+
+async function readQrMenuCustomization(restaurantId) {
+  const result = await pool.query(
+    `
+      SELECT qr_menu_customization, value
+      FROM settings
+      WHERE restaurant_id = $1 AND key = 'qr-menu-customization'
+      LIMIT 1
+    `,
+    [restaurantId]
+  );
+
+  if (!result.rows.length) return {};
+  return parseCustomizationPayload(result.rows[0]);
+}
+
+async function saveQrMenuCustomization(restaurantId, payload) {
+  await pool.query(
+    `
+      INSERT INTO settings (restaurant_id, key, qr_menu_customization)
+      VALUES ($1, 'qr-menu-customization', $2::jsonb)
+      ON CONFLICT (restaurant_id, key)
+      DO UPDATE SET qr_menu_customization = EXCLUDED.qr_menu_customization
+    `,
+    [restaurantId, JSON.stringify(payload)]
+  );
+}
+
 // Place these BEFORE the generic /:section handlers so they are not shadowed
 router.get("/qr-menu-customization", async (req, res) => {
   try {
     const restaurantId = req.user.restaurant_id;
+    const { name: restaurantName } = await ensureRestaurantSlugForBranding(restaurantId);
 
     const result = await pool.query(
       `
@@ -742,6 +870,8 @@ router.get("/qr-menu-customization", async (req, res) => {
       delivery_enabled: true,
       table_geo_enabled: false,
       table_geo_radius_meters: 150,
+      ...BRANDING_DEFAULTS,
+      app_display_name: restaurantName || "Restaurant",
     };
 
     res.json({
@@ -783,6 +913,110 @@ router.post("/qr-menu-customization", async (req, res) => {
     res.status(500).json({ error: "Failed to save qr-menu-customization" });
   }
 });
+
+router.post(
+  "/qr-menu-branding-assets",
+  brandingUpload.fields([
+    { name: "app_icon", maxCount: 1 },
+    { name: "splash_logo", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    try {
+      const restaurantId = req.user.restaurant_id;
+      const files = req.files || {};
+      const appIconFile = Array.isArray(files.app_icon) ? files.app_icon[0] : null;
+      const splashLogoFile = Array.isArray(files.splash_logo) ? files.splash_logo[0] : null;
+
+      if (!appIconFile && !splashLogoFile) {
+        return res.status(400).json({ error: "No branding file uploaded." });
+      }
+
+      const existing = await readQrMenuCustomization(restaurantId);
+      const next = { ...existing };
+      const { slug, name: restaurantName } = await ensureRestaurantSlugForBranding(restaurantId);
+      if (!slug) {
+        return res.status(404).json({ error: "Restaurant not found" });
+      }
+
+      const safeSlug = sanitizeSlugForPath(slug, `restaurant-${restaurantId}`);
+      const relativeDir = path.join("uploads", "restaurants", safeSlug);
+      const absoluteDir = path.join(__dirname, "..", "public", relativeDir);
+      await fs.promises.mkdir(absoluteDir, { recursive: true });
+
+      if (appIconFile?.buffer) {
+        const icon192RelPath = path.join(relativeDir, "icon-192.png");
+        const icon512RelPath = path.join(relativeDir, "icon-512.png");
+        const appleTouchRelPath = path.join(relativeDir, "apple-touch-icon.png");
+
+        await sharp(appIconFile.buffer, { density: 300 })
+          .resize(192, 192, {
+            fit: "contain",
+            background: { r: 0, g: 0, b: 0, alpha: 0 },
+            withoutEnlargement: false,
+          })
+          .png({ compressionLevel: 9, quality: 90 })
+          .toFile(path.join(__dirname, "..", "public", icon192RelPath));
+
+        await sharp(appIconFile.buffer, { density: 300 })
+          .resize(512, 512, {
+            fit: "contain",
+            background: { r: 0, g: 0, b: 0, alpha: 0 },
+            withoutEnlargement: false,
+          })
+          .png({ compressionLevel: 9, quality: 90 })
+          .toFile(path.join(__dirname, "..", "public", icon512RelPath));
+
+        await sharp(appIconFile.buffer, { density: 300 })
+          .resize(180, 180, {
+            fit: "contain",
+            background: { r: 255, g: 255, b: 255, alpha: 1 },
+            withoutEnlargement: false,
+          })
+          .png({ compressionLevel: 9, quality: 90 })
+          .toFile(path.join(__dirname, "..", "public", appleTouchRelPath));
+
+        next.app_icon = `/${icon512RelPath.replace(/\\/g, "/")}`;
+        next.app_icon_192 = `/${icon192RelPath.replace(/\\/g, "/")}`;
+        next.app_icon_512 = `/${icon512RelPath.replace(/\\/g, "/")}`;
+        next.apple_touch_icon = `/${appleTouchRelPath.replace(/\\/g, "/")}`;
+      }
+
+      if (splashLogoFile?.buffer) {
+        const splashRelPath = path.join(relativeDir, "splash-logo.png");
+        const splashBackground = colorHexToRgba(
+          req.body?.pwa_background_color || existing?.pwa_background_color || "#FFFFFF",
+          { r: 255, g: 255, b: 255, alpha: 1 }
+        );
+
+        await sharp(splashLogoFile.buffer, { density: 300 })
+          .resize(1024, 1024, {
+            fit: "contain",
+            background: splashBackground,
+            withoutEnlargement: true,
+          })
+          .png({ compressionLevel: 9, quality: 90 })
+          .toFile(path.join(__dirname, "..", "public", splashRelPath));
+
+        next.splash_logo = `/${splashRelPath.replace(/\\/g, "/")}`;
+      }
+
+      next.branding_updated_at = new Date().toISOString();
+      if (!String(next.app_display_name || "").trim()) {
+        next.app_display_name = restaurantName || next.main_title || "Restaurant";
+      }
+
+      await saveQrMenuCustomization(restaurantId, next);
+
+      return res.json({
+        success: true,
+        customization: next,
+      });
+    } catch (err) {
+      console.error("❌ Failed to upload QR branding assets:", err);
+      return res.status(500).json({ error: "Failed to upload branding assets" });
+    }
+  }
+);
 
 router.post("/qr-menu-delivery", async (req, res) => {
   try {
