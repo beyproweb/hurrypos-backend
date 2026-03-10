@@ -90,7 +90,15 @@ function toAbsoluteManifestAssetUrl(src, req) {
   );
   if (publicBase) return `${publicBase}${value}`;
 
-  const origin = `${req.protocol}://${req.get("host")}`;
+  const forwardedProto = String(req.get("x-forwarded-proto") || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const host = String(req.get("host") || "").trim();
+  const isLocalHost =
+    host.includes("localhost") || host.startsWith("127.0.0.1") || host.startsWith("[::1]");
+  const protocol = forwardedProto || (isLocalHost ? "http" : "https");
+  const origin = `${protocol}://${host}`;
   return `${origin}${value}`;
 }
 
