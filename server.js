@@ -242,7 +242,14 @@ app.use("/api/standalone/auth", require("./routes/standaloneAuth"));
 app.use("/api/standalone/qr", require("./routes/standaloneQr"));
 app.use("/api/standalone/kitchen", require("./routes/standaloneKitchen"));
 app.use("/api/standalone/tables", require("./routes/standaloneTables"));
-app.use("/api/public", require("./routes/publicQR"));
+const publicQRRoutes = require("./routes/publicQR");
+app.use("/api/public", publicQRRoutes);
+// Backward-compat aliases for stale frontend builds / caches.
+app.use("/public", publicQRRoutes);
+app.get("/manifest.json", (req, res) => {
+  const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+  res.redirect(302, `/api/public/manifest.json${qs}`);
+});
 app.use("/api/public/concerts", require("./routes/publicConcerts"));
 app.use("/api/public", require("./routes/publicRegistrations"));
 
