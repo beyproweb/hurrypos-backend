@@ -585,6 +585,7 @@ router.get("/share/:identifier", async (req, res) => {
       ? `/${encodeURIComponent(restaurant.slug)}`
       : `/restaurant/${encodeURIComponent(String(restaurant.id))}`;
     const menuUrl = `${webBase}${menuPath}`;
+    const landingUrl = `${menuUrl}${menuUrl.includes("?") ? "&" : "?"}from_share=1`;
 
     const html = `<!doctype html>
 <html lang="en">
@@ -603,13 +604,13 @@ router.get("/share/:identifier", async (req, res) => {
     <meta name="twitter:title" content="${escapeHtml(appName)}" />
     <meta name="twitter:description" content="${escapeHtml(description)}" />
     <meta name="twitter:image" content="${escapeHtml(imageUrl)}" />
-    <meta http-equiv="refresh" content="0; url=${escapeHtml(menuUrl)}" />
+    <meta http-equiv="refresh" content="0; url=${escapeHtml(landingUrl)}" />
     <link rel="canonical" href="${escapeHtml(menuUrl)}" />
   </head>
   <body>
     <p>Redirecting to ${escapeHtml(appName)}...</p>
     <script>
-      window.location.replace(${JSON.stringify(menuUrl)});
+      window.location.replace(${JSON.stringify(landingUrl)});
     </script>
   </body>
 </html>`;
