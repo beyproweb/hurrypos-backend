@@ -67,6 +67,33 @@ function detectImageMimeType(src) {
   return "image/png";
 }
 
+function normalizePublicBaseUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const withoutSlash = raw.replace(/\/+$/, "");
+  return withoutSlash.replace(/\/api$/i, "");
+}
+
+function toAbsoluteManifestAssetUrl(src, req) {
+  const value = String(src || "").trim();
+  if (!value) return value;
+  if (/^https?:\/\//i.test(value)) return value;
+  // Keep non-upload app-root assets (e.g. /Beylogo.svg) on current origin.
+  if (!value.startsWith("/uploads/")) return value;
+
+  const publicBase = normalizePublicBaseUrl(
+    process.env.PUBLIC_UPLOADS_BASE_URL ||
+      process.env.PUBLIC_API_BASE_URL ||
+      process.env.PUBLIC_API_BASE ||
+      process.env.API_BASE_URL ||
+      ""
+  );
+  if (publicBase) return `${publicBase}${value}`;
+
+  const origin = `${req.protocol}://${req.get("host")}`;
+  return `${origin}${value}`;
+}
+
 function safeDecodeURIComponent(value) {
   try {
     return decodeURIComponent(String(value || ""));
@@ -495,6 +522,8 @@ router.get("/manifest.json", async (req, res) => {
       customization.app_icon_512 || customization.app_icon,
       fallbackIcon
     );
+    const manifestIcon192 = toAbsoluteManifestAssetUrl(icon192, req);
+    const manifestIcon512 = toAbsoluteManifestAssetUrl(icon512, req);
     const basePath = restaurant.slug
       ? `/${encodeURIComponent(restaurant.slug)}`
       : `/qr-menu/${encodeURIComponent(String(restaurant.id))}/${encodeURIComponent(
@@ -516,14 +545,14 @@ router.get("/manifest.json", async (req, res) => {
       theme_color: themeColor,
       icons: [
         {
-          src: icon192,
+          src: manifestIcon192,
           sizes: "192x192",
-          type: detectImageMimeType(icon192),
+          type: detectImageMimeType(manifestIcon192),
         },
         {
-          src: icon512,
+          src: manifestIcon512,
           sizes: "512x512",
-          type: detectImageMimeType(icon512),
+          type: detectImageMimeType(manifestIcon512),
           purpose: "any maskable",
         },
       ],
