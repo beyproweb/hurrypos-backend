@@ -495,14 +495,15 @@ router.get("/manifest.json", async (req, res) => {
       customization.app_icon_512 || customization.app_icon,
       fallbackIcon
     );
-    const startUrl = restaurant.slug
+    const basePath = restaurant.slug
       ? `/${encodeURIComponent(restaurant.slug)}`
       : `/qr-menu/${encodeURIComponent(String(restaurant.id))}/${encodeURIComponent(
           String(restaurant.qr_code_id || "scan")
         )}`;
-    // Use restaurant-specific scope so Chrome can install multiple restaurants
-    // from the same origin as separate apps.
-    const appScope = startUrl;
+    // Keep scope/page aligned even when user opens /slug without trailing slash.
+    // This preserves per-restaurant install identity while keeping installability stable.
+    const startUrl = `${basePath}?source=pwa`;
+    const appScope = basePath;
 
     const manifest = {
       id: `/restaurant/${restaurant.id}`,
