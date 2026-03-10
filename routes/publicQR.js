@@ -67,6 +67,83 @@ function detectImageMimeType(src) {
   return "image/png";
 }
 
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(String(value || ""));
+  } catch {
+    return String(value || "");
+  }
+}
+
+function resolveIdentifierFromReferer(refererValue) {
+  const raw = String(refererValue || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    const query = url.searchParams;
+    const fromQuery =
+      query.get("identifier") ||
+      query.get("tenant_id") ||
+      query.get("tenant") ||
+      query.get("restaurant_id") ||
+      query.get("restaurant") ||
+      query.get("slug") ||
+      query.get("id") ||
+      "";
+    if (String(fromQuery || "").trim()) {
+      return safeDecodeURIComponent(String(fromQuery).trim());
+    }
+
+    const segments = String(url.pathname || "/")
+      .split("/")
+      .filter(Boolean);
+    if (!segments.length) return "";
+
+    const reservedRootRoutes = new Set([
+      "login",
+      "staff-login",
+      "dashboard",
+      "orders",
+      "products",
+      "kitchen",
+      "suppliers",
+      "stock",
+      "production",
+      "tables",
+      "tableoverview",
+      "reports",
+      "staff",
+      "task",
+      "live-route",
+      "takeaway-overview",
+      "settings",
+      "subscription",
+      "expenses",
+      "ingredient-prices",
+      "cash-register-history",
+      "integrations",
+      "standalone",
+      "standalone-register",
+      "qr-menu-settings",
+      "register",
+      "qr",
+      "menu",
+      "api",
+      "socket.io",
+    ]);
+
+    if (segments[0] === "qr-menu" && segments[1]) {
+      return safeDecodeURIComponent(segments[1]);
+    }
+    if (segments.length === 1 && !reservedRootRoutes.has(segments[0])) {
+      return safeDecodeURIComponent(segments[0]);
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
 async function resolveRestaurantForPublic(identifier) {
   const key = String(identifier || "").trim();
   if (!key) return null;
@@ -352,14 +429,42 @@ router.get("/qr-link/:slug", async (req, res) => {
 
 router.get("/manifest.json", async (req, res) => {
   try {
-    const identifier = String(req.query?.identifier || "").trim();
+    const fallbackManifest = {
+      id: "/beypro",
+      name: "Beypro QR Menu",
+      short_name: "Beypro Menu",
+      start_url: "/",
+      scope: "/",
+      display: "standalone",
+      background_color: "#FFFFFF",
+      theme_color: "#4F46E5",
+      icons: [
+        {
+          src: "/Beylogo.svg",
+          sizes: "192x192",
+          type: "image/svg+xml",
+        },
+        {
+          src: "/Beylogo.svg",
+          sizes: "512x512",
+          type: "image/svg+xml",
+          purpose: "any maskable",
+        },
+      ],
+    };
+
+    let identifier = String(req.query?.identifier || "").trim();
     if (!identifier) {
-      return res.status(400).json({ error: "Missing identifier" });
+      identifier = resolveIdentifierFromReferer(req.get("referer"));
     }
 
-    const restaurant = await resolveRestaurantForPublic(identifier);
+    const restaurant = identifier ? await resolveRestaurantForPublic(identifier) : null;
     if (!restaurant) {
-      return res.status(404).json({ error: "Restaurant not found" });
+      res.set("Content-Type", "application/manifest+json");
+      res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+      res.set("Pragma", "no-cache");
+      res.set("Expires", "0");
+      return res.status(200).json(fallbackManifest);
     }
 
     const customizationRaw = await readQrMenuCustomization(restaurant.id);
@@ -370,8 +475,9 @@ router.get("/manifest.json", async (req, res) => {
 
     const appName = String(
       customization.app_display_name ||
-        restaurant.name ||
         customization.main_title ||
+        customization.title ||
+        restaurant.name ||
         "Restaurant"
     ).trim() || "Restaurant";
     const shortName = appName.length > 18 ? `${appName.slice(0, 18).trim()}` : appName;
@@ -394,13 +500,16 @@ router.get("/manifest.json", async (req, res) => {
       : `/qr-menu/${encodeURIComponent(String(restaurant.id))}/${encodeURIComponent(
           String(restaurant.qr_code_id || "scan")
         )}`;
+    // Use restaurant-specific scope so Chrome can install multiple restaurants
+    // from the same origin as separate apps.
+    const appScope = startUrl;
 
     const manifest = {
       id: `/restaurant/${restaurant.id}`,
       name: appName,
       short_name: shortName || appName,
       start_url: startUrl,
-      scope: "/",
+      scope: appScope,
       display: "standalone",
       background_color: backgroundColor,
       theme_color: themeColor,
