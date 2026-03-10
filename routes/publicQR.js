@@ -74,6 +74,77 @@ function normalizePublicBaseUrl(value) {
   return withoutSlash.replace(/\/api$/i, "");
 }
 
+function resolveRequestOrigin(req) {
+  const forwardedProto = String(req.get("x-forwarded-proto") || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const host = String(req.get("host") || "").trim();
+  if (!host) return "";
+  const isLocalHost =
+    host.includes("localhost") || host.startsWith("127.0.0.1") || host.startsWith("[::1]");
+  const protocol = forwardedProto || (isLocalHost ? "http" : "https");
+  return `${protocol}://${host}`;
+}
+
+function resolvePublicWebBaseUrl(req) {
+  const envBase = normalizePublicBaseUrl(
+    process.env.PUBLIC_WEB_BASE_URL ||
+      process.env.PUBLIC_POS_BASE_URL ||
+      process.env.POS_APP_BASE_URL ||
+      process.env.WEB_BASE_URL ||
+      ""
+  );
+  if (envBase) return envBase;
+
+  const host = String(req.get("host") || "").trim().toLowerCase();
+  if (host.includes("api.beypro.com")) {
+    return "https://pos.beypro.com";
+  }
+  if (host.includes("localhost") || host.startsWith("127.0.0.1") || host.startsWith("[::1]")) {
+    return "http://localhost:5173";
+  }
+  return resolveRequestOrigin(req);
+}
+
+function resolvePublicApiBaseUrl(req) {
+  const envBase = normalizePublicBaseUrl(
+    process.env.PUBLIC_API_BASE_URL ||
+      process.env.PUBLIC_API_BASE ||
+      process.env.API_BASE_URL ||
+      ""
+  );
+  if (envBase) return envBase;
+
+  const host = String(req.get("host") || "").trim().toLowerCase();
+  if (host.includes("pos.beypro.com")) {
+    return "https://api.beypro.com";
+  }
+  return resolveRequestOrigin(req);
+}
+
+function toAbsolutePublicAssetUrl(src, req) {
+  const value = String(src || "").trim();
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+
+  const normalized = normalizeAssetPath(value, "");
+  if (!normalized) return "";
+  if (normalized.startsWith("/uploads/")) {
+    return `${resolvePublicApiBaseUrl(req)}${normalized}`;
+  }
+  return `${resolvePublicWebBaseUrl(req)}${normalized}`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function toAbsoluteManifestAssetUrl(src, req) {
   const value = String(src || "").trim();
   if (!value) return value;
@@ -459,6 +530,98 @@ router.get("/qr-link/:slug", async (req, res) => {
   } catch (err) {
     console.error("❌ Public qr-link error:", err);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/share/:identifier", async (req, res) => {
+  try {
+    const identifier = String(req.params.identifier || "").trim();
+    const webBase = resolvePublicWebBaseUrl(req);
+    const fallbackMenuUrl = `${webBase}/`;
+
+    if (!identifier) {
+      return res.redirect(302, fallbackMenuUrl);
+    }
+
+    const restaurant = await resolveRestaurantForPublic(identifier);
+    if (!restaurant) {
+      return res.redirect(302, fallbackMenuUrl);
+    }
+
+    const customizationRaw = await readQrMenuCustomization(restaurant.id);
+    const customization = {
+      ...QR_BRANDING_DEFAULTS,
+      ...customizationRaw,
+    };
+
+    const appName =
+      String(
+        customization.app_display_name ||
+          customization.main_title ||
+          customization.title ||
+          restaurant.name ||
+          "Restaurant"
+      ).trim() || "Restaurant";
+
+    const description =
+      String(
+        customization.subtitle ||
+          customization.tagline ||
+          customization.story_text ||
+          `Explore ${appName} on Beypro QR Menu.`
+      ).trim() || `Explore ${appName} on Beypro QR Menu.`;
+
+    const imageCandidate =
+      customization.app_icon_512 ||
+      customization.app_icon_192 ||
+      customization.splash_logo ||
+      customization.app_icon ||
+      "/Beylogo.svg";
+    const imageUrl =
+      toAbsolutePublicAssetUrl(imageCandidate, req) ||
+      `${resolvePublicWebBaseUrl(req)}/Beylogo.svg`;
+
+    const menuPath = restaurant.slug
+      ? `/${encodeURIComponent(restaurant.slug)}`
+      : `/restaurant/${encodeURIComponent(String(restaurant.id))}`;
+    const menuUrl = `${webBase}${menuPath}`;
+
+    const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(appName)}</title>
+    <meta name="description" content="${escapeHtml(description)}" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="${escapeHtml(appName)}" />
+    <meta property="og:description" content="${escapeHtml(description)}" />
+    <meta property="og:image" content="${escapeHtml(imageUrl)}" />
+    <meta property="og:url" content="${escapeHtml(menuUrl)}" />
+    <meta property="og:site_name" content="${escapeHtml(appName)}" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="${escapeHtml(appName)}" />
+    <meta name="twitter:description" content="${escapeHtml(description)}" />
+    <meta name="twitter:image" content="${escapeHtml(imageUrl)}" />
+    <meta http-equiv="refresh" content="0; url=${escapeHtml(menuUrl)}" />
+    <link rel="canonical" href="${escapeHtml(menuUrl)}" />
+  </head>
+  <body>
+    <p>Redirecting to ${escapeHtml(appName)}...</p>
+    <script>
+      window.location.replace(${JSON.stringify(menuUrl)});
+    </script>
+  </body>
+</html>`;
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    return res.status(200).send(html);
+  } catch (err) {
+    console.error("❌ Public share page generation failed:", err);
+    return res.status(500).send("Server error");
   }
 });
 
