@@ -1005,36 +1005,99 @@ const getReservationFinalizeResetSql = (statusSqlExpr, options = {}) => {
   return assignments.join(",\n              ");
 };
 
+async function cancelLinkedConcertBookings(
+  client,
+  restaurantId,
+  orderIds,
+  { cancellationReason = "linked_order_closed", bookingTypes = ["table"] } = {}
+) {
+  const normalizedOrderIds = Array.from(
+    new Set(
+      (Array.isArray(orderIds) ? orderIds : [orderIds])
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value > 0)
+    )
+  );
+  if (!restaurantId || !normalizedOrderIds.length) return [];
+  const normalizedBookingTypes = Array.from(
+    new Set(
+      (Array.isArray(bookingTypes) ? bookingTypes : [bookingTypes])
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+  if (!normalizedBookingTypes.length) return [];
+
+  await ensureConcertTables(pool);
+
+  const { rows } = await client.query(
+    `
+      UPDATE concert_bookings cb
+         SET payment_status = 'cancelled',
+             booking_status = 'cancelled',
+             cancelled_at = NOW(),
+             updated_at = NOW(),
+             customer_note = CASE
+               WHEN NULLIF(TRIM(COALESCE(cb.customer_note, '')), '') IS NULL THEN $3
+               WHEN POSITION($3 IN COALESCE(cb.customer_note, '')) > 0 THEN cb.customer_note
+               ELSE CONCAT(cb.customer_note, ' | ', $3)
+             END
+       WHERE cb.restaurant_id = $1
+         AND cb.reservation_order_id = ANY($2::int[])
+         AND LOWER(COALESCE(cb.booking_type, '')) = ANY($4::text[])
+         AND LOWER(COALESCE(cb.payment_status, '')) <> 'cancelled'
+         AND LOWER(COALESCE(cb.booking_status, '')) <> 'cancelled'
+       RETURNING cb.id, cb.reservation_order_id, cb.reserved_table_number
+    `,
+    [restaurantId, normalizedOrderIds, cancellationReason, normalizedBookingTypes]
+  );
+
+  return rows || [];
+}
+
 async function closeStaleReservations(restaurantId) {
   if (!restaurantId) return [];
   try {
-    const { rows } = await pool.query(
-      `
-        UPDATE orders o
-           SET status = 'closed',
-               ${getReservationFinalizeResetSql("'closed'")},
-               total = 0,
-               updated_at = NOW()
-         WHERE o.restaurant_id = $1
-           AND o.reservation_date IS NOT NULL
-           AND o.reservation_date < CURRENT_DATE
-           AND COALESCE(o.total, 0) = 0
-           AND LOWER(COALESCE(o.status, '')) NOT IN ('closed', 'cancelled', 'canceled')
-           AND (
-             LOWER(COALESCE(o.status, '')) = 'reserved'
-             OR LOWER(COALESCE(o.order_type, '')) = 'reservation'
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM order_items oi WHERE oi.order_id = o.id
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM sub_orders so WHERE so.order_id = o.id
-           )
-         RETURNING o.id, o.table_number, o.reservation_date
-      `,
-      [restaurantId]
-    );
-    return rows || [];
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { rows } = await client.query(
+        `
+          UPDATE orders o
+             SET status = 'closed',
+                 ${getReservationFinalizeResetSql("'closed'")},
+                 total = 0,
+                 updated_at = NOW()
+           WHERE o.restaurant_id = $1
+             AND o.reservation_date IS NOT NULL
+             AND o.reservation_date < CURRENT_DATE
+             AND COALESCE(o.total, 0) = 0
+             AND LOWER(COALESCE(o.status, '')) NOT IN ('closed', 'cancelled', 'canceled')
+             AND (
+               LOWER(COALESCE(o.status, '')) = 'reserved'
+               OR LOWER(COALESCE(o.order_type, '')) = 'reservation'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM order_items oi WHERE oi.order_id = o.id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM sub_orders so WHERE so.order_id = o.id
+             )
+           RETURNING o.id, o.table_number, o.reservation_date
+        `,
+        [restaurantId]
+      );
+      await cancelLinkedConcertBookings(client, restaurantId, rows.map((row) => row.id), {
+        cancellationReason: "stale_reservation_closed",
+      });
+      await client.query("COMMIT");
+      return rows || [];
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.warn("⚠️ Failed to close stale reservations:", err?.message || err);
     return [];
@@ -3828,6 +3891,10 @@ router.post("/:id/close", async (req, res) => {
       }
     }
 
+    await cancelLinkedConcertBookings(client, restaurantId, id, {
+      cancellationReason: "linked_order_closed",
+    });
+
     if (needsDebtAdjustment) {
       if (delta > 0) {
         await increaseCustomerDebt(
@@ -4402,6 +4469,9 @@ router.post("/:id/add-debt", async (req, res) => {
     );
 
     const order = updateResult.rows[0];
+    await cancelLinkedConcertBookings(client, restaurantId, id, {
+      cancellationReason: "linked_order_closed",
+    });
 
     await client.query("COMMIT");
 
@@ -4645,6 +4715,7 @@ router.patch("/:id/reset-if-empty", async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
   try {
+    await client.query("BEGIN");
     const itemsRes = await client.query("SELECT COUNT(*) FROM order_items WHERE order_id = $1", [id]);
     const itemCount = parseInt(itemsRes.rows[0].count, 10);
 
@@ -4660,16 +4731,22 @@ if (itemCount === 0) {
         WHERE restaurant_id = $1 AND id = $2`,
       [req.user.restaurant_id, id]
     );
+    await cancelLinkedConcertBookings(client, req.user.restaurant_id, id, {
+      cancellationReason: "empty_order_auto_closed",
+    });
+    await client.query("COMMIT");
     io.to(`restaurant_${req.user.restaurant_id}`).emit("order_closed", { orderId: parseInt(id, 10) });
     return res.json({ message: "Order status reset to closed" });
   }
 
+  await client.query("COMMIT");
   return res.json({ message: "Quick order skipped from auto-close" });
 }
 
-
+    await client.query("COMMIT");
     res.json({ message: "Order has items, not resetting" });
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error("❌ Error resetting order:", error);
     res.status(500).json({ error: "Failed to reset order" });
   } finally {
@@ -5740,6 +5817,9 @@ router.patch("/:orderId/merge-table", async (req, res) => {
         WHERE id = $1`,
       [sourceOrder.id]
     );
+    await cancelLinkedConcertBookings(client, restaurantId, sourceOrder.id, {
+      cancellationReason: "merged_into_other_order",
+    });
 
     await client.query("COMMIT");
 
@@ -5941,6 +6021,9 @@ router.patch("/merge-by-customer", async (req, res) => {
           WHERE id = $1`,
         [order.id]
       );
+      await cancelLinkedConcertBookings(client, restaurantId, order.id, {
+        cancellationReason: "merged_into_other_order",
+      });
       await client.query(`UPDATE orders SET total = total + $2 WHERE id=$1`, [target.id, order.total || 0]);
     }
 
@@ -6493,6 +6576,10 @@ router.delete("/reservations/:id", async (req, res) => {
       return res.status(404).json({ error: "Reservation not found or cannot be cancelled" });
     }
 
+    await cancelLinkedConcertBookings(pool, restaurantId, id, {
+      cancellationReason: "reservation_deleted",
+    });
+
     // Emit cancellation to frontend
     io.to(`restaurant_${restaurantId}`).emit("orders_updated");
     const cancelledReservation = result.rows[0];
@@ -6664,6 +6751,9 @@ router.delete("/:id/reservations", async (req, res) => {
     );
 
     const updatedOrder = updated.rows[0];
+    await cancelLinkedConcertBookings(pool, restaurantId, orderId, {
+      cancellationReason: "reservation_deleted",
+    });
     io.to(`restaurant_${restaurantId}`).emit("orders_updated");
     if (updatedOrder) {
       const reservationPayload = {

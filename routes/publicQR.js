@@ -4,6 +4,7 @@ const router = express.Router();
 const { pool } = require("../db");
 const { getIO } = require("../utils/socket");
 const { saveNotification } = require("../utils/realtime");
+const { ensureConcertTables } = require("../utils/concertsService");
 
 const CALL_WAITER_COOLDOWN_MS = 15000;
 const callWaiterRateLimit = new Map();
@@ -789,6 +790,8 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
     const identifier = (req.params.identifier || "").trim();
     if (!identifier) return res.json({ table_numbers: [], reserved_table_numbers: [] });
 
+    await ensureConcertTables(pool);
+
     const { rows } = await pool.query(
       `
       SELECT id
@@ -814,6 +817,49 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
       WHERE restaurant_id = $1
         AND table_number IS NOT NULL
         AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
+      ORDER BY table_number ASC
+      `,
+      [restaurantId]
+    );
+
+    const { rows: concertBusyRows } = await pool.query(
+      `
+      WITH latest_concert_booking_per_table AS (
+        SELECT DISTINCT ON (cb.reserved_table_number)
+               cb.reserved_table_number AS table_number,
+               cb.booking_type,
+               cb.payment_status,
+               cb.booking_status,
+               cb.updated_at,
+               cb.created_at,
+               cb.id,
+               o.status AS reservation_order_status,
+               o.reservation_date,
+               o.reservation_time
+        FROM concert_bookings cb
+        LEFT JOIN orders o
+          ON o.id = cb.reservation_order_id
+         AND o.restaurant_id = cb.restaurant_id
+        WHERE cb.restaurant_id = $1
+          AND cb.reserved_table_number IS NOT NULL
+        ORDER BY cb.reserved_table_number, cb.updated_at DESC NULLS LAST, cb.created_at DESC NULLS LAST, cb.id DESC
+      )
+      SELECT
+             table_number,
+             booking_type,
+             payment_status,
+             booking_status,
+             reservation_order_status,
+             reservation_date,
+             reservation_time
+      FROM latest_concert_booking_per_table
+      WHERE LOWER(COALESCE(booking_type, '')) = 'table'
+        AND LOWER(COALESCE(payment_status, '')) IN ('pending_bank_transfer', 'confirmed')
+        AND LOWER(COALESCE(booking_status, '')) <> 'cancelled'
+        AND (
+          reservation_order_status IS NULL
+          OR LOWER(COALESCE(reservation_order_status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
+        )
       ORDER BY table_number ASC
       `,
       [restaurantId]
@@ -866,6 +912,14 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
       if (status !== "checked_in") {
         reservedSet.add(tableNumber);
       }
+    });
+
+    concertBusyRows.forEach((row) => {
+      const tableNumber = Number(row?.table_number);
+      if (!Number.isFinite(tableNumber) || tableNumber <= 0) return;
+
+      unavailableSet.add(tableNumber);
+      reservedSet.add(tableNumber);
     });
 
     const tableNumbers = Array.from(unavailableSet);

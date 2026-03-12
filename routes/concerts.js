@@ -204,11 +204,19 @@ router.patch("/bookings/:bookingId/payment-status", async (req, res) => {
   }
   try {
     const paymentStatus = req.body?.payment_status;
+    const cancellationReason = String(
+      req.body?.cancellation_reason ??
+        req.body?.cancel_reason ??
+        req.body?.delete_reason ??
+        req.body?.reason ??
+        ""
+    ).trim();
     const result = await updateBookingPaymentStatus(
       pool,
       restaurantId,
       bookingId,
-      paymentStatus
+      paymentStatus,
+      cancellationReason
     );
     if (result.status >= 400) {
       return res.status(result.status).json({ error: result.error });
@@ -220,6 +228,13 @@ router.patch("/bookings/:bookingId/payment-status", async (req, res) => {
     const reservationTable = Number(booking?.reserved_table_number);
     const normalizedPaymentStatus = String(booking?.payment_status || "").toLowerCase();
     const normalizedBookingType = String(booking?.booking_type || "").toLowerCase();
+    const bookingCancellationReason = String(
+      booking?.cancellation_reason ??
+        booking?.cancel_reason ??
+        booking?.reason ??
+        cancellationReason ??
+        ""
+    ).trim();
     const room = `restaurant_${restaurantId}`;
 
     if (io) {
@@ -236,6 +251,9 @@ router.patch("/bookings/:bookingId/payment-status", async (req, res) => {
             reservation_id: Number.isFinite(reservationOrderId) ? reservationOrderId : null,
             table_number: reservationTable,
             status: "cancelled",
+            cancellation_reason: bookingCancellationReason || null,
+            cancel_reason: bookingCancellationReason || null,
+            reason: bookingCancellationReason || null,
           });
         } else if (normalizedPaymentStatus === "confirmed") {
           io.to(room).emit("reservation_updated", {
@@ -244,6 +262,34 @@ router.patch("/bookings/:bookingId/payment-status", async (req, res) => {
             status: "reserved",
           });
         }
+      }
+
+      if (
+        normalizedPaymentStatus === "cancelled" &&
+        Number.isFinite(reservationOrderId) &&
+        reservationOrderId > 0
+      ) {
+        io.to(room).emit("order_cancelled", {
+          orderId: reservationOrderId,
+          id: reservationOrderId,
+          status: "cancelled",
+          cancellation_reason: bookingCancellationReason || null,
+          cancel_reason: bookingCancellationReason || null,
+          reason: bookingCancellationReason || null,
+          order: {
+            id: reservationOrderId,
+            status: "cancelled",
+            cancellation_reason: bookingCancellationReason || null,
+            cancel_reason: bookingCancellationReason || null,
+          },
+          concert_booking: {
+            id: booking?.id ?? null,
+            payment_status: normalizedPaymentStatus,
+            booking_type: normalizedBookingType || null,
+            cancellation_reason: bookingCancellationReason || null,
+            cancel_reason: bookingCancellationReason || null,
+          },
+        });
       }
 
       if (normalizedPaymentStatus === "confirmed" && normalizedBookingType === "ticket") {

@@ -232,6 +232,14 @@ async function ensureConcertTables(pool) {
       CONSTRAINT concert_bookings_payment_status_chk CHECK (payment_status IN ('pending_bank_transfer', 'confirmed', 'cancelled'))
     );
   `);
+  await pool.query(`
+    ALTER TABLE concert_bookings
+    ADD COLUMN IF NOT EXISTS cancellation_reason TEXT
+  `);
+  await pool.query(`
+    ALTER TABLE orders
+    ADD COLUMN IF NOT EXISTS cancellation_reason TEXT
+  `);
 
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_concert_events_restaurant_date ON concert_events(restaurant_id, event_date, event_time)`
@@ -1399,9 +1407,16 @@ async function listBookingsForEvent(pool, restaurantId, eventId) {
   return result.rows;
 }
 
-async function updateBookingPaymentStatus(pool, restaurantId, bookingId, paymentStatus) {
+async function updateBookingPaymentStatus(
+  pool,
+  restaurantId,
+  bookingId,
+  paymentStatus,
+  cancellationReason = ""
+) {
   await ensureConcertTables(pool);
   const normalizedStatus = normalizePaymentStatus(paymentStatus);
+  const normalizedReason = asText(cancellationReason, "");
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -1434,11 +1449,15 @@ async function updateBookingPaymentStatus(pool, restaurantId, bookingId, payment
           booking_status = $4,
           updated_at = NOW(),
           confirmed_at = CASE WHEN $3 = 'confirmed' THEN NOW() ELSE confirmed_at END,
-          cancelled_at = CASE WHEN $3 = 'cancelled' THEN NOW() ELSE cancelled_at END
+          cancelled_at = CASE WHEN $3 = 'cancelled' THEN NOW() ELSE cancelled_at END,
+          cancellation_reason = CASE
+            WHEN $3 = 'cancelled' THEN NULLIF($5, '')
+            ELSE NULL
+          END
       WHERE restaurant_id = $1
         AND id = $2
       `,
-      [restaurantId, bookingId, normalizedStatus, nextBookingStatus]
+      [restaurantId, bookingId, normalizedStatus, nextBookingStatus, normalizedReason]
     );
 
     if (booking.reservation_order_id) {
@@ -1448,6 +1467,10 @@ async function updateBookingPaymentStatus(pool, restaurantId, bookingId, payment
           `
           UPDATE orders
           SET status = 'cancelled',
+              cancellation_reason = CASE
+                WHEN NULLIF($3, '') IS NULL THEN cancellation_reason
+                ELSE NULLIF($3, '')
+              END,
               reservation_date = NULL,
               reservation_time = NULL,
               reservation_clients = NULL,
@@ -1456,7 +1479,7 @@ async function updateBookingPaymentStatus(pool, restaurantId, bookingId, payment
           WHERE restaurant_id = $1
             AND id = $2
           `,
-          [restaurantId, booking.reservation_order_id]
+          [restaurantId, booking.reservation_order_id, normalizedReason]
         );
       } else if (normalizedStatus === "confirmed") {
         if (bookingType === "table") {
@@ -1468,6 +1491,7 @@ async function updateBookingPaymentStatus(pool, restaurantId, bookingId, payment
                     THEN 'reserved'
                   ELSE status
                 END,
+                cancellation_reason = NULL,
                 updated_at = NOW()
             WHERE restaurant_id = $1
               AND id = $2
@@ -1483,6 +1507,7 @@ async function updateBookingPaymentStatus(pool, restaurantId, bookingId, payment
                     THEN status
                   ELSE 'confirmed'
                 END,
+                cancellation_reason = NULL,
                 updated_at = NOW()
             WHERE restaurant_id = $1
               AND id = $2
@@ -1546,6 +1571,9 @@ function mapBookingResponse(row) {
     reservation_order_status: row.reservation_order_status || null,
     reserved_table_number: row.reserved_table_number || null,
     bank_reference: row.bank_reference || null,
+    cancellation_reason: asText(row.cancellation_reason, "") || null,
+    cancel_reason: asText(row.cancellation_reason, "") || null,
+    reason: asText(row.cancellation_reason, "") || null,
     created_at: row.created_at,
     updated_at: row.updated_at,
     confirmed_at: row.confirmed_at || null,
