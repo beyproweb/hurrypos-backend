@@ -5,6 +5,7 @@ const { pool } = require("../db");
 const { getIO } = require("../utils/socket");
 const { saveNotification } = require("../utils/realtime");
 const { ensureConcertTables } = require("../utils/concertsService");
+const { getDriverLocation } = require("../utils/driverLocationStore");
 
 const CALL_WAITER_COOLDOWN_MS = 15000;
 const callWaiterRateLimit = new Map();
@@ -280,6 +281,132 @@ async function readQrMenuCustomization(restaurantId) {
   return parseCustomizationPayload(result.rows[0]);
 }
 
+let ordersColumnSetCache = null;
+let ordersColumnSetPromise = null;
+
+async function getOrdersColumnSet() {
+  if (ordersColumnSetCache) return ordersColumnSetCache;
+  if (!ordersColumnSetPromise) {
+    ordersColumnSetPromise = pool
+      .query(
+        `
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'orders'
+        `
+      )
+      .then(({ rows }) => {
+        ordersColumnSetCache = new Set(
+          rows.map((row) => String(row.column_name || "").toLowerCase())
+        );
+        return ordersColumnSetCache;
+      })
+      .catch((err) => {
+        console.warn("⚠️ Failed to introspect orders columns for public QR routes:", err?.message || err);
+        ordersColumnSetCache = new Set();
+        return ordersColumnSetCache;
+      });
+  }
+  return ordersColumnSetPromise;
+}
+
+const APPROX_CITY_SPEED_KMH = 28;
+
+function toFiniteCoordinate(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function getCoordinatePair(lat, lng) {
+  const normalizedLat = toFiniteCoordinate(lat);
+  const normalizedLng = toFiniteCoordinate(lng);
+  if (normalizedLat === null || normalizedLng === null) return null;
+  return { lat: normalizedLat, lng: normalizedLng };
+}
+
+function haversineDistanceMeters(a, b) {
+  if (!a || !b) return null;
+  const lat1 = toFiniteCoordinate(a.lat);
+  const lng1 = toFiniteCoordinate(a.lng);
+  const lat2 = toFiniteCoordinate(b.lat);
+  const lng2 = toFiniteCoordinate(b.lng);
+  if ([lat1, lng1, lat2, lng2].some((value) => value === null)) return null;
+
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const radiusMeters = 6371000;
+  const deltaLat = toRad(lat2 - lat1);
+  const deltaLng = toRad(lng2 - lng1);
+  const sourceLat = toRad(lat1);
+  const targetLat = toRad(lat2);
+  const h =
+    Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) +
+    Math.cos(sourceLat) * Math.cos(targetLat) * Math.sin(deltaLng / 2) * Math.sin(deltaLng / 2);
+
+  return 2 * radiusMeters * Math.asin(Math.sqrt(h));
+}
+
+function estimateDurationMinutes(distanceMeters) {
+  if (!Number.isFinite(distanceMeters) || distanceMeters <= 0) return null;
+  const metersPerMinute = (APPROX_CITY_SPEED_KMH * 1000) / 60;
+  return Math.max(1, Math.round(distanceMeters / metersPerMinute));
+}
+
+function buildStraightLinePath(origin, destination) {
+  if (!origin || !destination) return [];
+  return [
+    { lat: origin.lat, lng: origin.lng },
+    { lat: destination.lat, lng: destination.lng },
+  ];
+}
+
+function resolveTrackingStage({ orderStatus, driverStatus, hasDriverAssigned, etaMinutes }) {
+  const normalizedOrderStatus = String(orderStatus || "").trim().toLowerCase();
+  const normalizedDriverStatus = String(driverStatus || "").trim().toLowerCase();
+
+  if (["delivered", "closed", "completed"].includes(normalizedDriverStatus)) return "delivered";
+  if (["delivered", "closed", "completed"].includes(normalizedOrderStatus)) return "delivered";
+
+  const isOnRoad =
+    normalizedDriverStatus === "on_road" ||
+    normalizedDriverStatus === "on-road" ||
+    normalizedDriverStatus === "picked_up";
+  if (isOnRoad) {
+    return Number.isFinite(etaMinutes) && etaMinutes <= 3 ? "arriving" : "on_road";
+  }
+
+  if (hasDriverAssigned) return "driver_assigned";
+  if (normalizedOrderStatus === "ready") return "ready";
+  if (normalizedOrderStatus === "preparing") return "preparing";
+  return "confirmed";
+}
+
+async function fetchOsrmRoute(origin, destination) {
+  if (!origin || !destination) return null;
+
+  try {
+    const requestUrl = `https://router.project-osrm.org/route/v1/driving/${origin.lng},${origin.lat};${destination.lng},${destination.lat}?overview=full&geometries=geojson`;
+    const response = await fetch(requestUrl);
+    const data = await response.json();
+    const route = data?.routes?.[0];
+
+    if (!response.ok || data?.code !== "Ok" || !route) {
+      return null;
+    }
+
+    return {
+      path: Array.isArray(route?.geometry?.coordinates)
+        ? route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }))
+        : [],
+      distanceMeters: Number(route.distance) || null,
+      durationMinutes: Math.max(1, Math.round((Number(route.duration) || 0) / 60)),
+      source: "osrm",
+    };
+  } catch {
+    return null;
+  }
+}
+
 router.get("/qr-resolve/:code", async (req, res) => {
   try {
     const { code } = req.params;
@@ -462,6 +589,180 @@ router.get("/restaurant-info", async (req, res) => {
   } catch (err) {
     console.error("❌ Public restaurant-info failed:", err);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/orders/:orderId/tracking", async (req, res) => {
+  try {
+    const orderId = Number(req.params.orderId);
+    const identifier =
+      String(req.query?.identifier || "").trim() || resolveIdentifierFromReferer(req.get("referer"));
+
+    if (!Number.isFinite(orderId) || orderId <= 0) {
+      return res.status(400).json({ error: "Invalid order ID" });
+    }
+    if (!identifier) {
+      return res.status(400).json({ error: "Missing identifier" });
+    }
+
+    const restaurant = await resolveRestaurantForPublic(identifier);
+    if (!restaurant) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    const orderColumns = await getOrdersColumnSet();
+    const selectOrderColumn = (columnName, fallbackSql) =>
+      orderColumns.has(String(columnName).toLowerCase())
+        ? `o.${columnName}`
+        : `${fallbackSql} AS ${columnName}`;
+
+    const orderResult = await pool.query(
+      `
+      SELECT
+        o.id,
+        o.restaurant_id,
+        o.status,
+        ${selectOrderColumn("driver_status", "NULL::text")},
+        ${selectOrderColumn("driver_id", "NULL::integer")},
+        o.customer_name,
+        o.customer_address,
+        ${selectOrderColumn("delivery_lat", "NULL::numeric")},
+        ${selectOrderColumn("delivery_lng", "NULL::numeric")},
+        ${selectOrderColumn("estimated_delivery_time", "NULL::timestamp")},
+        o.created_at,
+        r.name AS restaurant_name,
+        r.slug AS restaurant_slug,
+        r.pos_location AS restaurant_pos_location,
+        r.pos_location_lat AS restaurant_pos_location_lat,
+        r.pos_location_lng AS restaurant_pos_location_lng,
+        s.name AS driver_name
+      FROM orders o
+      LEFT JOIN restaurants r ON r.id = o.restaurant_id
+      LEFT JOIN staff s ON s.id = o.driver_id
+      WHERE o.id = $1
+        AND o.restaurant_id = $2
+      LIMIT 1
+      `,
+      [orderId, restaurant.id]
+    );
+
+    if (!orderResult.rows.length) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const order = orderResult.rows[0];
+    const driverId = Number(order.driver_id);
+    const driverLocation =
+      Number.isFinite(driverId) && driverId > 0
+        ? await getDriverLocation({ restaurantId: restaurant.id, driverId })
+        : null;
+
+    const restaurantCoords = getCoordinatePair(
+      order.restaurant_pos_location_lat,
+      order.restaurant_pos_location_lng
+    );
+    const customerCoords = getCoordinatePair(order.delivery_lat, order.delivery_lng);
+    const driverCoords = driverLocation
+      ? getCoordinatePair(driverLocation.lat, driverLocation.lng)
+      : null;
+
+    const routeOrigin = driverCoords
+      ? { ...driverCoords, type: "driver", label: "Driver" }
+      : restaurantCoords
+        ? { ...restaurantCoords, type: "restaurant", label: "Restaurant" }
+        : null;
+
+    let route = null;
+    if (routeOrigin && customerCoords) {
+      route = await fetchOsrmRoute(routeOrigin, customerCoords);
+      if (!route) {
+        const approxDistanceMeters = haversineDistanceMeters(routeOrigin, customerCoords);
+        route = {
+          path: buildStraightLinePath(routeOrigin, customerCoords),
+          distanceMeters: approxDistanceMeters,
+          durationMinutes: estimateDurationMinutes(approxDistanceMeters),
+          source: "approximate",
+        };
+      }
+    }
+
+    const estimatedDeliveryEtaMinutes = (() => {
+      if (order.estimated_delivery_time) {
+        const etaMs = new Date(order.estimated_delivery_time).getTime();
+        if (Number.isFinite(etaMs)) {
+          return Math.max(0, Math.round((etaMs - Date.now()) / 60000));
+        }
+      }
+      if (Number.isFinite(route?.durationMinutes)) return route.durationMinutes;
+      return null;
+    })();
+
+    const trackingStage = resolveTrackingStage({
+      orderStatus: order.status,
+      driverStatus: order.driver_status,
+      hasDriverAssigned: Number.isFinite(driverId) && driverId > 0,
+      etaMinutes: estimatedDeliveryEtaMinutes,
+    });
+
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+
+    return res.json({
+      order_id: order.id,
+      restaurant_id: order.restaurant_id,
+      order_status: order.status || null,
+      driver_status: order.driver_status || null,
+      tracking_stage: trackingStage,
+      eta_minutes: estimatedDeliveryEtaMinutes,
+      estimated_delivery_time: order.estimated_delivery_time || null,
+      updated_at: new Date().toISOString(),
+      customer: {
+        name: order.customer_name || null,
+        address: order.customer_address || null,
+        lat: customerCoords?.lat ?? null,
+        lng: customerCoords?.lng ?? null,
+      },
+      restaurant: {
+        name: order.restaurant_name || restaurant.name || null,
+        slug: order.restaurant_slug || restaurant.slug || null,
+        address: order.restaurant_pos_location || null,
+        lat: restaurantCoords?.lat ?? null,
+        lng: restaurantCoords?.lng ?? null,
+      },
+      driver: {
+        id: Number.isFinite(driverId) && driverId > 0 ? driverId : null,
+        name: String(order.driver_name || "").trim() || null,
+        assigned: Number.isFinite(driverId) && driverId > 0,
+        has_live_location: Boolean(driverCoords),
+        location: driverCoords
+          ? {
+              lat: driverCoords.lat,
+              lng: driverCoords.lng,
+              timestamp: driverLocation?.timestamp || null,
+            }
+          : null,
+      },
+      route_origin: routeOrigin
+        ? {
+            type: routeOrigin.type,
+            label: routeOrigin.label,
+            lat: routeOrigin.lat,
+            lng: routeOrigin.lng,
+          }
+        : null,
+      route: route
+        ? {
+            path: Array.isArray(route.path) ? route.path : [],
+            distance_meters: route.distanceMeters ?? null,
+            duration_minutes: route.durationMinutes ?? null,
+            source: route.source || "approximate",
+          }
+        : null,
+    });
+  } catch (err) {
+    console.error("❌ Public order tracking failed:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 

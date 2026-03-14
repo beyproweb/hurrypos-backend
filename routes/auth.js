@@ -106,6 +106,7 @@ router.post("/login", async (req, res) => {
         name: user.name || user.full_name,
         role: user.role || "staff",
         restaurant_id: user.restaurant_id,
+        auth_source: source,
       },
       process.env.JWT_SECRET || "beypro_secret_2025",
       { expiresIn: "7d" }
@@ -327,6 +328,7 @@ router.post("/login", async (req, res) => {
         email: user.email,
         role: user.role,
         restaurant_id: user.restaurant_id,
+        auth_source: source,
         permissions,
       },
       token,

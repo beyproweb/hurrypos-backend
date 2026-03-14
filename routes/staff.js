@@ -157,9 +157,21 @@ router.post('/login', async (req, res) => {
       }
       
       const staffRes = await pool.query(
-        `SELECT id, name, email, role, pin, restaurant_id, status
-         FROM staff
-         WHERE pin = $1 AND restaurant_id = $2 AND status = 'active'
+        `SELECT
+           s.id,
+           s.name,
+           s.email,
+           s.role,
+           s.pin,
+           s.restaurant_id,
+           s.status,
+           r.name AS restaurant_name,
+           r.pos_location AS restaurant_pos_location,
+           r.pos_location_lat AS restaurant_pos_location_lat,
+           r.pos_location_lng AS restaurant_pos_location_lng
+         FROM staff s
+         LEFT JOIN restaurants r ON r.id = s.restaurant_id
+         WHERE s.pin = $1 AND s.restaurant_id = $2 AND s.status = 'active'
          LIMIT 1`,
         [String(pin), restaurantId]
       );
@@ -200,7 +212,12 @@ router.post('/login', async (req, res) => {
 
         // 🧾 Sign JWT
         const token = jwt.sign(
-          { id: staff.id, role: staff.role, restaurant_id: staff.restaurant_id },
+          {
+            id: staff.id,
+            role: staff.role,
+            restaurant_id: staff.restaurant_id,
+            auth_source: "staff",
+          },
           process.env.JWT_SECRET || "beypro_secret_2025",
           { expiresIn: "7d" }
         );
@@ -214,6 +231,10 @@ router.post('/login', async (req, res) => {
             email: staff.email,
             role: staff.role,
             restaurant_id: staff.restaurant_id,
+            restaurant_name: staff.restaurant_name || "",
+            pos_location: staff.restaurant_pos_location || "",
+            pos_location_lat: parseGeoValue(staff.restaurant_pos_location_lat),
+            pos_location_lng: parseGeoValue(staff.restaurant_pos_location_lng),
             permissions,
           },
           token,
@@ -274,9 +295,21 @@ router.post('/login', async (req, res) => {
     // 3️⃣ Try STAFF with EMAIL + PIN/PASSWORD (legacy support)
     console.log('🛠️ Querying staff table with email…');
     const staffRes = await pool.query(
-      `SELECT id, name, email, role, pin, restaurant_id, status
-       FROM staff
-       WHERE LOWER(TRIM(email)) = $1 AND status = 'active'`,
+      `SELECT
+         s.id,
+         s.name,
+         s.email,
+         s.role,
+         s.pin,
+         s.restaurant_id,
+         s.status,
+         r.name AS restaurant_name,
+         r.pos_location AS restaurant_pos_location,
+         r.pos_location_lat AS restaurant_pos_location_lat,
+         r.pos_location_lng AS restaurant_pos_location_lng
+       FROM staff s
+       LEFT JOIN restaurants r ON r.id = s.restaurant_id
+       WHERE LOWER(TRIM(s.email)) = $1 AND s.status = 'active'`,
       [normalizedEmail]
     );
 
@@ -290,7 +323,12 @@ router.post('/login', async (req, res) => {
 
       // 🧾 Sign JWT
       const token = jwt.sign(
-        { id: staff.id, role: staff.role, restaurant_id: staff.restaurant_id },
+        {
+          id: staff.id,
+          role: staff.role,
+          restaurant_id: staff.restaurant_id,
+          auth_source: "staff",
+        },
         process.env.JWT_SECRET || "beypro_secret_2025",
         { expiresIn: "7d" }
       );
@@ -304,6 +342,10 @@ router.post('/login', async (req, res) => {
           email: staff.email,
           role: staff.role,
           restaurant_id: staff.restaurant_id,
+          restaurant_name: staff.restaurant_name || "",
+          pos_location: staff.restaurant_pos_location || "",
+          pos_location_lat: parseGeoValue(staff.restaurant_pos_location_lat),
+          pos_location_lng: parseGeoValue(staff.restaurant_pos_location_lng),
           permissions,
         },
         token,

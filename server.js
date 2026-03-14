@@ -284,7 +284,101 @@ function ensureSubscriptionsTable() {
 app.get("/api/me", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
+    const restaurantId = req.user.restaurant_id;
+    const roleKey = String(req.user.role || "").toLowerCase();
+    const shouldPreferStaff =
+      req.user.auth_source === "staff" ||
+      ["staff", "driver", "cashier", "waiter", "kitchen", "kurye"].includes(roleKey);
     await ensureSubscriptionsTable();
+
+    if (shouldPreferStaff) {
+      let staffResult;
+      try {
+        staffResult = await pool.query(
+          `
+          SELECT
+            st.id,
+            st.name AS full_name,
+            st.email,
+            st.phone,
+            st.role,
+            st.restaurant_id,
+            r.name AS restaurant_name,
+            r.pos_location,
+            r.pos_location_lat,
+            r.pos_location_lng,
+            r.plan,
+            r.allowed_modules,
+            COALESCE(s.billing_cycle, r.billing_cycle, 'monthly') AS billing_cycle
+          FROM staff st
+          LEFT JOIN restaurants r ON r.id = st.restaurant_id
+          LEFT JOIN subscriptions s ON s.restaurant_id = st.restaurant_id
+          WHERE st.id = $1
+            AND st.restaurant_id = $2
+            AND st.status = 'active'
+          LIMIT 1
+          `,
+          [userId, restaurantId]
+        );
+      } catch (err) {
+        if (err && err.code === "42P01") {
+          staffResult = await pool.query(
+            `
+            SELECT
+              st.id,
+              st.name AS full_name,
+              st.email,
+              st.phone,
+              st.role,
+              st.restaurant_id,
+              r.name AS restaurant_name,
+              r.pos_location,
+              r.pos_location_lat,
+              r.pos_location_lng,
+              r.plan,
+              r.allowed_modules,
+              COALESCE(r.billing_cycle, 'monthly') AS billing_cycle
+            FROM staff st
+            LEFT JOIN restaurants r ON r.id = st.restaurant_id
+            WHERE st.id = $1
+              AND st.restaurant_id = $2
+              AND st.status = 'active'
+            LIMIT 1
+            `,
+            [userId, restaurantId]
+          );
+        } else {
+          throw err;
+        }
+      }
+
+      if (staffResult?.rows?.length) {
+        const row = staffResult.rows[0];
+        return res.json({
+          id: row.id,
+          full_name: row.full_name,
+          email: row.email,
+          phone: row.phone,
+          role: row.role || req.user.role || "staff",
+          auth_source: req.user.auth_source || "staff",
+          restaurant_id: row.restaurant_id,
+          restaurant_name: row.restaurant_name,
+          pos_location: row.pos_location || "",
+          pos_location_lat: row.pos_location_lat,
+          pos_location_lng: row.pos_location_lng,
+          plan: row.plan,
+          allowed_modules: row.allowed_modules || null,
+          billing_cycle: row.billing_cycle,
+        });
+      }
+
+      console.warn("⚠️ /api/me staff-preferred lookup found no active staff row, falling back to users", {
+        userId,
+        restaurantId,
+        role: req.user.role,
+        auth_source: req.user.auth_source || null,
+      });
+    }
 
     let result;
     try {
@@ -352,6 +446,7 @@ app.get("/api/me", authMiddleware, async (req, res) => {
       email: row.email,
       phone: row.phone,
       role: row.role,
+      auth_source: req.user.auth_source || "users",
       restaurant_id: row.restaurant_id,
       restaurant_name: row.restaurant_name,
       pos_location: row.pos_location || "",

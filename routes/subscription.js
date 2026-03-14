@@ -139,6 +139,71 @@ const token = jwt.sign(
 router.get("/me", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
+    const restaurantId = req.user.restaurant_id;
+    const roleKey = String(req.user.role || "").toLowerCase();
+    const shouldPreferStaff =
+      req.user.auth_source === "staff" ||
+      ["staff", "driver", "cashier", "waiter", "kitchen", "kurye"].includes(roleKey);
+
+    if (shouldPreferStaff) {
+      const staffResult = await pool.query(
+        `SELECT
+            st.id,
+            st.name,
+            st.email,
+            st.phone,
+            st.restaurant_id,
+            r.name AS restaurant_name,
+            r.plan,
+            r.billing_cycle,
+            r.pos_location,
+            r.usage_type,
+            sub.card_number,
+            sub.expiry,
+            sub.cvv,
+            sub.billing_cycle AS sub_billing_cycle,
+            sub.efatura,
+            sub.invoice_title,
+            sub.tax_office,
+            sub.invoice_type
+         FROM staff st
+         LEFT JOIN restaurants r ON r.id = st.restaurant_id
+         LEFT JOIN subscriptions sub ON sub.restaurant_id = r.id
+         WHERE st.id = $1
+           AND st.restaurant_id = $2
+           AND st.status = 'active'
+         LIMIT 1`,
+        [userId, restaurantId]
+      );
+
+      if (staffResult.rows.length > 0) {
+        const staff = staffResult.rows[0];
+        return res.json({
+          user: {
+            id: staff.id,
+            full_name: staff.name,
+            email: staff.email,
+            business_name: staff.restaurant_name || "",
+            restaurant_id: staff.restaurant_id,
+            restaurant_name: staff.restaurant_name || "",
+            role: req.user.role || "staff",
+            auth_source: req.user.auth_source || "staff",
+            active_plan: staff.plan || "",
+            phone: staff.phone || "",
+            pos_location: staff.pos_location || "",
+            usage_type: staff.usage_type || "",
+            card_number: staff.card_number || "",
+            expiry: staff.expiry || "",
+            cvv: staff.cvv || "",
+            billing_cycle: staff.sub_billing_cycle || staff.billing_cycle || "monthly",
+            efatura: staff.efatura || false,
+            invoice_title: staff.invoice_title || "",
+            tax_office: staff.tax_office || "",
+            invoice_type: staff.invoice_type || "",
+          },
+        });
+      }
+    }
 
     const result = await pool.query(
       `SELECT
@@ -181,6 +246,10 @@ router.get("/me", authMiddleware, async (req, res) => {
         full_name: user.full_name,
         email: user.email,
         business_name: user.business_name,
+        restaurant_id: user.restaurant_id,
+        restaurant_name: user.restaurant_name || "",
+        role: req.user.role || "",
+        auth_source: req.user.auth_source || "users",
         active_plan: user.active_plan,
         phone: user.phone || "",
         pos_location: user.pos_location || "",

@@ -4,19 +4,40 @@ module.exports = function (io) {
   const { pool } = require("../db");
   const authMiddleware = require("../middleware/authMiddleware");
   const { emitOrderUpdate, emitDriverOnRoad } = require("../utils/realtime");
+  const {
+    buildDriverLocationKey,
+    getDriverLocation,
+    getKnownDriverIds,
+    setDriverLocation,
+  } = require("../utils/driverLocationStore");
+  let ordersColumnSetCache = null;
+  let ordersColumnSetPromise = null;
 
-  // ✅ Safe Redis handling — disable when not configured
-  let redis = null;
-  try {
-    if (process.env.REDIS_URL) {
-      redis = require("../utils/redis");
-      console.log("✅ Redis enabled for driver locations");
-    } else {
-      console.log("⚠️ Redis not configured — using in-memory driver location store");
+  async function getOrdersColumnSet() {
+    if (ordersColumnSetCache) return ordersColumnSetCache;
+    if (!ordersColumnSetPromise) {
+      ordersColumnSetPromise = pool
+        .query(
+          `
+          SELECT column_name
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'orders'
+          `
+        )
+        .then(({ rows }) => {
+          ordersColumnSetCache = new Set(
+            rows.map((row) => String(row.column_name || "").toLowerCase())
+          );
+          return ordersColumnSetCache;
+        })
+        .catch((err) => {
+          console.warn("⚠️ Failed to introspect orders columns for driver routes:", err?.message || err);
+          ordersColumnSetCache = new Set();
+          return ordersColumnSetCache;
+        });
     }
-  } catch (err) {
-    console.warn("⚠️ Redis initialization failed, using memory:", err.message);
-    redis = null;
+    return ordersColumnSetPromise;
   }
 
   // 🔒 apply tenant auth to all routes
@@ -80,9 +101,6 @@ module.exports = function (io) {
     }
   });
 
-  // In-memory driver locations (could later move to Redis)
-  const driverLocations = {};
-
   // Utility: decode an encoded polyline string (Google format)
   // Returns array of [lat, lng]
   function decodePolyline(encoded) {
@@ -121,29 +139,67 @@ module.exports = function (io) {
   }
 
   router.post("/location", async (req, res) => {
-  const { driver_id, lat, lng } = req.body;
-  if (!driver_id || !lat || !lng)
-    return res.status(400).json({ error: "Missing fields" });
-  const key = `driver:${req.user.restaurant_id}:${driver_id}`;
-  const value = JSON.stringify({ lat, lng, timestamp: Date.now() });
+    const { driver_id, lat, lng } = req.body;
+    const parsedLat = Number(lat);
+    const parsedLng = Number(lng);
+    if (!driver_id || !Number.isFinite(parsedLat) || !Number.isFinite(parsedLng)) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
 
-  if (redis) await redis.set(key, value, "EX", 600);
-  else driverLocations[key] = value;
+    const tokenUserId = String(req.user?.id ?? "").trim();
+    const postedDriverId = String(driver_id ?? "").trim();
+    if (tokenUserId && postedDriverId && tokenUserId !== postedDriverId) {
+      console.warn("⚠️ Driver location id mismatch on POST /drivers/location", {
+        restaurantId: req.user?.restaurant_id,
+        tokenUserId,
+        postedDriverId,
+        role: req.user?.role,
+      });
+    }
 
-  res.json({ status: "ok" });
-});
+    const restaurantId = req.user.restaurant_id;
+    const payload = await setDriverLocation({
+      restaurantId,
+      driverId: driver_id,
+      lat: parsedLat,
+      lng: parsedLng,
+    });
 
-router.get("/location/:driver_id", async (req, res) => {
-  const { driver_id } = req.params;
-  const key = `driver:${req.user.restaurant_id}:${driver_id}`;
+    io.to(`restaurant_${restaurantId}`).emit("driver_location_updated", {
+      restaurant_id: restaurantId,
+      driver_id: String(driver_id),
+      lat: parsedLat,
+      lng: parsedLng,
+      timestamp: payload.timestamp,
+    });
 
-  let data;
-  if (redis) data = await redis.get(key);
-  else data = driverLocations[key];
+    res.json({ status: "ok", ...payload });
+  });
 
-  if (!data) return res.status(404).json({ error: "No location for driver" });
-  res.json(JSON.parse(data));
-});
+  router.get("/location/:driver_id", async (req, res) => {
+    const { driver_id } = req.params;
+    const restaurantId = req.user?.restaurant_id;
+    const key = buildDriverLocationKey(restaurantId, driver_id);
+    const data = await getDriverLocation({ restaurantId, driverId: driver_id });
+
+    if (!data) {
+      const memoryKnownDriverIds = getKnownDriverIds(restaurantId);
+
+      console.warn("⚠️ No driver location found on GET /drivers/location/:driver_id", {
+        restaurantId,
+        requestedDriverId: String(driver_id ?? "").trim(),
+        tokenUserId: String(req.user?.id ?? "").trim(),
+        role: req.user?.role,
+        lookupKey: key,
+        memoryKnownDriverIds,
+        redisEnabled: Boolean(process.env.REDIS_URL),
+      });
+
+      return res.status(404).json({ error: "No location for driver" });
+    }
+
+    res.json(data);
+  });
 
 
 
@@ -240,6 +296,12 @@ router.get("/location/:driver_id", async (req, res) => {
     }
 
     try {
+      const orderColumns = await getOrdersColumnSet();
+      const selectOrderColumn = (columnName, fallbackSql) =>
+        orderColumns.has(String(columnName).toLowerCase())
+          ? `o.${columnName}`
+          : `${fallbackSql} AS ${columnName}`;
+
       // Query orders assigned to this driver that are not yet delivered or closed
       const query = `
         SELECT 
@@ -248,12 +310,12 @@ router.get("/location/:driver_id", async (req, res) => {
           o.customer_name,
           o.customer_address,
           o.customer_address AS delivery_address,
-          NULL::numeric AS delivery_lat,
-          NULL::numeric AS delivery_lng,
-          o.driver_id,
-          o.driver_status,
+          ${selectOrderColumn("delivery_lat", "NULL::numeric")},
+          ${selectOrderColumn("delivery_lng", "NULL::numeric")},
+          ${selectOrderColumn("driver_id", "NULL::integer")},
+          ${selectOrderColumn("driver_status", "NULL::text")},
           o.status,
-          o.estimated_delivery_time,
+          ${selectOrderColumn("estimated_delivery_time", "NULL::timestamp")},
           o.created_at,
           p.name as pos_name,
           p.latitude as pos_location_lat,

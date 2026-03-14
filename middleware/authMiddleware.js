@@ -53,6 +53,7 @@ module.exports = (req, res, next) => {
       name: decoded.name,
       role: decoded.role,
       restaurant_id: decoded.restaurant_id,
+      auth_source: decoded.auth_source || decoded.source || null,
       allowed_modules: Array.isArray(decoded.allowed_modules)
         ? decoded.allowed_modules.map((m) => String(m))
         : undefined,
