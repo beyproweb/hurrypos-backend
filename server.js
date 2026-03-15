@@ -186,27 +186,27 @@ app.use(
   })
 );
 
-// 🚫 Mute all Redis errors globally (temporary dev patch)
-process.env.REDIS_URL = ""; // ensure no adapter uses it
+// Optional dev-only Redis muting. Keep Redis enabled in production so
+// driver locations and socket rooms work across multiple backend instances.
+if (isDev && envBool("DISABLE_REDIS", false)) {
+  process.env.REDIS_URL = "";
 
-try {
-  const Redis = require("ioredis");
+  try {
+    const Redis = require("ioredis");
 
-  // Override the constructor to prevent real connections
-  const Original = Redis.prototype.connect;
-  Redis.prototype.connect = function (...args) {
-    console.warn("⚠️ Redis disabled — skipping connection silently");
-    this.status = "ready";
-    return Promise.resolve(this);
-  };
+    Redis.prototype.connect = function (...args) {
+      console.warn("⚠️ Redis disabled via DISABLE_REDIS=true");
+      this.status = "ready";
+      return Promise.resolve(this);
+    };
 
-  // Suppress global error events so they don't log
-  Redis.prototype.emit = function (event, ...rest) {
-    if (event === "error") return false; // swallow error events
-    return require("events").EventEmitter.prototype.emit.call(this, event, ...rest);
-  };
-} catch (err) {
-  console.log("ℹ️ ioredis not used or already muted");
+    Redis.prototype.emit = function (event, ...rest) {
+      if (event === "error") return false;
+      return require("events").EventEmitter.prototype.emit.call(this, event, ...rest);
+    };
+  } catch (err) {
+    console.log("ℹ️ ioredis not used or already muted");
+  }
 }
 
 // Legacy installer redirects
@@ -246,6 +246,8 @@ const publicQRRoutes = require("./routes/publicQR");
 app.use("/api/public", publicQRRoutes);
 // Backward-compat aliases for stale frontend builds / caches.
 app.use("/public", publicQRRoutes);
+app.use("/api/public", require("./routes/publicCustomers"));
+app.use("/public", require("./routes/publicCustomers"));
 app.get("/manifest.json", (req, res) => {
   const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
   res.redirect(302, `/api/public/manifest.json${qs}`);
