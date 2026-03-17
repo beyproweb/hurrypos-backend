@@ -37,6 +37,15 @@ function asInt(value, fallback = 0) {
   return Math.max(0, Math.floor(n));
 }
 
+function asBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
 function normalizeBookingType(value, fallback = "ticket") {
   const next = asText(value, fallback).toLowerCase();
   return BOOKING_TYPES.has(next) ? next : fallback;
@@ -112,6 +121,7 @@ function sanitizeEventInput(payload = {}, { isPatch = false } = {}) {
     reservation_payment_method: reservationPaymentMethod,
     bank_transfer_instructions: asNullableText(payload.bank_transfer_instructions),
     status,
+    free_concert: asBoolean(payload.free_concert, false),
   };
 
   const areaAllocations = normalizeArray(payload.area_allocations).map((row) => ({
@@ -184,6 +194,10 @@ async function ensureConcertTables(pool) {
   await pool.query(`
     ALTER TABLE concert_events
     ADD COLUMN IF NOT EXISTS event_image TEXT
+  `);
+  await pool.query(`
+    ALTER TABLE concert_events
+    ADD COLUMN IF NOT EXISTS free_concert BOOLEAN NOT NULL DEFAULT FALSE
   `);
 
   await pool.query(`
@@ -565,6 +579,7 @@ async function buildEventView(client, eventRow) {
     reservation_payment_method: "bank_transfer",
     bank_transfer_instructions: eventRow.bank_transfer_instructions || "",
     status: normalizeEventStatus(eventRow.status, "active"),
+    free_concert: Boolean(eventRow.free_concert),
     auto_sold_out: soldOutAuto,
     sold_ticket_count: bookedTickets,
     sold_table_count: bookedTables,
@@ -658,9 +673,10 @@ async function createEvent(pool, restaurantId, payload) {
         total_table_quantity,
         reservation_payment_method,
         bank_transfer_instructions,
-        status
+        status,
+        free_concert
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'bank_transfer', $11, $12)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'bank_transfer', $11, $12, $13)
       RETURNING id
       `,
       [
@@ -676,6 +692,7 @@ async function createEvent(pool, restaurantId, payload) {
         clean.total_table_quantity,
         clean.bank_transfer_instructions,
         clean.status,
+        clean.free_concert,
       ]
     );
     const eventId = inserted.rows[0].id;
@@ -722,6 +739,7 @@ async function updateEvent(pool, restaurantId, eventId, payload) {
           total_table_quantity = $11,
           bank_transfer_instructions = $12,
           status = $13,
+          free_concert = $14,
           updated_at = NOW()
       WHERE restaurant_id = $1
         AND id = $2
@@ -740,6 +758,7 @@ async function updateEvent(pool, restaurantId, eventId, payload) {
         clean.total_table_quantity,
         clean.bank_transfer_instructions,
         clean.status,
+        clean.free_concert,
       ]
     );
 

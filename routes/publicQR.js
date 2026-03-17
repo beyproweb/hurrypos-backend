@@ -533,6 +533,10 @@ router.get("/products/:identifier", async (req, res) => {
       return res.status(404).json({ error: "Invalid restaurant" });
     }
     const restaurantId = rows[0].id;
+    const customization = await readQrMenuCustomization(restaurantId);
+    if (customization?.disable_all_products === true) {
+      return res.json([]);
+    }
 
     const { rows: products } = await pool.query(
       `
@@ -1349,6 +1353,9 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
       loyalty_reward_text: "Free Menu Item",
       loyalty_color: "#F59E0B",
       delivery_enabled: true,
+      table_order_enabled: true,
+      reservation_pickup_enabled: true,
+      disable_all_products: false,
       table_geo_enabled: false,
       table_geo_radius_meters: 150,
       ...QR_BRANDING_DEFAULTS,

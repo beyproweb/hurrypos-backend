@@ -868,6 +868,9 @@ router.get("/qr-menu-customization", async (req, res) => {
       loyalty_reward_text: "Free Menu Item",
       loyalty_color: "#F59E0B",
       delivery_enabled: true,
+      table_order_enabled: true,
+      reservation_pickup_enabled: true,
+      disable_all_products: false,
       table_geo_enabled: false,
       table_geo_radius_meters: 150,
       ...BRANDING_DEFAULTS,
@@ -896,6 +899,12 @@ router.post("/qr-menu-customization", async (req, res) => {
       return res.status(400).json({ error: "Invalid customization payload" });
     }
 
+    const existingData = await readQrMenuCustomization(restaurantId);
+    const mergedData = {
+      ...existingData,
+      ...newData,
+    };
+
     // Upsert jsonb
     await pool.query(
       `
@@ -904,10 +913,10 @@ router.post("/qr-menu-customization", async (req, res) => {
       ON CONFLICT (restaurant_id, key)
       DO UPDATE SET qr_menu_customization = EXCLUDED.qr_menu_customization
       `,
-      [restaurantId, JSON.stringify(newData)]
+      [restaurantId, JSON.stringify(mergedData)]
     );
 
-    res.json({ success: true, customization: newData });
+    res.json({ success: true, customization: mergedData });
   } catch (err) {
     console.error("❌ Failed to save QR customization:", err);
     res.status(500).json({ error: "Failed to save qr-menu-customization" });
