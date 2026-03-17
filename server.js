@@ -68,6 +68,7 @@ const alwaysAllowedDevAppOrigins = [
 const productionOrigins = [
   "https://pos.beypro.com",
   "https://www.pos.beypro.com",
+  "https://apollo.beypro.com",
   "https://dev.beypro.com",
   "https://hurrypos-frontend.onrender.com",
   "https://beypro.com",
@@ -87,41 +88,35 @@ const allowedOrigins = [
 console.log(`📍 Allowed CORS origins (${isDev ? "DEV" : "PROD"}):`);
 allowedOrigins.forEach(origin => console.log(`   - ${origin}`));
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      // Electron may send null, app://, or omit Origin completely
-      if (!origin) return callback(null, true);
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Electron/mobile clients may omit Origin or use non-http schemes.
+    if (!origin) return callback(null, true);
 
-      const normalized = String(origin).toLowerCase();
+    const normalized = String(origin).toLowerCase();
 
-      if (
-        allowedOrigins.some((o) => normalized === o.toLowerCase()) ||
-        /\.vercel\.app$/.test(normalized) ||
-        normalized === "null" ||
-        normalized.startsWith("file://") ||
-        normalized.startsWith("app://") || // ✅ packaged Electron apps
-        normalized.startsWith("capacitor://") // optional mobile builds
-      ) {
-        return callback(null, true);
-      }
+    if (
+      allowedOrigins.some((o) => normalized === o.toLowerCase()) ||
+      /\.vercel\.app$/.test(normalized) ||
+      normalized === "null" ||
+      normalized.startsWith("file://") ||
+      normalized.startsWith("app://") ||
+      normalized.startsWith("capacitor://")
+    ) {
+      return callback(null, true);
+    }
 
-      console.warn("❌ Blocked by CORS:", origin);
-      return callback(new Error("Not allowed by CORS"));
-    },
-    methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
-    credentials: true,
-    allowedHeaders: [
-      "Origin",
-      "X-Requested-With",
-      "Content-Type",
-      "Accept",
-      "Authorization",
-      "x-client-lang",
-      "X-Client-Lang",
-    ],
-  })
-);
+    console.warn("❌ Blocked by CORS:", origin);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 // Turn CORS allowlist failures into a clearer status code (otherwise Express returns 500).
 app.use((err, req, res, next) => {
