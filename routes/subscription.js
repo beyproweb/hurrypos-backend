@@ -12,8 +12,10 @@ function normalizeEmail(email) {
 
 /* ----------------------------- REGISTER ----------------------------- */
 router.post("/register", async (req, res) => {
-  const client = await pool.connect();
+  let client;
+  let inTransaction = false;
   try {
+    client = await pool.connect();
     const { full_name, email, password, business_name, subscription_plan } = req.body;
 
     if (!full_name || !email || !password || !business_name) {
@@ -30,6 +32,7 @@ router.post("/register", async (req, res) => {
 
     const password_hash = await bcrypt.hash(password, 10);
     await client.query("BEGIN");
+    inTransaction = true;
 
     // Create user
     const userRes = await client.query(
@@ -79,13 +82,20 @@ router.post("/register", async (req, res) => {
     );
 
     await client.query("COMMIT");
+    inTransaction = false;
     res.json({ success: true, message: "Registration successful", restaurant_id: restaurantId });
   } catch (err) {
-    await client.query("ROLLBACK");
+    if (client && inTransaction) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error("❌ Registration rollback failed:", rollbackErr);
+      }
+    }
     console.error("❌ Registration error:", err);
     res.status(500).json({ success: false, error: "Registration failed" });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 

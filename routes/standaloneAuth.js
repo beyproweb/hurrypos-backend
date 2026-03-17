@@ -28,8 +28,10 @@ function signStandaloneToken({ id, name, role, restaurant_id, allowed_modules })
 }
 
 router.post("/register", async (req, res) => {
-  const client = await pool.connect();
+  let client;
+  let inTransaction = false;
   try {
+    client = await pool.connect();
     const { full_name, email, password, business_name, planKey, plan, moduleKey } = req.body || {};
     if (!full_name || !email || !password || !business_name) {
       return res.status(400).json({ error: "Missing required fields" });
@@ -73,6 +75,7 @@ router.post("/register", async (req, res) => {
 
     const password_hash = await bcrypt.hash(password, 10);
     await client.query("BEGIN");
+    inTransaction = true;
 
     const userRes = await client.query(
       `INSERT INTO users (email, full_name, password_hash, business_name, subscription_plan, role)
@@ -104,6 +107,7 @@ router.post("/register", async (req, res) => {
     );
 
     await client.query("COMMIT");
+    inTransaction = false;
 
     const allowed = normalizeModules(restaurant.allowed_modules) || allowedModules;
     const token = signStandaloneToken({
@@ -121,11 +125,17 @@ router.post("/register", async (req, res) => {
       allowed_modules: allowed,
     });
   } catch (err) {
-    await client.query("ROLLBACK");
+    if (client && inTransaction) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error("❌ Standalone registration rollback failed:", rollbackErr);
+      }
+    }
     console.error("❌ Standalone registration failed:", err);
     return res.status(500).json({ error: "Registration failed" });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
