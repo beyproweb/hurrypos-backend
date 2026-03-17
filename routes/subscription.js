@@ -15,15 +15,16 @@ router.post("/register", async (req, res) => {
   let client;
   let inTransaction = false;
   try {
-    client = await pool.connect();
-    const { full_name, email, password, business_name, subscription_plan } = req.body;
+    const { full_name, email, password, business_name, subscription_plan } = req.body || {};
 
     if (!full_name || !email || !password || !business_name) {
       return res.status(400).json({ success: false, error: "Missing required fields" });
     }
 
+    client = await pool.connect();
+
     const normalizedEmail = normalizeEmail(email);
-    const existing = await pool.query("SELECT id FROM users WHERE LOWER(TRIM(email)) = $1", [
+    const existing = await client.query("SELECT id FROM users WHERE LOWER(TRIM(email)) = $1", [
       normalizedEmail,
     ]);
     if (existing.rowCount > 0) {
@@ -95,7 +96,13 @@ router.post("/register", async (req, res) => {
     console.error("❌ Registration error:", err);
     res.status(500).json({ success: false, error: "Registration failed" });
   } finally {
-    if (client) client.release();
+    if (client) {
+      try {
+        client.release();
+      } catch (releaseErr) {
+        console.error("❌ Registration client release failed:", releaseErr);
+      }
+    }
   }
 });
 

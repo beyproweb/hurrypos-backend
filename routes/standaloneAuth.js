@@ -31,11 +31,12 @@ router.post("/register", async (req, res) => {
   let client;
   let inTransaction = false;
   try {
-    client = await pool.connect();
     const { full_name, email, password, business_name, planKey, plan, moduleKey } = req.body || {};
     if (!full_name || !email || !password || !business_name) {
       return res.status(400).json({ error: "Missing required fields" });
     }
+
+    client = await pool.connect();
 
     const planKeyRaw = planKey || plan || moduleKey || "qr_kitchen";
     const normalizedPlan = String(planKeyRaw || "").trim().toLowerCase();
@@ -43,7 +44,7 @@ router.post("/register", async (req, res) => {
     const allowedModules = [allowedPlan];
 
     const normalizedEmail = normalizeEmail(email);
-    const existing = await pool.query(
+    const existing = await client.query(
       "SELECT id, full_name, email, password_hash, role, restaurant_id FROM users WHERE LOWER(TRIM(email)) = $1",
       [normalizedEmail]
     );
@@ -135,7 +136,13 @@ router.post("/register", async (req, res) => {
     console.error("❌ Standalone registration failed:", err);
     return res.status(500).json({ error: "Registration failed" });
   } finally {
-    if (client) client.release();
+    if (client) {
+      try {
+        client.release();
+      } catch (releaseErr) {
+        console.error("❌ Standalone registration client release failed:", releaseErr);
+      }
+    }
   }
 });
 
