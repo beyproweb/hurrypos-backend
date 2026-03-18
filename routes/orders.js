@@ -24,6 +24,10 @@ module.exports = function(io) {
   const { emitAlert } = require("../utils/realtime");
   const { updateStockForOrder } = require("../utils/orderStock");
   const { ensureConcertTables } = require("../utils/concertsService");
+  const {
+    CONFIRMATION_TYPES,
+    sendOrderCustomerConfirmationEmail,
+  } = require("../utils/customerConfirmationEmail");
   const { attachAllowedModules } = require("../middleware/moduleGuard");
   const DEFAULT_TZ = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
 
@@ -322,6 +326,25 @@ module.exports = function(io) {
       await recordCancelSyncError(orderId, `External accept error: ${err.message}`);
       return { ok: false, error: err.message };
     }
+  };
+
+  const normalizeCustomerEmail = (value) => {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (!normalized) return "";
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized) ? normalized : "";
+  };
+
+  const isQrMenuRequest = (req) => {
+    const role = String(req?.user?.role || "").toLowerCase();
+    const identifier = String(req?.query?.identifier || "").trim();
+    const mode = String(req?.query?.mode || "").trim().toLowerCase();
+    return Boolean(
+      identifier ||
+        role === "qr-guest" ||
+        role === "qr-table" ||
+        mode === "table" ||
+        mode === "delivery"
+    );
   };
 
   const sendExternalPreparationCompleted = async ({ orderId }) => {
@@ -2010,10 +2033,12 @@ router.post("/", async (req, res) => {
       order_type,          // 'table' | 'phone' | 'packet' ...
       customer_name,
       customer_phone,
+      customer_email,
       customer_address,
       payment_method,
       reservation_clients,
     } = req.body;
+    const normalizedCustomerEmail = normalizeCustomerEmail(customer_email);
     const hasReservationClientsInPayload =
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservation_clients") ||
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservationClients");
@@ -2418,37 +2443,35 @@ if (
   }
 }
 
-// ✅ Immediately persist customer + address (so it shows on frontend top bar)
-if (customer_phone && customer_address) {
-  // ---- Safe insert: only if phone not found for this restaurant ----
-  const existingCustomer = await pool.query(
-    `SELECT id FROM customers WHERE phone = $1 AND restaurant_id = $2 LIMIT 1`,
-    [customer_phone, restaurantId]
-  );
-
-  let customerId;
-  if (existingCustomer.rowCount === 0) {
-    const inserted = await pool.query(
-      `INSERT INTO customers (restaurant_id, name, phone)
-       VALUES ($1, $2, $3)
-       RETURNING id`,
-      [restaurantId, customer_name || 'Customer', customer_phone]
-    );
-    customerId = inserted.rows[0].id;
-  } else {
-    customerId = existingCustomer.rows[0].id;
-  }
-
-  // ---- Safe insert address (idempotent) ----
-  await pool.query(
+// ✅ Persist customer contact details from QR checkout (name/phone/email/address).
+if (customer_phone) {
+  const safeCustomerPhone = String(customer_phone || "").trim();
+  const safeCustomerName = String(customer_name || "").trim() || "Customer";
+  const upsertCustomer = await client.query(
     `
-    INSERT INTO customer_addresses (customer_id, address, is_default, restaurant_id)
-    VALUES ($1, $2, true, $3)
-    ON CONFLICT (customer_id, address)
-    DO UPDATE SET is_default = EXCLUDED.is_default
+    INSERT INTO customers (restaurant_id, name, phone, email)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (restaurant_id, phone)
+    DO UPDATE SET
+      name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
+      email = COALESCE(NULLIF(EXCLUDED.email, ''), customers.email)
+    RETURNING id
     `,
-    [customerId, customer_address, restaurantId]
+    [restaurantId, safeCustomerName, safeCustomerPhone, normalizedCustomerEmail || null]
   );
+
+  const customerId = upsertCustomer.rows?.[0]?.id;
+  if (customerId && customer_address) {
+    await client.query(
+      `
+      INSERT INTO customer_addresses (customer_id, address, is_default, restaurant_id)
+      VALUES ($1, $2, true, $3)
+      ON CONFLICT (customer_id, address)
+      DO UPDATE SET is_default = EXCLUDED.is_default
+      `,
+      [customerId, customer_address, restaurantId]
+    );
+  }
 }
 
     // DEBUG
@@ -2473,6 +2496,29 @@ touch(order.id, "POST /orders create+commit");
 io.to(`restaurant_${restaurantId}`).emit("orders_updated");
 
 if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
+
+    // 📧 QR Menu customer confirmation email trigger (only once per confirmed order).
+    if (isQrMenuRequest(req)) {
+      const normalizedOrderType = String(order?.order_type || order_type || "").toLowerCase();
+      const confirmationType =
+        normalizedOrderType === "takeaway"
+          ? CONFIRMATION_TYPES.PICKUP_ORDER
+          : ["packet", "delivery", "online"].includes(normalizedOrderType)
+            ? CONFIRMATION_TYPES.DELIVERY_ORDER
+            : null;
+
+      if (confirmationType) {
+        await sendOrderCustomerConfirmationEmail({
+          pool,
+          restaurantId,
+          orderId: Number(order.id),
+          confirmationType,
+          explicitCustomerEmail: normalizedCustomerEmail,
+          triggeredFrom: "orders.create.qr_confirmed",
+          req,
+        });
+      }
+    }
 
     // 🔥 If the order was created WITH items, emit a full payload for auto-print
     if (hasItems) {
@@ -2770,6 +2816,7 @@ router.put("/:id/status", async (req, res) => {
       typeof payment_status === "string" && payment_status.trim() !== ""
         ? payment_status.trim().toLowerCase()
         : null;
+    const normalizedCustomerEmailFromPayload = normalizeCustomerEmail(req.body?.customer_email);
     const hasReservationClientsInPayload =
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservation_clients") ||
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservationClients");
@@ -2795,6 +2842,10 @@ router.put("/:id/status", async (req, res) => {
     const paidRequested = normalizedStatus === "paid" || normalizedPaymentStatus === "paid";
     const closedRequested = normalizedStatus === "closed";
     const existingStatus = String(existingOrder?.status || "").toLowerCase();
+    const statusTransitionedToConfirmed =
+      normalizedStatus === "confirmed" && existingStatus !== "confirmed";
+    const statusTransitionedFromReservedToConfirmed =
+      normalizedStatus === "confirmed" && existingStatus === "reserved";
     const hasReservationSignalOnOrder = Boolean(
       existingOrder?.reservation_date ||
         existingOrder?.reservation_time ||
@@ -2998,6 +3049,49 @@ router.put("/:id/status", async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    const normalizedOrderType = String(updatedOrder?.order_type || "").toLowerCase();
+    const hasReservationSchedule = Boolean(updatedOrder?.reservation_date || updatedOrder?.reservation_time);
+
+    // 📧 Reservation confirmation is sent only when staff confirms reservation (reserved -> confirmed),
+    // typically from TableOverview.
+    if (
+      statusTransitionedFromReservedToConfirmed &&
+      (normalizedOrderType === "table" || normalizedOrderType === "reservation") &&
+      hasReservationSchedule
+    ) {
+      await sendOrderCustomerConfirmationEmail({
+        pool,
+        restaurantId,
+        orderId: Number(parsedId),
+        confirmationType: CONFIRMATION_TYPES.TABLE_RESERVATION,
+        explicitCustomerEmail: normalizedCustomerEmailFromPayload,
+        triggeredFrom: "orders.status.tableoverview_confirmed",
+        req,
+      });
+    }
+
+    // Keep QR delivery/pickup flow unchanged.
+    if (isQrMenuRequest(req) && statusTransitionedToConfirmed) {
+      const confirmationType =
+        normalizedOrderType === "takeaway"
+          ? CONFIRMATION_TYPES.PICKUP_ORDER
+          : ["packet", "delivery", "online"].includes(normalizedOrderType)
+            ? CONFIRMATION_TYPES.DELIVERY_ORDER
+            : null;
+
+      if (confirmationType) {
+        await sendOrderCustomerConfirmationEmail({
+          pool,
+          restaurantId,
+          orderId: Number(parsedId),
+          confirmationType,
+          explicitCustomerEmail: normalizedCustomerEmailFromPayload,
+          triggeredFrom: "orders.status.qr_confirmed",
+          req,
+        });
+      }
+    }
 
     io.to(`restaurant_${restaurantId}`).emit("orders_updated");
     res.json(updatedOrder);
@@ -6054,9 +6148,11 @@ router.post("/reservations", async (req, res) => {
     table_number,
     customer_name,
     customer_phone,
+    customer_email,
   } = req.body;
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
+  const normalizedCustomerEmail = normalizeCustomerEmail(customer_email);
 
   try {
     // Validate required fields
@@ -6113,6 +6209,20 @@ router.post("/reservations", async (req, res) => {
         return res.status(404).json({ error: "Order not found" });
       }
 
+      if (safeCustomerPhone) {
+        await pool.query(
+          `
+          INSERT INTO customers (restaurant_id, name, phone, email)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (restaurant_id, phone)
+          DO UPDATE SET
+            name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
+            email = COALESCE(NULLIF(EXCLUDED.email, ''), customers.email)
+          `,
+          [restaurantId, safeCustomerName || "Customer", safeCustomerPhone, normalizedCustomerEmail || null]
+        );
+      }
+
       // Emit update to frontend
       io.to(`restaurant_${restaurantId}`).emit("orders_updated");
       io.to(`restaurant_${restaurantId}`).emit("reservation_created", {
@@ -6164,6 +6274,20 @@ router.post("/reservations", async (req, res) => {
       );
 
       const reservation = newOrderResult.rows[0];
+
+      if (safeCustomerPhone) {
+        await pool.query(
+          `
+          INSERT INTO customers (restaurant_id, name, phone, email)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (restaurant_id, phone)
+          DO UPDATE SET
+            name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
+            email = COALESCE(NULLIF(EXCLUDED.email, ''), customers.email)
+          `,
+          [restaurantId, safeCustomerName || "Customer", safeCustomerPhone, normalizedCustomerEmail || null]
+        );
+      }
 
       io.to(`restaurant_${restaurantId}`).emit("orders_updated");
       io.to(`restaurant_${restaurantId}`).emit("reservation_created", {

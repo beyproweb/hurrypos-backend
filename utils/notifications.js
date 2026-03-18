@@ -27,20 +27,22 @@ const sendEmail = async (...args) => {
     let subject;
     let body;
     let isHtml = false;
+    let htmlBody = null;
+    let textBody = null;
     options = {};
 
     if (args.length === 1 && isPlainObject(args[0])) {
       const input = args[0];
       to = input.to;
       subject = input.subject;
-      if (typeof input.html === "string") {
-        body = input.html;
+      htmlBody = typeof input.html === "string" ? input.html : null;
+      textBody = typeof input.text === "string" ? input.text : null;
+      body = input.body;
+      if (htmlBody !== null) {
         isHtml = true;
-      } else if (typeof input.text === "string") {
-        body = input.text;
+      } else if (textBody !== null) {
         isHtml = false;
       } else {
-        body = input.body;
         isHtml = !!input.isHtml;
       }
       options = { ...input };
@@ -73,8 +75,17 @@ const sendEmail = async (...args) => {
       from,
       to,
       subject,
-      [isHtml ? "html" : "text"]: body,
     };
+
+    if (htmlBody !== null || textBody !== null) {
+      if (htmlBody !== null) mailOptions.html = htmlBody;
+      if (textBody !== null) mailOptions.text = textBody;
+      if (htmlBody === null && textBody === null && typeof body === "string") {
+        mailOptions[isHtml ? "html" : "text"] = body;
+      }
+    } else {
+      mailOptions[isHtml ? "html" : "text"] = body;
+    }
 
     if (options.replyTo) mailOptions.replyTo = options.replyTo;
     if (options.cc) mailOptions.cc = options.cc;

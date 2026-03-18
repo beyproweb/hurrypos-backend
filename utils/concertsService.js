@@ -25,6 +25,12 @@ function asNullableText(value) {
   return next || null;
 }
 
+function normalizeEmail(value) {
+  const next = asText(value, "").toLowerCase();
+  if (!next) return null;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(next) ? next : null;
+}
+
 function asMoney(value, fallback = 0) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -1148,6 +1154,7 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
     const paymentStatus = "pending_bank_transfer";
     const customerName = asNullableText(rawPayload.customer_name);
     const customerPhone = asNullableText(rawPayload.customer_phone);
+    const customerEmail = normalizeEmail(rawPayload.customer_email || rawPayload.email);
     const customerNote = asText(rawPayload.customer_note || rawPayload.note || "", "");
     const requestedGuestsCount = asInt(
       rawPayload.guests_count || rawPayload.reservation_clients || rawPayload.guests || 0,
@@ -1326,6 +1333,20 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         await client.query("ROLLBACK");
         return { status: 500, error: "Failed to create concert ticket order" };
       }
+    }
+
+    if (customerPhone) {
+      await client.query(
+        `
+        INSERT INTO customers (restaurant_id, name, phone, email)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (restaurant_id, phone)
+        DO UPDATE SET
+          name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
+          email = COALESCE(NULLIF(EXCLUDED.email, ''), customers.email)
+        `,
+        [restaurantId, customerName || "Customer", customerPhone, customerEmail]
+      );
     }
 
     const insertResult = await client.query(
