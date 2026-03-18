@@ -3,7 +3,9 @@
 const express = require("express");
 const router = express.Router();
 const authMiddleware = require("../middleware/authMiddleware");
-const { sendCloudMessage } = require("../utils/whatsappCloud");/* =========================================================
+const { sendCloudMessage } = require("../utils/whatsappCloud");
+const { sendEmail } = require("../utils/notifications");
+/* =========================================================
    In-memory fallbacks so the UI still works if DB writes fail
    ========================================================= */
 const recentEvents = new Map();        // Map<cid, {sent:Set, opens:Set, clicks:Set, last:Date}>
@@ -107,7 +109,6 @@ async function ensureTables() {
    Soft deps + config
    ========================================================= */
 function tryRequire(m) { try { return require(m); } catch { return null; } }
-const nodemailer = tryRequire("nodemailer"); // optional
 const cheerio = tryRequire("cheerio");       // optional
 
 /* =========================================================
@@ -336,84 +337,6 @@ function buildRestaurantCondition(column, paramIndex, restaurantIdValue) {
     return { clause: `CAST(${column} AS TEXT) = $${paramIndex}`, param: text };
   }
   return null;
-}
-
-/* =========================================================
-   Transporter (never crashes; JSON transport fallback)
-   ========================================================= */
-function buildTransporter() {
-  if (!nodemailer) return null; // tell caller to install nodemailer if needed
-  const {
-    SMTP_HOST,
-    SMTP_PORT = "587",
-    SMTP_USER,
-    SMTP_PASS,
-    SMTP_SECURE = "false",
-    SMTP_STRATEGY,
-    SMTP_SERVICE,
-    SMTP_URL,
-  } = process.env;
-
-  const strategy = String(SMTP_STRATEGY || "").toLowerCase();
-
-  // Explicit debug mode
-  if (strategy === "json") {
-    // Keep: Useful for production debugging
-    console.warn("📬 Email campaigns using jsonTransport (SMTP_STRATEGY=json)");
-    return nodemailer.createTransport({ jsonTransport: true });
-  }
-
-  const url = truthyStr(SMTP_URL);
-  const user = truthyStr(SMTP_USER);
-  const pass = truthyStr(SMTP_PASS);
-
-  if (url) {
-    if (process.env.NODE_ENV !== "production") {
-      console.log("📬 Email campaigns using SMTP_URL transport");
-    }
-    return nodemailer.createTransport(url);
-  }
-
-  if (truthyStr(SMTP_SERVICE) && user && pass) {
-    if (process.env.NODE_ENV !== "production") {
-      console.log(`📬 Email campaigns using nodemailer service=${truthyStr(SMTP_SERVICE)}`);
-    }
-    return nodemailer.createTransport({
-      service: truthyStr(SMTP_SERVICE),
-      auth: { user, pass },
-    });
-  }
-
-  let host = truthyStr(SMTP_HOST);
-  let port = Number(SMTP_PORT) || 587;
-  let secure = String(SMTP_SECURE || "").toLowerCase() === "true";
-
-  if (!host && user) {
-    if (/gmail\.com$/i.test(user)) {
-      host = "smtp.gmail.com";
-      if (!SMTP_PORT) port = 465;
-      secure = true;
-    } else if (/@(outlook|hotmail|live)\./i.test(user)) {
-      host = "smtp-mail.outlook.com";
-      if (!SMTP_PORT) port = 587;
-      if (SMTP_SECURE === undefined) secure = false;
-    }
-  }
-
-  if (!host || !user || !pass) {
-    // Keep: Useful for production debugging
-    console.warn(
-      "⚠️ Email campaigns falling back to jsonTransport because SMTP_HOST/USER/PASS are not fully configured."
-    );
-    return nodemailer.createTransport({ jsonTransport: true });
-  }
-
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth: { user, pass },
-  });
 }
 
 /* =========================================================
@@ -684,14 +607,6 @@ router.post("/email", async (req, res) => {
       .map((r) => String(r || "").trim())
       .filter((r) => r && !seen.has(r) && (seen.add(r) || true));
 
-    const transporter = buildTransporter();
-    if (!transporter) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "nodemailer not installed (npm i nodemailer)" });
-    }
-    try { await transporter.verify(); } catch {}
-
     const tablesOk = await ensureTables();
 
     let campaignId = Date.now().toString();
@@ -725,6 +640,7 @@ router.post("/email", async (req, res) => {
     const origin = getSafeOrigin(req);
     const senderEmail =
       fromEmail ||
+      process.env.EMAIL_FROM ||
       process.env.SMTP_FROM ||
       process.env.SMTP_USER ||
       "no-reply@example.com";
@@ -742,12 +658,13 @@ router.post("/email", async (req, res) => {
     for (const rcpt of rcpts) {
       try {
         const htmlTracked = rewritePerRecipient(html, origin, campaignId, rcpt);
-        await transporter.sendMail({
+        await sendEmail({
           from,
           to: rcpt,
           subject,
           html: htmlTracked,
           text: text || stripHtml(htmlTracked),
+          throwOnError: true,
         });
         await q(
           `INSERT INTO campaign_events (campaign_id, customer_email, event_type)
