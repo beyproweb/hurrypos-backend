@@ -1,14 +1,115 @@
 const nodemailer = require('nodemailer');
 
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
+function truthyStr(value) {
+  const normalized = String(value || "").trim();
+  return normalized ? normalized : "";
+}
+
+function parseBool(value, fallback = false) {
+  if (value === undefined || value === null || String(value).trim() === "") return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function resolveMailEnv() {
+  const strategy = truthyStr(process.env.SMTP_STRATEGY).toLowerCase();
+  const smtpUrl = truthyStr(process.env.SMTP_URL || process.env.EMAIL_URL || process.env.MAIL_URL);
+  const service = truthyStr(process.env.SMTP_SERVICE || process.env.EMAIL_SERVICE || process.env.MAIL_SERVICE);
+  const host = truthyStr(process.env.SMTP_HOST || process.env.EMAIL_HOST || process.env.MAIL_HOST);
+  const port = Number(process.env.SMTP_PORT || process.env.EMAIL_PORT || process.env.MAIL_PORT) || 587;
+  const user = truthyStr(process.env.SMTP_USER || process.env.EMAIL_USER || process.env.MAIL_USER);
+  const pass = truthyStr(process.env.SMTP_PASS || process.env.EMAIL_PASS || process.env.MAIL_PASS);
+  const secureRaw = process.env.SMTP_SECURE ?? process.env.EMAIL_SECURE ?? process.env.MAIL_SECURE;
+  const secure = parseBool(secureRaw, port === 465);
+
+  return {
+    strategy,
+    smtpUrl,
+    service,
+    host,
+    port,
+    user,
+    pass,
+    secure,
+  };
+}
+
+let transporter = null;
+let transporterKey = "";
+
+function buildTransporter() {
+  const config = resolveMailEnv();
+  const key = JSON.stringify({
+    strategy: config.strategy,
+    smtpUrl: config.smtpUrl,
+    service: config.service,
+    host: config.host,
+    port: config.port,
+    secure: config.secure,
+    user: config.user,
+    hasPass: Boolean(config.pass),
+  });
+
+  if (transporter && transporterKey === key) return transporter;
+
+  if (config.strategy === "json") {
+    transporter = nodemailer.createTransport({ jsonTransport: true });
+    transporterKey = key;
+    return transporter;
+  }
+
+  if (config.smtpUrl) {
+    transporter = nodemailer.createTransport(config.smtpUrl);
+    transporterKey = key;
+    return transporter;
+  }
+
+  if (config.service && config.user && config.pass) {
+    transporter = nodemailer.createTransport({
+      service: config.service,
+      auth: { user: config.user, pass: config.pass },
+    });
+    transporterKey = key;
+    return transporter;
+  }
+
+  let host = config.host;
+  let port = config.port;
+  let secure = config.secure;
+
+  // Convenience fallback when only SMTP_USER/PASS are set.
+  if (!host && config.user) {
+    if (/gmail\.com$/i.test(config.user)) {
+      host = "smtp.gmail.com";
+      if (!process.env.SMTP_PORT) port = 465;
+      if (process.env.SMTP_SECURE === undefined) secure = true;
+    } else if (/@(outlook|hotmail|live)\./i.test(config.user)) {
+      host = "smtp-mail.outlook.com";
+      if (!process.env.SMTP_PORT) port = 587;
+      if (process.env.SMTP_SECURE === undefined) secure = false;
+    }
+  }
+
+  if (!host || !config.user || !config.pass) {
+    transporter = null;
+    transporterKey = key;
+    return null;
+  }
+
+  transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: {
+      user: config.user,
+      pass: config.pass,
+    },
+  });
+  transporterKey = key;
+  return transporter;
+}
 
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -67,7 +168,22 @@ const sendEmail = async (...args) => {
       options = isPlainObject(args[4]) ? args[4] : {};
     }
 
-    const fromEmail = options.fromEmail || process.env.SMTP_USER;
+    const activeTransporter = buildTransporter();
+    if (!activeTransporter) {
+      throw new Error(
+        "SMTP is not configured. Set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS or SMTP_URL."
+      );
+    }
+
+    const fromEmail =
+      options.fromEmail ||
+      process.env.SMTP_FROM ||
+      process.env.EMAIL_FROM ||
+      process.env.MAIL_FROM ||
+      process.env.SMTP_USER ||
+      process.env.EMAIL_USER ||
+      process.env.MAIL_USER ||
+      "no-reply@beypro.local";
     const fromName = options.fromName || "Beypro Notifications";
     const from = options.from || `"${fromName}" <${fromEmail}>`;
 
@@ -91,7 +207,7 @@ const sendEmail = async (...args) => {
     if (options.cc) mailOptions.cc = options.cc;
     if (options.bcc) mailOptions.bcc = options.bcc;
 
-    await transporter.sendMail(mailOptions);
+    await activeTransporter.sendMail(mailOptions);
     const toDisplay = Array.isArray(to) ? to.join(", ") : String(to || "");
     console.log(`✅ Email sent to: ${toDisplay}`);
   } catch (error) {
