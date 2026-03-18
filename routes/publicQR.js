@@ -1,6 +1,8 @@
 // routes/publicQR.js
 const express = require("express");
 const router = express.Router();
+const fs = require("fs");
+const path = require("path");
 const { pool } = require("../db");
 const { getIO } = require("../utils/socket");
 const { saveNotification } = require("../utils/realtime");
@@ -19,6 +21,7 @@ const QR_BRANDING_DEFAULTS = {
   app_display_name: "",
   pwa_primary_color: "#4F46E5",
   pwa_background_color: "#FFFFFF",
+  qrmenu_font_family: "gotham",
 };
 
 function parseCustomizationPayload(row) {
@@ -67,6 +70,22 @@ function detectImageMimeType(src) {
   if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
   if (lower.endsWith(".webp")) return "image/webp";
   return "image/png";
+}
+
+function uploadsAssetExists(src) {
+  const normalized = normalizeAssetPath(src, "");
+  if (!normalized || !normalized.startsWith("/uploads/")) return true;
+  const localPath = path.join(__dirname, "..", "public", normalized.replace(/^\/+/, ""));
+  return fs.existsSync(localPath);
+}
+
+function resolveAvailableAssetPath(src, fallback = "") {
+  const normalized = normalizeAssetPath(src, fallback);
+  if (!normalized) return fallback;
+  if (normalized.startsWith("/uploads/") && !uploadsAssetExists(normalized)) {
+    return normalizeAssetPath(fallback, "") || "";
+  }
+  return normalized;
 }
 
 function normalizePublicBaseUrl(value) {
@@ -877,12 +896,13 @@ router.get("/share/:identifier", async (req, res) => {
           `Explore ${appName} on Beypro QR Menu.`
       ).trim() || `Explore ${appName} on Beypro QR Menu.`;
 
-    const imageCandidate =
+    const imageCandidateRaw =
       customization.app_icon_512 ||
       customization.app_icon_192 ||
       customization.splash_logo ||
       customization.app_icon ||
       "/Beylogo.svg";
+    const imageCandidate = resolveAvailableAssetPath(imageCandidateRaw, "/Beylogo.svg");
     const imageUrl =
       toAbsolutePublicAssetUrl(imageCandidate, req) ||
       `${resolvePublicWebBaseUrl(req)}/Beylogo.svg`;
@@ -992,14 +1012,10 @@ router.get("/manifest.json", async (req, res) => {
     );
     const backgroundColor = normalizeHexColor(customization.pwa_background_color, "#FFFFFF");
     const fallbackIcon = "/Beylogo.svg";
-    const icon192 = normalizeAssetPath(
-      customization.app_icon_192 || customization.app_icon,
-      fallbackIcon
-    );
-    const icon512 = normalizeAssetPath(
-      customization.app_icon_512 || customization.app_icon,
-      fallbackIcon
-    );
+    const icon192Raw = customization.app_icon_192 || customization.app_icon;
+    const icon512Raw = customization.app_icon_512 || customization.app_icon;
+    const icon192 = resolveAvailableAssetPath(icon192Raw, fallbackIcon);
+    const icon512 = resolveAvailableAssetPath(icon512Raw, fallbackIcon);
     const manifestIcon192 = toAbsoluteManifestAssetUrl(icon192, req);
     const manifestIcon512 = toAbsoluteManifestAssetUrl(icon512, req);
     const basePath = restaurant.slug
@@ -1362,12 +1378,22 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
       app_display_name: restaurant.name || "Restaurant",
     };
 
+    const mergedCustomization = {
+      ...defaults,
+      ...data,
+    };
+    const sanitizedBranding = {
+      ...mergedCustomization,
+      app_icon: resolveAvailableAssetPath(mergedCustomization.app_icon, ""),
+      app_icon_192: resolveAvailableAssetPath(mergedCustomization.app_icon_192, ""),
+      app_icon_512: resolveAvailableAssetPath(mergedCustomization.app_icon_512, ""),
+      apple_touch_icon: resolveAvailableAssetPath(mergedCustomization.apple_touch_icon, ""),
+      splash_logo: resolveAvailableAssetPath(mergedCustomization.splash_logo, ""),
+    };
+
     res.json({
       success: true,
-      customization: {
-        ...defaults,
-        ...data,
-      },
+      customization: sanitizedBranding,
     });
 
   } catch (err) {

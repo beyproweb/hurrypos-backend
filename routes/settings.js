@@ -711,6 +711,7 @@ const BRANDING_DEFAULTS = {
   app_display_name: "",
   pwa_primary_color: "#4F46E5",
   pwa_background_color: "#FFFFFF",
+  qrmenu_font_family: "gotham",
 };
 
 function parseCustomizationPayload(row) {
