@@ -42,6 +42,23 @@ module.exports = function songRequestsRoutes(io) {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock($1)", [restaurantId]);
 
+      const existingActiveRequestResult = await client.query(
+        `SELECT id
+           FROM song_requests
+          WHERE restaurant_id = $1
+            AND table_number = $2
+            AND status::text = ANY($3::text[])
+          ORDER BY created_at ASC, id ASC
+          LIMIT 1`,
+        [restaurantId, tableNumber, ACTIVE_QUEUE_STATUSES]
+      );
+      if (existingActiveRequestResult.rows[0]) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "An active song request already exists for this table",
+        });
+      }
+
       const countResult = await client.query(
         `SELECT COUNT(*)::int AS pending_count
            FROM song_requests
