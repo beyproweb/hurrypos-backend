@@ -1197,23 +1197,6 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
       );
     };
 
-    const parseReservationMs = (dateValue, timeValue) => {
-      if (!dateValue) return NaN;
-      const dateRaw = String(dateValue).trim();
-      if (!dateRaw) return NaN;
-      const timeRaw = timeValue ? String(timeValue).trim() : "00:00:00";
-      const parsed = new Date(`${dateRaw}T${timeRaw || "00:00:00"}`).getTime();
-      return Number.isFinite(parsed) ? parsed : NaN;
-    };
-
-    const isReservationDueNow = (row) => {
-      if (!isReservationLikeRow(row)) return false;
-      if (!row?.reservation_date) return true;
-      const scheduledMs = parseReservationMs(row.reservation_date, row.reservation_time);
-      if (!Number.isFinite(scheduledMs)) return true;
-      return Date.now() >= scheduledMs;
-    };
-
     const unavailableSet = new Set();
     const reservedSet = new Set();
 
@@ -1226,8 +1209,6 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
         unavailableSet.add(tableNumber);
         return;
       }
-
-      if (!isReservationDueNow(row)) return;
 
       unavailableSet.add(tableNumber);
       if (status !== "checked_in") {

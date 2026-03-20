@@ -6163,13 +6163,138 @@ router.post("/reservations", async (req, res) => {
     const clientCount = parseInt(reservation_clients) || 0;
     const notes = (reservation_notes || "").trim();
 
-    // If order_id provided, update that order with reservation fields
+    const createStandaloneReservationForTable = async ({
+      resolvedTableNumber,
+      fallbackCustomerName = null,
+      fallbackCustomerPhone = null,
+    }) => {
+      const newOrderResult = await pool.query(
+        `INSERT INTO orders (
+          restaurant_id,
+          table_number,
+          status,
+          total,
+          order_type,
+          customer_name,
+          customer_phone,
+          reservation_date,
+          reservation_time,
+          reservation_clients,
+          reservation_notes,
+          created_at
+        )
+        VALUES ($1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, $7, $8, NOW())
+        RETURNING *`,
+        [
+          restaurantId,
+          resolvedTableNumber,
+          fallbackCustomerName,
+          fallbackCustomerPhone,
+          reservation_date,
+          reservation_time,
+          clientCount,
+          notes,
+        ]
+      );
+
+      const reservation = newOrderResult.rows[0];
+
+      if (fallbackCustomerPhone) {
+        await pool.query(
+          `
+          INSERT INTO customers (restaurant_id, name, phone, email)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (restaurant_id, phone)
+          DO UPDATE SET
+            name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
+            email = COALESCE(NULLIF(EXCLUDED.email, ''), customers.email)
+          `,
+          [
+            restaurantId,
+            fallbackCustomerName || "Customer",
+            fallbackCustomerPhone,
+            normalizedCustomerEmail || null,
+          ]
+        );
+      }
+
+      emitReservationCreated(restaurantId, reservation);
+
+      return res.json({
+        success: true,
+        message: "✅ Reservation created for table",
+        reservation,
+      });
+    };
+
+    // If order_id provided, attach to an existing reservation row or create a standalone
+    // reservation row for normal service orders. Do not mutate live table service orders.
     if (order_id) {
+      const sourceOrderId = Number(order_id);
+      if (!Number.isFinite(sourceOrderId) || sourceOrderId <= 0) {
+        return res.status(400).json({ error: "Invalid order_id" });
+      }
       const safeTableNumber = Number.isFinite(Number(table_number))
         ? Number(table_number)
         : null;
       const safeCustomerName = (customer_name || "").trim() || null;
       const safeCustomerPhone = (customer_phone || "").trim() || null;
+      const sourceOrderResult = await pool.query(
+        `SELECT
+           id,
+           table_number,
+           status,
+           order_type,
+           total,
+           customer_name,
+           customer_phone,
+           reservation_date,
+           reservation_time,
+           reservation_clients,
+           reservation_notes
+         FROM orders
+         WHERE restaurant_id = $1 AND id = $2
+         LIMIT 1`,
+        [restaurantId, sourceOrderId]
+      );
+      if (sourceOrderResult.rowCount === 0) {
+        return res.status(404).json({ error: "Order not found" });
+      }
+
+      const sourceOrder = sourceOrderResult.rows[0];
+      const sourceOrderType = String(sourceOrder?.order_type || "").trim().toLowerCase();
+      const sourceOrderStatus = String(sourceOrder?.status || "").trim().toLowerCase();
+      const sourceTableNumber = Number(sourceOrder?.table_number);
+      const sourceTotal = Number(sourceOrder?.total || 0);
+      const sourceItemsResult = await pool.query(
+        `SELECT COUNT(*)::int AS item_count
+           FROM order_items
+          WHERE order_id = $1`,
+        [sourceOrderId]
+      );
+      const sourceItemCount = Number(sourceItemsResult.rows?.[0]?.item_count || 0);
+      const isReservationOnlySource =
+        sourceOrderType === "reservation" ||
+        ((sourceOrderStatus === "reserved" || sourceOrderStatus === "confirmed") &&
+          sourceItemCount === 0 &&
+          sourceTotal <= 0);
+
+      if (!isReservationOnlySource) {
+        const resolvedTableNumber = Number.isFinite(safeTableNumber)
+          ? safeTableNumber
+          : Number.isFinite(sourceTableNumber)
+            ? sourceTableNumber
+            : null;
+        if (!Number.isFinite(resolvedTableNumber)) {
+          return res.status(400).json({ error: "Table number is required for reservation" });
+        }
+
+        return await createStandaloneReservationForTable({
+          resolvedTableNumber,
+          fallbackCustomerName: safeCustomerName ?? sourceOrder?.customer_name ?? null,
+          fallbackCustomerPhone: safeCustomerPhone ?? sourceOrder?.customer_phone ?? null,
+        });
+      }
 
       const result = await pool.query(
         `UPDATE orders
@@ -6201,7 +6326,7 @@ router.post("/reservations", async (req, res) => {
           safeCustomerName,
           safeCustomerPhone,
           restaurantId,
-          order_id,
+          sourceOrderId,
         ]
       );
 
@@ -6223,14 +6348,8 @@ router.post("/reservations", async (req, res) => {
         );
       }
 
-      // Emit update to frontend
-      io.to(`restaurant_${restaurantId}`).emit("orders_updated");
-      io.to(`restaurant_${restaurantId}`).emit("reservation_created", {
-        reservation_id: result.rows[0].id,
-        order_id: order_id,
-        reservation_date,
-        reservation_time,
-        reservation_clients: clientCount,
+      emitReservationCreated(restaurantId, result.rows[0], {
+        order_id: sourceOrderId,
       });
 
       return res.json({
@@ -6244,64 +6363,10 @@ router.post("/reservations", async (req, res) => {
     if (table_number) {
       const safeCustomerName = (customer_name || "").trim() || null;
       const safeCustomerPhone = (customer_phone || "").trim() || null;
-      const newOrderResult = await pool.query(
-        `INSERT INTO orders (
-          restaurant_id,
-          table_number,
-          status,
-          total,
-          order_type,
-          customer_name,
-          customer_phone,
-          reservation_date,
-          reservation_time,
-          reservation_clients,
-          reservation_notes,
-          created_at
-        )
-        VALUES ($1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, $7, $8, NOW())
-        RETURNING *`,
-        [
-          restaurantId,
-          table_number,
-          safeCustomerName,
-          safeCustomerPhone,
-          reservation_date,
-          reservation_time,
-          clientCount,
-          notes,
-        ]
-      );
-
-      const reservation = newOrderResult.rows[0];
-
-      if (safeCustomerPhone) {
-        await pool.query(
-          `
-          INSERT INTO customers (restaurant_id, name, phone, email)
-          VALUES ($1, $2, $3, $4)
-          ON CONFLICT (restaurant_id, phone)
-          DO UPDATE SET
-            name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
-            email = COALESCE(NULLIF(EXCLUDED.email, ''), customers.email)
-          `,
-          [restaurantId, safeCustomerName || "Customer", safeCustomerPhone, normalizedCustomerEmail || null]
-        );
-      }
-
-      io.to(`restaurant_${restaurantId}`).emit("orders_updated");
-      io.to(`restaurant_${restaurantId}`).emit("reservation_created", {
-        reservation_id: reservation.id,
-        table_number,
-        reservation_date,
-        reservation_time,
-        reservation_clients: clientCount,
-      });
-
-      return res.json({
-        success: true,
-        message: "✅ Reservation created for table",
-        reservation,
+      return await createStandaloneReservationForTable({
+        resolvedTableNumber: Number(table_number),
+        fallbackCustomerName: safeCustomerName,
+        fallbackCustomerPhone: safeCustomerPhone,
       });
     }
 
@@ -6366,7 +6431,17 @@ router.get("/reservations", async (req, res) => {
       params.push(parseInt(table_number));
     }
 
-    query += ` ORDER BY reservation_date ASC, reservation_time ASC`;
+    query += ` ORDER BY
+      reservation_date ASC,
+      reservation_time ASC,
+      CASE
+        WHEN LOWER(COALESCE(status, '')) = 'checked_in' THEN 0
+        WHEN LOWER(COALESCE(status, '')) = 'confirmed' THEN 1
+        WHEN LOWER(COALESCE(status, '')) = 'reserved' THEN 2
+        ELSE 3
+      END ASC,
+      updated_at DESC,
+      id DESC`;
 
     const result = await pool.query(query, params);
     
@@ -6449,10 +6524,7 @@ router.put("/reservations/:id", async (req, res) => {
       return res.status(404).json({ error: "Reservation not found" });
     }
 
-    // Emit update to frontend
-    io.to(`restaurant_${restaurantId}`).emit("orders_updated");
-    io.to(`restaurant_${restaurantId}`).emit("reservation_updated", {
-      reservation_id: result.rows[0].id,
+    emitReservationStateUpdate(restaurantId, result.rows[0], {
       changes: req.body,
     });
 
@@ -6527,6 +6599,28 @@ const emitReservationStateUpdate = (restaurantId, reservationOrder, extraPayload
 
   io.to(`restaurant_${restaurantId}`).emit("orders_updated");
   io.to(`restaurant_${restaurantId}`).emit("reservation_updated", payload);
+  return payload;
+};
+
+const emitReservationCreated = (restaurantId, reservationOrder, extraPayload = {}) => {
+  if (!reservationOrder || !restaurantId) return;
+  const payload = {
+    reservation_id: reservationOrder.id,
+    order_id: reservationOrder.id,
+    table_number: reservationOrder.table_number,
+    status: reservationOrder.status,
+    order_type: reservationOrder.order_type,
+    reservation_date: reservationOrder.reservation_date,
+    reservation_time: reservationOrder.reservation_time,
+    reservation_clients: reservationOrder.reservation_clients,
+    reservation_notes: reservationOrder.reservation_notes,
+    customer_name: reservationOrder.customer_name || null,
+    customer_phone: reservationOrder.customer_phone || null,
+    ...extraPayload,
+  };
+
+  io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+  io.to(`restaurant_${restaurantId}`).emit("reservation_created", payload);
   return payload;
 };
 
