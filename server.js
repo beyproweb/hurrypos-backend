@@ -483,6 +483,7 @@ app.use("/api/phoneorders", requirePosCore, require("./routes/phoneorders"));
 app.use("/api/customerAddresses", requirePosCore, require("./routes/customerAddresses"));
 app.use("/api/customers", requirePosCore, require("./routes/customers"));
 app.use("/api/tables", require("./routes/tables"));
+app.use("/api", require("./routes/songRequests")(io));
 app.use("/api/campaigns", requirePosCore, require("./routes/campaigns"));
 app.use("/webhook", whatsappWebhook);
 // ✅ Mount KITCHEN router AFTER orders, with auth
