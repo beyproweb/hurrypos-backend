@@ -11,6 +11,15 @@ const BOOKING_CANCELLED_STATUSES = new Set(["cancelled", "canceled"]);
 const EVENT_STATUSES = new Set(["active", "sold_out", "hidden"]);
 const BOOKING_TYPES = new Set(["ticket", "table"]);
 const PAYMENT_STATUSES = new Set(["pending_bank_transfer", "confirmed", "cancelled"]);
+const GUEST_COMPOSITION_FIELD_MODES = new Set(["hidden", "optional", "required"]);
+const GUEST_COMPOSITION_RESTRICTION_RULES = new Set([
+  "no_restriction",
+  "male_only_groups_not_allowed",
+  "female_only_groups_not_allowed",
+  "at_least_1_female_required",
+  "couple_only",
+  "custom_rule_later",
+]);
 
 let concertTablesEnsured = false;
 
@@ -72,6 +81,159 @@ function normalizeAreaName(value) {
   return next || null;
 }
 
+function normalizeGuestCompositionFieldMode(value, fallback = "hidden") {
+  const next = asText(value, fallback).toLowerCase();
+  return GUEST_COMPOSITION_FIELD_MODES.has(next) ? next : fallback;
+}
+
+function normalizeGuestCompositionRestrictionRule(value, fallback = "no_restriction") {
+  const next = asText(value, fallback).toLowerCase();
+  return GUEST_COMPOSITION_RESTRICTION_RULES.has(next) ? next : fallback;
+}
+
+function hasGuestCompositionValue(value) {
+  return value !== undefined && value !== null && String(value).trim() !== "";
+}
+
+function getDefaultGuestCompositionValidationMessage(rule) {
+  switch (normalizeGuestCompositionRestrictionRule(rule)) {
+    case "male_only_groups_not_allowed":
+      return "Male-only groups are not allowed for this reservation.";
+    case "female_only_groups_not_allowed":
+      return "Female-only groups are not allowed for this reservation.";
+    case "at_least_1_female_required":
+      return "At least 1 female guest is required for this reservation.";
+    case "couple_only":
+      return "Only mixed couples with equal men and women are allowed for this reservation.";
+    default:
+      return "Guest composition does not match the reservation policy.";
+  }
+}
+
+function guestCompositionRestrictionRuleRequiresInput(rule) {
+  const normalizedRule = normalizeGuestCompositionRestrictionRule(
+    rule,
+    "no_restriction"
+  );
+  return [
+    "male_only_groups_not_allowed",
+    "female_only_groups_not_allowed",
+    "at_least_1_female_required",
+    "couple_only",
+  ].includes(normalizedRule);
+}
+
+function readGuestCompositionPayload(rawPayload = {}) {
+  const rawMale =
+    rawPayload?.male_guests_count ??
+    rawPayload?.male_guests ??
+    rawPayload?.men_count ??
+    rawPayload?.reservation_men ??
+    rawPayload?.men ??
+    "";
+  const rawFemale =
+    rawPayload?.female_guests_count ??
+    rawPayload?.female_guests ??
+    rawPayload?.women_count ??
+    rawPayload?.reservation_women ??
+    rawPayload?.women ??
+    "";
+
+  return {
+    hasInput: hasGuestCompositionValue(rawMale) || hasGuestCompositionValue(rawFemale),
+    maleGuestsCount: asInt(rawMale, 0),
+    femaleGuestsCount: asInt(rawFemale, 0),
+  };
+}
+
+function validateConcertGuestComposition({ eventRow, bookingType, guestsCount, rawPayload }) {
+  const enabled = asBoolean(eventRow?.guest_composition_enabled, false);
+  const restrictionRule = normalizeGuestCompositionRestrictionRule(
+    eventRow?.guest_composition_restriction_rule,
+    "no_restriction"
+  );
+  const fieldMode = normalizeGuestCompositionFieldMode(
+    eventRow?.guest_composition_field_mode,
+    enabled ? "optional" : "hidden"
+  );
+  const effectiveFieldMode = guestCompositionRestrictionRuleRequiresInput(restrictionRule)
+    ? "required"
+    : fieldMode;
+  const validationMessage =
+    asText(eventRow?.guest_composition_validation_message, "") ||
+    getDefaultGuestCompositionValidationMessage(restrictionRule);
+
+  if (bookingType !== "table" || !enabled || effectiveFieldMode === "hidden") {
+    return {
+      maleGuestsCount: null,
+      femaleGuestsCount: null,
+    };
+  }
+
+  const { hasInput, maleGuestsCount, femaleGuestsCount } = readGuestCompositionPayload(rawPayload);
+  const totalGuests = asInt(guestsCount, 0);
+  if (restrictionRule === "couple_only" && totalGuests > 0 && totalGuests % 2 !== 0) {
+    return {
+      error: validationMessage,
+    };
+  }
+  if (effectiveFieldMode === "optional" && !hasInput) {
+    return {
+      maleGuestsCount: null,
+      femaleGuestsCount: null,
+    };
+  }
+  if (!hasInput) {
+    return {
+      error: guestCompositionRestrictionRuleRequiresInput(restrictionRule)
+        ? validationMessage
+        : "Guest composition must match guest count.",
+    };
+  }
+
+  if (totalGuests <= 0 || maleGuestsCount + femaleGuestsCount !== totalGuests) {
+    return {
+      error: "Guest composition must match guest count.",
+    };
+  }
+
+  let restricted = false;
+  switch (restrictionRule) {
+    case "male_only_groups_not_allowed":
+      restricted = maleGuestsCount > 0 && femaleGuestsCount === 0;
+      break;
+    case "female_only_groups_not_allowed":
+      restricted = femaleGuestsCount > 0 && maleGuestsCount === 0;
+      break;
+    case "at_least_1_female_required":
+      restricted = femaleGuestsCount < 1;
+      break;
+    case "couple_only":
+      restricted =
+        totalGuests % 2 !== 0 ||
+        maleGuestsCount !== femaleGuestsCount ||
+        maleGuestsCount < 1 ||
+        femaleGuestsCount < 1;
+      break;
+    case "custom_rule_later":
+    case "no_restriction":
+    default:
+      restricted = false;
+      break;
+  }
+
+  if (restricted) {
+    return {
+      error: validationMessage,
+    };
+  }
+
+  return {
+    maleGuestsCount,
+    femaleGuestsCount,
+  };
+}
+
 function normalizeDateInput(value) {
   const next = asText(value, "");
   if (!next) return null;
@@ -128,6 +290,18 @@ function sanitizeEventInput(payload = {}, { isPatch = false } = {}) {
     bank_transfer_instructions: asNullableText(payload.bank_transfer_instructions),
     status,
     free_concert: asBoolean(payload.free_concert, false),
+    guest_composition_enabled: asBoolean(payload.guest_composition_enabled, false),
+    guest_composition_field_mode: normalizeGuestCompositionFieldMode(
+      payload.guest_composition_field_mode,
+      asBoolean(payload.guest_composition_enabled, false) ? "optional" : "hidden"
+    ),
+    guest_composition_restriction_rule: normalizeGuestCompositionRestrictionRule(
+      payload.guest_composition_restriction_rule,
+      "no_restriction"
+    ),
+    guest_composition_validation_message: asNullableText(
+      payload.guest_composition_validation_message
+    ),
   };
 
   const areaAllocations = normalizeArray(payload.area_allocations).map((row) => ({
@@ -205,6 +379,22 @@ async function ensureConcertTables(pool) {
     ALTER TABLE concert_events
     ADD COLUMN IF NOT EXISTS free_concert BOOLEAN NOT NULL DEFAULT FALSE
   `);
+  await pool.query(`
+    ALTER TABLE concert_events
+    ADD COLUMN IF NOT EXISTS guest_composition_enabled BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+  await pool.query(`
+    ALTER TABLE concert_events
+    ADD COLUMN IF NOT EXISTS guest_composition_field_mode TEXT NOT NULL DEFAULT 'hidden'
+  `);
+  await pool.query(`
+    ALTER TABLE concert_events
+    ADD COLUMN IF NOT EXISTS guest_composition_restriction_rule TEXT NOT NULL DEFAULT 'no_restriction'
+  `);
+  await pool.query(`
+    ALTER TABLE concert_events
+    ADD COLUMN IF NOT EXISTS guest_composition_validation_message TEXT
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS concert_ticket_types (
@@ -255,6 +445,14 @@ async function ensureConcertTables(pool) {
   await pool.query(`
     ALTER TABLE concert_bookings
     ADD COLUMN IF NOT EXISTS cancellation_reason TEXT
+  `);
+  await pool.query(`
+    ALTER TABLE concert_bookings
+    ADD COLUMN IF NOT EXISTS male_guests_count INTEGER
+  `);
+  await pool.query(`
+    ALTER TABLE concert_bookings
+    ADD COLUMN IF NOT EXISTS female_guests_count INTEGER
   `);
   await pool.query(`
     ALTER TABLE orders
@@ -586,6 +784,16 @@ async function buildEventView(client, eventRow) {
     bank_transfer_instructions: eventRow.bank_transfer_instructions || "",
     status: normalizeEventStatus(eventRow.status, "active"),
     free_concert: Boolean(eventRow.free_concert),
+    guest_composition_enabled: Boolean(eventRow.guest_composition_enabled),
+    guest_composition_field_mode: normalizeGuestCompositionFieldMode(
+      eventRow.guest_composition_field_mode,
+      Boolean(eventRow.guest_composition_enabled) ? "optional" : "hidden"
+    ),
+    guest_composition_restriction_rule: normalizeGuestCompositionRestrictionRule(
+      eventRow.guest_composition_restriction_rule,
+      "no_restriction"
+    ),
+    guest_composition_validation_message: eventRow.guest_composition_validation_message || "",
     auto_sold_out: soldOutAuto,
     sold_ticket_count: bookedTickets,
     sold_table_count: bookedTables,
@@ -680,9 +888,16 @@ async function createEvent(pool, restaurantId, payload) {
         reservation_payment_method,
         bank_transfer_instructions,
         status,
-        free_concert
+        free_concert,
+        guest_composition_enabled,
+        guest_composition_field_mode,
+        guest_composition_restriction_rule,
+        guest_composition_validation_message
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'bank_transfer', $11, $12, $13)
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+        'bank_transfer', $11, $12, $13, $14, $15, $16, $17
+      )
       RETURNING id
       `,
       [
@@ -699,6 +914,10 @@ async function createEvent(pool, restaurantId, payload) {
         clean.bank_transfer_instructions,
         clean.status,
         clean.free_concert,
+        clean.guest_composition_enabled,
+        clean.guest_composition_field_mode,
+        clean.guest_composition_restriction_rule,
+        clean.guest_composition_validation_message,
       ]
     );
     const eventId = inserted.rows[0].id;
@@ -746,6 +965,10 @@ async function updateEvent(pool, restaurantId, eventId, payload) {
           bank_transfer_instructions = $12,
           status = $13,
           free_concert = $14,
+          guest_composition_enabled = $15,
+          guest_composition_field_mode = $16,
+          guest_composition_restriction_rule = $17,
+          guest_composition_validation_message = $18,
           updated_at = NOW()
       WHERE restaurant_id = $1
         AND id = $2
@@ -765,6 +988,10 @@ async function updateEvent(pool, restaurantId, eventId, payload) {
         clean.bank_transfer_instructions,
         clean.status,
         clean.free_concert,
+        clean.guest_composition_enabled,
+        clean.guest_composition_field_mode,
+        clean.guest_composition_restriction_rule,
+        clean.guest_composition_validation_message,
       ]
     );
 
@@ -1167,6 +1394,18 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
     if (bookingType === "table") {
       quantity = guestsCount;
     }
+    const guestCompositionValidation = validateConcertGuestComposition({
+      eventRow,
+      bookingType,
+      guestsCount,
+      rawPayload,
+    });
+    if (guestCompositionValidation?.error) {
+      await client.query("ROLLBACK");
+      return { status: 400, error: guestCompositionValidation.error };
+    }
+    const maleGuestsCount = guestCompositionValidation?.maleGuestsCount ?? null;
+    const femaleGuestsCount = guestCompositionValidation?.femaleGuestsCount ?? null;
 
     let areaAllocationRow = null;
     if (areaName) {
@@ -1364,6 +1603,8 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         customer_name,
         customer_phone,
         customer_note,
+        male_guests_count,
+        female_guests_count,
         payment_method,
         payment_status,
         booking_status,
@@ -1373,8 +1614,8 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
       )
       VALUES (
         $1, $2, $3, $4, $5, $6, $7,
-        $8, $9, $10, $11, $12,
-        $13, $14, 'pending', $15, $16, NOW()
+        $8, $9, $10, $11, $12, $13, $14,
+        $15, $16, 'pending', $17, $18, NOW()
       )
       RETURNING *
       `,
@@ -1391,6 +1632,8 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         customerName,
         customerPhone,
         customerNote || null,
+        bookingType === "table" ? maleGuestsCount : null,
+        bookingType === "table" ? femaleGuestsCount : null,
         paymentMethod,
         paymentStatus,
         linkedOrder?.id || null,
@@ -1599,6 +1842,9 @@ function mapBookingResponse(row) {
     booking_type: normalizeBookingType(row.booking_type),
     quantity: asInt(row.quantity, 0),
     guests_count: row.guests_count == null ? null : asInt(row.guests_count, 0),
+    male_guests_count: row.male_guests_count == null ? null : asInt(row.male_guests_count, 0),
+    female_guests_count:
+      row.female_guests_count == null ? null : asInt(row.female_guests_count, 0),
     unit_price: asMoney(row.unit_price, 0),
     total_amount: asMoney(row.total_amount, 0),
     customer_name: row.customer_name || "",

@@ -1215,6 +1215,164 @@ async function getQrMenuCustomization(restaurantId) {
   }
 }
 
+function parseReservationGuestCompositionValue(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function hasReservationGuestCompositionValue(value) {
+  return value !== undefined && value !== null && String(value).trim() !== "";
+}
+
+function normalizeReservationGuestCompositionFieldMode(value, fallback = "hidden") {
+  const normalized = String(value || fallback).trim().toLowerCase();
+  return ["hidden", "optional", "required"].includes(normalized) ? normalized : fallback;
+}
+
+function normalizeReservationGuestCompositionRestrictionRule(
+  value,
+  fallback = "no_restriction"
+) {
+  const normalized = String(value || fallback).trim().toLowerCase();
+  return [
+    "no_restriction",
+    "male_only_groups_not_allowed",
+    "female_only_groups_not_allowed",
+    "at_least_1_female_required",
+    "couple_only",
+    "custom_rule_later",
+  ].includes(normalized)
+    ? normalized
+    : fallback;
+}
+
+function getDefaultReservationGuestCompositionMessage(rule) {
+  switch (normalizeReservationGuestCompositionRestrictionRule(rule)) {
+    case "male_only_groups_not_allowed":
+      return "Male-only groups are not allowed for this reservation.";
+    case "female_only_groups_not_allowed":
+      return "Female-only groups are not allowed for this reservation.";
+    case "at_least_1_female_required":
+      return "At least 1 female guest is required for this reservation.";
+    case "couple_only":
+      return "Only mixed couples with equal men and women are allowed for this reservation.";
+    default:
+      return "Guest composition does not match the reservation policy.";
+  }
+}
+
+function reservationRestrictionRuleRequiresInput(rule) {
+  const normalized = normalizeReservationGuestCompositionRestrictionRule(
+    rule,
+    "no_restriction"
+  );
+  return [
+    "male_only_groups_not_allowed",
+    "female_only_groups_not_allowed",
+    "at_least_1_female_required",
+    "couple_only",
+  ].includes(normalized);
+}
+
+function validateReservationGuestComposition({
+  config,
+  guestCount,
+  reservationMen,
+  reservationWomen,
+}) {
+  const enabled = Boolean(config?.reservation_guest_composition_enabled);
+  const restrictionRule = normalizeReservationGuestCompositionRestrictionRule(
+    config?.reservation_guest_composition_restriction_rule,
+    "no_restriction"
+  );
+  const fieldMode = normalizeReservationGuestCompositionFieldMode(
+    config?.reservation_guest_composition_field_mode,
+    enabled ? "optional" : "hidden"
+  );
+  const effectiveFieldMode = reservationRestrictionRuleRequiresInput(restrictionRule)
+    ? "required"
+    : fieldMode;
+  if (!enabled || effectiveFieldMode === "hidden") {
+    return {
+      reservationMenCount: null,
+      reservationWomenCount: null,
+    };
+  }
+
+  const hasInput =
+    hasReservationGuestCompositionValue(reservationMen) ||
+    hasReservationGuestCompositionValue(reservationWomen);
+  const totalGuests = parseReservationGuestCompositionValue(guestCount);
+  const validationMessage =
+    String(config?.reservation_guest_composition_validation_message || "").trim() ||
+    getDefaultReservationGuestCompositionMessage(restrictionRule);
+  if (restrictionRule === "couple_only" && totalGuests > 0 && totalGuests % 2 !== 0) {
+    return {
+      error: validationMessage,
+    };
+  }
+  if (effectiveFieldMode === "optional" && !hasInput) {
+    return {
+      reservationMenCount: null,
+      reservationWomenCount: null,
+    };
+  }
+  if (!hasInput) {
+    return {
+      error: reservationRestrictionRuleRequiresInput(restrictionRule)
+        ? validationMessage
+        : "Guest composition must match guest count.",
+    };
+  }
+
+  const reservationMenCount = parseReservationGuestCompositionValue(reservationMen);
+  const reservationWomenCount = parseReservationGuestCompositionValue(reservationWomen);
+  if (
+    totalGuests <= 0 ||
+    reservationMenCount + reservationWomenCount !== totalGuests
+  ) {
+    return {
+      error: "Guest composition must match guest count.",
+    };
+  }
+
+  let blocked = false;
+  switch (restrictionRule) {
+    case "male_only_groups_not_allowed":
+      blocked = reservationMenCount > 0 && reservationWomenCount === 0;
+      break;
+    case "female_only_groups_not_allowed":
+      blocked = reservationWomenCount > 0 && reservationMenCount === 0;
+      break;
+    case "at_least_1_female_required":
+      blocked = reservationWomenCount < 1;
+      break;
+    case "couple_only":
+      blocked =
+        totalGuests % 2 !== 0 ||
+        reservationMenCount !== reservationWomenCount ||
+        reservationMenCount < 1 ||
+        reservationWomenCount < 1;
+      break;
+    case "custom_rule_later":
+    case "no_restriction":
+    default:
+      blocked = false;
+      break;
+  }
+
+  if (blocked) {
+    return {
+      error: validationMessage,
+    };
+  }
+
+  return {
+    reservationMenCount,
+    reservationWomenCount,
+  };
+}
+
 function haversineMeters(lat1, lng1, lat2, lng2) {
   const toRad = (deg) => (deg * Math.PI) / 180;
   const dLat = toRad(lat2 - lat1);
@@ -1342,6 +1500,30 @@ async function ensureTakeawayFields() {
   } catch (err) {
     console.warn("⚠️ Unable to ensure takeaway columns:", err.message);
     ordersHasTakeawayFields = false;
+    return false;
+  }
+}
+
+let ordersHasReservationGuestCompositionFields = null;
+async function ensureReservationGuestCompositionFields() {
+  if (ordersHasReservationGuestCompositionFields === true) return true;
+  try {
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS reservation_men INTEGER`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS reservation_women INTEGER`
+    );
+    ordersHasReservationGuestCompositionFields = true;
+    return true;
+  } catch (err) {
+    console.warn(
+      "⚠️ Unable to ensure reservation guest composition columns:",
+      err.message
+    );
+    ordersHasReservationGuestCompositionFields = false;
     return false;
   }
 }
@@ -6143,6 +6325,8 @@ router.post("/reservations", async (req, res) => {
     reservation_date,
     reservation_time,
     reservation_clients,
+    reservation_men,
+    reservation_women,
     reservation_notes,
     order_id,
     table_number,
@@ -6155,6 +6339,8 @@ router.post("/reservations", async (req, res) => {
   const normalizedCustomerEmail = normalizeCustomerEmail(customer_email);
 
   try {
+    await ensureReservationGuestCompositionFields();
+
     // Validate required fields
     if (!reservation_date || !reservation_time) {
       return res.status(400).json({ error: "Reservation date and time are required" });
@@ -6162,6 +6348,16 @@ router.post("/reservations", async (req, res) => {
 
     const clientCount = parseInt(reservation_clients) || 0;
     const notes = (reservation_notes || "").trim();
+    const qrCustomization = await getQrMenuCustomization(restaurantId);
+    const guestCompositionValidation = validateReservationGuestComposition({
+      config: qrCustomization,
+      guestCount: clientCount,
+      reservationMen: reservation_men,
+      reservationWomen: reservation_women,
+    });
+    if (guestCompositionValidation?.error) {
+      return res.status(400).json({ error: guestCompositionValidation.error });
+    }
 
     const createStandaloneReservationForTable = async ({
       resolvedTableNumber,
@@ -6180,10 +6376,12 @@ router.post("/reservations", async (req, res) => {
           reservation_date,
           reservation_time,
           reservation_clients,
+          reservation_men,
+          reservation_women,
           reservation_notes,
           created_at
         )
-        VALUES ($1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, $7, $8, NOW())
+        VALUES ($1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         RETURNING *`,
         [
           restaurantId,
@@ -6193,6 +6391,8 @@ router.post("/reservations", async (req, res) => {
           reservation_date,
           reservation_time,
           clientCount,
+          reservation_men == null ? null : Number(reservation_men) || 0,
+          reservation_women == null ? null : Number(reservation_women) || 0,
           notes,
         ]
       );
@@ -6301,10 +6501,12 @@ router.post("/reservations", async (req, res) => {
          SET reservation_date = $1,
              reservation_time = $2,
              reservation_clients = $3,
-             reservation_notes = $4,
-             table_number = COALESCE($5::int, table_number),
-             customer_name = COALESCE($6::text, customer_name),
-             customer_phone = COALESCE($7::text, customer_phone),
+             reservation_men = $4,
+             reservation_women = $5,
+             reservation_notes = $6,
+             table_number = COALESCE($7::int, table_number),
+             customer_name = COALESCE($8::text, customer_name),
+             customer_phone = COALESCE($9::text, customer_phone),
              order_type = CASE
                WHEN LOWER(COALESCE(order_type,'')) = 'reservation' THEN 'table'
                ELSE COALESCE(order_type, 'table')
@@ -6315,12 +6517,14 @@ router.post("/reservations", async (req, res) => {
                ELSE COALESCE(status, 'reserved')
              END,
              updated_at = NOW()
-         WHERE restaurant_id = $8 AND id = $9
+         WHERE restaurant_id = $10 AND id = $11
          RETURNING *`,
         [
           reservation_date,
           reservation_time,
           clientCount,
+          reservation_men == null ? null : Number(reservation_men) || 0,
+          reservation_women == null ? null : Number(reservation_women) || 0,
           notes,
           safeTableNumber,
           safeCustomerName,
@@ -6386,6 +6590,8 @@ router.get("/reservations", async (req, res) => {
   const { start_date, end_date, table_number } = req.query;
 
   try {
+    await ensureReservationGuestCompositionFields();
+
     // Fire-and-forget, throttled to avoid opening extra DB connections on every poll.
     scheduleCloseStaleReservations(restaurantId);
 
@@ -6396,6 +6602,8 @@ router.get("/reservations", async (req, res) => {
         reservation_date,
         reservation_time,
         reservation_clients,
+        reservation_men,
+        reservation_women,
         reservation_notes,
         status,
         order_type,
@@ -6472,11 +6680,20 @@ router.get("/reservations", async (req, res) => {
 // ✅ PUT /reservations/:id - Update an existing reservation
 router.put("/reservations/:id", async (req, res) => {
   const { id } = req.params;
-  const { reservation_date, reservation_time, reservation_clients, reservation_notes } = req.body;
+  const {
+    reservation_date,
+    reservation_time,
+    reservation_clients,
+    reservation_men,
+    reservation_women,
+    reservation_notes,
+  } = req.body;
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
 
   try {
+    await ensureReservationGuestCompositionFields();
+
     // Build dynamic UPDATE query
     const updates = [];
     const params = [];
@@ -6495,6 +6712,18 @@ router.put("/reservations/:id", async (req, res) => {
     if (reservation_clients !== undefined) {
       updates.push(`reservation_clients = $${paramIdx++}::integer`);
       params.push(parseInt(reservation_clients) || 0);
+    }
+
+    if (reservation_men !== undefined) {
+      updates.push(`reservation_men = $${paramIdx++}::integer`);
+      params.push(reservation_men === null || reservation_men === "" ? null : parseInt(reservation_men) || 0);
+    }
+
+    if (reservation_women !== undefined) {
+      updates.push(`reservation_women = $${paramIdx++}::integer`);
+      params.push(
+        reservation_women === null || reservation_women === "" ? null : parseInt(reservation_women) || 0
+      );
     }
 
     if (reservation_notes !== undefined) {
@@ -6546,6 +6775,8 @@ router.get("/reservations/:id", async (req, res) => {
   if (!restaurantId) return;
 
   try {
+    await ensureReservationGuestCompositionFields();
+
     const result = await pool.query(
       `SELECT
         id,
@@ -6553,6 +6784,8 @@ router.get("/reservations/:id", async (req, res) => {
         reservation_date,
         reservation_time,
         reservation_clients,
+        reservation_men,
+        reservation_women,
         reservation_notes,
         status,
         order_type,
@@ -6591,6 +6824,8 @@ const emitReservationStateUpdate = (restaurantId, reservationOrder, extraPayload
     reservation_date: reservationOrder.reservation_date,
     reservation_time: reservationOrder.reservation_time,
     reservation_clients: reservationOrder.reservation_clients,
+    reservation_men: reservationOrder.reservation_men ?? null,
+    reservation_women: reservationOrder.reservation_women ?? null,
     reservation_notes: reservationOrder.reservation_notes,
     customer_name: reservationOrder.customer_name || null,
     customer_phone: reservationOrder.customer_phone || null,
@@ -6613,6 +6848,8 @@ const emitReservationCreated = (restaurantId, reservationOrder, extraPayload = {
     reservation_date: reservationOrder.reservation_date,
     reservation_time: reservationOrder.reservation_time,
     reservation_clients: reservationOrder.reservation_clients,
+    reservation_men: reservationOrder.reservation_men ?? null,
+    reservation_women: reservationOrder.reservation_women ?? null,
     reservation_notes: reservationOrder.reservation_notes,
     customer_name: reservationOrder.customer_name || null,
     customer_phone: reservationOrder.customer_phone || null,
@@ -6825,11 +7062,20 @@ router.delete("/reservations/:id", async (req, res) => {
 // ✅ POST /orders/:id/reservations - Mobile app route to create reservation for an order
 router.post("/:id/reservations", async (req, res) => {
   const { id } = req.params;
-  const { reservation_date, reservation_time, reservation_clients, reservation_notes } = req.body;
+  const {
+    reservation_date,
+    reservation_time,
+    reservation_clients,
+    reservation_men,
+    reservation_women,
+    reservation_notes,
+  } = req.body;
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
 
   try {
+    await ensureReservationGuestCompositionFields();
+
     if (!reservation_date || !reservation_time) {
       return res.status(400).json({ error: "Reservation date and time are required" });
     }
@@ -6844,11 +7090,22 @@ router.post("/:id/reservations", async (req, res) => {
        SET reservation_date = $1, 
            reservation_time = $2, 
            reservation_clients = $3, 
-           reservation_notes = $4,
+           reservation_men = $4,
+           reservation_women = $5,
+           reservation_notes = $6,
            updated_at = NOW()
-       WHERE id = $5 AND restaurant_id = $6
-       RETURNING id, reservation_date, reservation_time, reservation_clients, reservation_notes`,
-      [dateStr, timeStr, clientCount, notes, id, restaurantId]
+       WHERE id = $7 AND restaurant_id = $8
+       RETURNING id, reservation_date, reservation_time, reservation_clients, reservation_men, reservation_women, reservation_notes`,
+      [
+        dateStr,
+        timeStr,
+        clientCount,
+        reservation_men === null || reservation_men === "" ? null : parseInt(reservation_men) || 0,
+        reservation_women === null || reservation_women === "" ? null : parseInt(reservation_women) || 0,
+        notes,
+        id,
+        restaurantId,
+      ]
     );
 
     if (result.rows.length === 0) {
@@ -6868,11 +7125,20 @@ router.post("/:id/reservations", async (req, res) => {
 // ✅ PUT /orders/:id/reservations - Mobile app route to update reservation for an order
 router.put("/:id/reservations", async (req, res) => {
   const { id } = req.params;
-  const { reservation_date, reservation_time, reservation_clients, reservation_notes } = req.body;
+  const {
+    reservation_date,
+    reservation_time,
+    reservation_clients,
+    reservation_men,
+    reservation_women,
+    reservation_notes,
+  } = req.body;
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
 
   try {
+    await ensureReservationGuestCompositionFields();
+
     if (!reservation_date || !reservation_time) {
       return res.status(400).json({ error: "Reservation date and time are required" });
     }
@@ -6887,11 +7153,22 @@ router.put("/:id/reservations", async (req, res) => {
        SET reservation_date = $1, 
            reservation_time = $2, 
            reservation_clients = $3, 
-           reservation_notes = $4,
+           reservation_men = $4,
+           reservation_women = $5,
+           reservation_notes = $6,
            updated_at = NOW()
-       WHERE id = $5 AND restaurant_id = $6
-       RETURNING id, reservation_date, reservation_time, reservation_clients, reservation_notes`,
-      [dateStr, timeStr, clientCount, notes, id, restaurantId]
+       WHERE id = $7 AND restaurant_id = $8
+       RETURNING id, reservation_date, reservation_time, reservation_clients, reservation_men, reservation_women, reservation_notes`,
+      [
+        dateStr,
+        timeStr,
+        clientCount,
+        reservation_men === null || reservation_men === "" ? null : parseInt(reservation_men) || 0,
+        reservation_women === null || reservation_women === "" ? null : parseInt(reservation_women) || 0,
+        notes,
+        id,
+        restaurantId,
+      ]
     );
 
     if (result.rows.length === 0) {
