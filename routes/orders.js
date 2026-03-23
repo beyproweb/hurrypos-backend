@@ -3981,7 +3981,6 @@ router.post("/:id/close", async (req, res) => {
          customer_phone,
          kitchen_delivered_at,
          external_source,
-         order_origin,
          payment_method,
          reservation_date,
          reservation_time,
