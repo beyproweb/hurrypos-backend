@@ -540,6 +540,13 @@ const sendEmail = async (...args) => {
         data: truncateForLog(result?.data),
       },
     });
+    return {
+      ok: true,
+      provider: strategy,
+      to: recipientsTo,
+      subject: parsed.subject,
+      result,
+    };
   } catch (error) {
     const details = summarizeAxiosError(error);
     console.error("[email] send failed", {
@@ -549,6 +556,13 @@ const sendEmail = async (...args) => {
       error: details,
     });
     if (parsed.options && parsed.options.throwOnError) throw error;
+    return {
+      ok: false,
+      provider: strategy,
+      to: recipientsTo,
+      subject: parsed.subject,
+      error: details,
+    };
   }
 };
 

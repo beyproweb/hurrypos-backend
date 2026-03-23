@@ -10,6 +10,7 @@ const {
   listAvailableTablesForEvent,
   mapBookingResponse,
 } = require("../utils/concertsService");
+const { sendConcertOwnerReservationNotificationEmail } = require("../utils/customerConfirmationEmail");
 
 router.get("/:identifier/events", async (req, res) => {
   const identifier = String(req.params.identifier || "").trim();
@@ -126,6 +127,27 @@ router.post("/:identifier/events/:eventId/bookings", async (req, res) => {
         reservation_time: result.data.reservation.reservation_time,
       });
     }
+    console.log("[owner-reservation-email] route.trigger.start", {
+      source: "public_concerts.bookings.create",
+      reservationType: "concert",
+      bookingId: Number(result.data?.booking?.id),
+      restaurantId,
+    });
+    const ownerNotificationResult = await sendConcertOwnerReservationNotificationEmail({
+      pool,
+      restaurantId,
+      bookingId: Number(result.data?.booking?.id),
+      explicitCustomerEmail: req.body?.customer_email || req.body?.email || "",
+      triggeredFrom: "public_concerts.bookings.create",
+      req,
+    });
+    console.log("[owner-reservation-email] route.trigger.result", {
+      source: "public_concerts.bookings.create",
+      reservationType: "concert",
+      bookingId: Number(result.data?.booking?.id),
+      restaurantId,
+      result: ownerNotificationResult,
+    });
 
     const bookingResponse = mapBookingResponse(result.data.booking || {});
     res.status(result.status).json({

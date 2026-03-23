@@ -4,6 +4,7 @@ module.exports = function (io) {
   const { pool } = require("../db");
   const authMiddleware = require("../middleware/authMiddleware");
   const { emitOrderUpdate, emitDriverOnRoad } = require("../utils/realtime");
+  const { sendOrderCustomerDeliveredEmail } = require("../utils/customerConfirmationEmail");
   const {
     buildDriverLocationKey,
     getDriverLocation,
@@ -12,6 +13,7 @@ module.exports = function (io) {
   } = require("../utils/driverLocationStore");
   let ordersColumnSetCache = null;
   let ordersColumnSetPromise = null;
+  const QR_ORDER_ORIGIN_DELIVERY = "qr_menu_delivery";
 
   async function getOrdersColumnSet() {
     if (ordersColumnSetCache) return ordersColumnSetCache;
@@ -56,7 +58,7 @@ module.exports = function (io) {
 
       // Fetch order details for notification
       const orderResult = await pool.query(
-        `SELECT id, customer_name, order_type FROM orders WHERE restaurant_id = $1 AND id = $2`,
+        `SELECT id, customer_name, order_type, order_origin FROM orders WHERE restaurant_id = $1 AND id = $2`,
         [restaurantId, id]
       );
       const order = orderResult.rows[0];
@@ -75,6 +77,21 @@ module.exports = function (io) {
         });
       }
 
+      if (
+        driver_status === "delivered" &&
+        order &&
+        ["packet", "delivery", "online"].includes(String(order?.order_type || "").toLowerCase()) &&
+        String(order?.order_origin || "").toLowerCase() === QR_ORDER_ORIGIN_DELIVERY
+      ) {
+        await sendOrderCustomerDeliveredEmail({
+          pool,
+          restaurantId,
+          orderId: Number(id),
+          triggeredFrom: "drivers.driver_status.delivered.qr_delivery",
+          req,
+        });
+      }
+
       emitOrderUpdate(io, restaurantId);
       res.json({ success: true });
     } catch (err) {
@@ -89,8 +106,9 @@ module.exports = function (io) {
     const restaurantId = req.user.restaurant_id;
     try {
       await pool.query(
-        `UPDATE orders SET status = 'closed'
-         WHERE restaurant_id = $1 AND id = $2`,
+        `UPDATE orders
+            SET status = 'closed'
+          WHERE restaurant_id = $1 AND id = $2`,
         [restaurantId, id]
       );
       emitOrderUpdate(io, restaurantId);

@@ -27,6 +27,10 @@ module.exports = function(io) {
   const {
     CONFIRMATION_TYPES,
     sendOrderCustomerConfirmationEmail,
+    sendOrderCustomerDeliveredEmail,
+    sendOrderCustomerCancellationEmail,
+    sendTableReservationOwnerNotificationEmail,
+    sendDeliveryOwnerOrderNotificationEmail,
   } = require("../utils/customerConfirmationEmail");
   const { attachAllowedModules } = require("../middleware/moduleGuard");
   const DEFAULT_TZ = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
@@ -346,6 +350,22 @@ module.exports = function(io) {
         mode === "delivery"
     );
   };
+
+  const QR_ORDER_ORIGIN_DELIVERY = "qr_menu_delivery";
+
+  const resolveQrOrderOrigin = (req, orderType) => {
+    if (!isQrMenuRequest(req)) return null;
+    const normalizedOrderType = String(orderType || "").trim().toLowerCase();
+    if (["packet", "delivery", "online"].includes(normalizedOrderType)) {
+      return QR_ORDER_ORIGIN_DELIVERY;
+    }
+    if (normalizedOrderType === "takeaway") return "qr_menu_pickup";
+    if (["table", "reservation"].includes(normalizedOrderType)) return "qr_menu_table";
+    return "qr_menu";
+  };
+
+  const isQrDeliveryOrder = (order = {}) =>
+    String(order?.order_origin || "").trim().toLowerCase() === QR_ORDER_ORIGIN_DELIVERY;
 
   const sendExternalPreparationCompleted = async ({ orderId }) => {
     if (!orderId) return { skipped: true, reason: "missing_order_id" };
@@ -2319,6 +2339,7 @@ router.post("/", async (req, res) => {
     const hasItems = Array.isArray(items) && items.length > 0;
     // Default to confirmed so tables remain actionable even before items are added
     const initialStatus = "confirmed";
+    const orderOrigin = resolveQrOrderOrigin(req, order_type);
 
     let createdBy = null;
     if (hasCreatedByColumn && req.user?.id) {
@@ -2547,6 +2568,7 @@ router.post("/", async (req, res) => {
       "status",
       "total",
       "order_type",
+      "order_origin",
       "customer_name",
       "customer_phone",
       "customer_address",
@@ -2563,6 +2585,7 @@ router.post("/", async (req, res) => {
       initialStatus,
       total,
       order_type || null,
+      orderOrigin,
       customer_name || null,
       customer_phone || null,
       customer_address || null,
@@ -2700,6 +2723,17 @@ if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
           req,
         });
       }
+    }
+
+    if (orderOrigin === QR_ORDER_ORIGIN_DELIVERY) {
+      await sendDeliveryOwnerOrderNotificationEmail({
+        pool,
+        restaurantId,
+        orderId: Number(order.id),
+        explicitCustomerEmail: normalizedCustomerEmail,
+        triggeredFrom: "orders.create.qr_delivery_owner",
+        req,
+      });
     }
 
     // 🔥 If the order was created WITH items, emit a full payload for auto-print
@@ -3253,8 +3287,9 @@ router.put("/:id/status", async (req, res) => {
       });
     }
 
-    // Keep QR delivery/pickup flow unchanged.
-    if (isQrMenuRequest(req) && statusTransitionedToConfirmed) {
+    // Keep QR menu confirmation emails working both for immediate QR requests
+    // and for later staff confirmations of persisted QR delivery orders.
+    if ((isQrMenuRequest(req) || isQrDeliveryOrder(updatedOrder)) && statusTransitionedToConfirmed) {
       const confirmationType =
         normalizedOrderType === "takeaway"
           ? CONFIRMATION_TYPES.PICKUP_ORDER
@@ -3946,6 +3981,7 @@ router.post("/:id/close", async (req, res) => {
          customer_phone,
          kitchen_delivered_at,
          external_source,
+         order_origin,
          payment_method,
          reservation_date,
          reservation_time,
@@ -4282,7 +4318,7 @@ router.patch("/:id/cancel", async (req, res) => {
       await client.query("BEGIN");
 
       const { rows: orderRows } = await client.query(
-        `SELECT id, total, status
+        `SELECT id, total, status, order_type, order_origin
          FROM orders
          WHERE restaurant_id = $1 AND id = $2
          FOR UPDATE`,
@@ -4520,6 +4556,21 @@ router.patch("/:id/cancel", async (req, res) => {
         ? await sendExternalOrderRejection({ orderId, reason })
         : { skipped: true, reason: "order_not_cancelled" };
 
+      if (
+        orderNowCancelled &&
+        isQrDeliveryOrder(orderRows[0]) &&
+        ["packet", "delivery", "online"].includes(String(orderRows[0]?.order_type || "").toLowerCase())
+      ) {
+        await sendOrderCustomerCancellationEmail({
+          pool,
+          restaurantId,
+          orderId,
+          confirmationType: CONFIRMATION_TYPES.DELIVERY_ORDER_CANCELLED,
+          triggeredFrom: "orders.cancel.partial.qr_delivery",
+          req,
+        });
+      }
+
       return res.json({
         ok: true,
         partial: true,
@@ -4541,11 +4592,11 @@ router.patch("/:id/cancel", async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE orders
-         SET status = 'cancelled',
+       SET status = 'cancelled',
              cancellation_reason = NULLIF($1, ''),
              cancelled_at = NOW()
        WHERE restaurant_id = $2 AND id = $3 AND status <> 'cancelled'
-       RETURNING id, table_number`,
+       RETURNING id, table_number, order_type, order_origin`,
       [reason, restaurantId, orderId]
     );
 
@@ -4562,6 +4613,19 @@ router.patch("/:id/cancel", async (req, res) => {
     }
 
     const externalSync = await sendExternalOrderRejection({ orderId, reason });
+    if (
+      isQrDeliveryOrder(rows[0]) &&
+      ["packet", "delivery", "online"].includes(String(rows[0]?.order_type || "").toLowerCase())
+    ) {
+      await sendOrderCustomerCancellationEmail({
+        pool,
+        restaurantId,
+        orderId,
+        confirmationType: CONFIRMATION_TYPES.DELIVERY_ORDER_CANCELLED,
+        triggeredFrom: "orders.cancel.full.qr_delivery",
+        req,
+      });
+    }
     return res.json({
       ok: true,
       orderId,
@@ -5844,7 +5908,8 @@ router.patch("/:id/driver-status", async (req, res) => {
          external_id,
          external_expedition_type,
          customer_address,
-         order_type
+         order_type,
+         order_origin
        FROM orders WHERE restaurant_id = $1 AND id = $2`,
       [req.user.restaurant_id, id]
     );
@@ -5915,6 +5980,18 @@ router.patch("/:id/driver-status", async (req, res) => {
       // Middleware supports: order_accepted / order_rejected / order_picked_up (+ preparation-completed).
       // A "delivered" signal should come from platform logistics (when supported).
       dlog(`✅ Driver marked order as DELIVERED - no external sync performed`);
+      if (
+        isQrDeliveryOrder(order) &&
+        ["packet", "delivery", "online"].includes(String(order?.order_type || "").toLowerCase())
+      ) {
+        await sendOrderCustomerDeliveredEmail({
+          pool,
+          restaurantId: req.user.restaurant_id,
+          orderId: Number(id),
+          triggeredFrom: "orders.driver_status.delivered.qr_delivery",
+          req,
+        });
+      }
       if (isYsOrder) {
         emitYsOrderStatus(req.user.restaurant_id, Number(id), "delivered", {});
       }
@@ -6224,6 +6301,17 @@ try {
 if (typeof emitOrderUpdate === "function") emitOrderUpdate(ioRef, restaurantId);
 else ioRef.to(`restaurant_${restaurantId}`).emit("orders_updated");
 
+  if (isQrDeliveryOrder(order)) {
+    await sendOrderCustomerConfirmationEmail({
+      pool,
+      restaurantId,
+      orderId: Number(id),
+      confirmationType: CONFIRMATION_TYPES.DELIVERY_ORDER,
+      triggeredFrom: "orders.confirm_online.qr_delivery",
+      req,
+    });
+  }
+
   if (String(order.external_source || "").toLowerCase() === "yemeksepeti") {
     emitYsOrderStatus(restaurantId, Number(id), "accepted", {});
   }
@@ -6419,6 +6507,27 @@ router.post("/reservations", async (req, res) => {
       }
 
       emitReservationCreated(restaurantId, reservation);
+      console.log("[owner-reservation-email] route.trigger.start", {
+        source: "orders.reservations.create.table",
+        reservationType: "table",
+        reservationId: Number(reservation.id),
+        restaurantId,
+      });
+      const ownerNotificationResult = await sendTableReservationOwnerNotificationEmail({
+        pool,
+        restaurantId,
+        reservationId: Number(reservation.id),
+        explicitCustomerEmail: normalizedCustomerEmail,
+        triggeredFrom: "orders.reservations.create.table",
+        req,
+      });
+      console.log("[owner-reservation-email] route.trigger.result", {
+        source: "orders.reservations.create.table",
+        reservationType: "table",
+        reservationId: Number(reservation.id),
+        restaurantId,
+        result: ownerNotificationResult,
+      });
 
       return res.json({
         success: true,
@@ -6554,6 +6663,27 @@ router.post("/reservations", async (req, res) => {
 
       emitReservationCreated(restaurantId, result.rows[0], {
         order_id: sourceOrderId,
+      });
+      console.log("[owner-reservation-email] route.trigger.start", {
+        source: "orders.reservations.create.order",
+        reservationType: "table",
+        reservationId: Number(result.rows[0].id),
+        restaurantId,
+      });
+      const ownerNotificationResult = await sendTableReservationOwnerNotificationEmail({
+        pool,
+        restaurantId,
+        reservationId: Number(result.rows[0].id),
+        explicitCustomerEmail: normalizedCustomerEmail,
+        triggeredFrom: "orders.reservations.create.order",
+        req,
+      });
+      console.log("[owner-reservation-email] route.trigger.result", {
+        source: "orders.reservations.create.order",
+        reservationType: "table",
+        reservationId: Number(result.rows[0].id),
+        restaurantId,
+        result: ownerNotificationResult,
       });
 
       return res.json({
@@ -6993,6 +7123,29 @@ router.delete("/reservations/:id", async (req, res) => {
   ).trim();
 
   try {
+    const snapshotResult = await pool.query(
+      `
+      SELECT
+        id,
+        order_number,
+        customer_name,
+        customer_phone,
+        reservation_date,
+        reservation_time,
+        reservation_clients,
+        reservation_notes,
+        table_number,
+        cancellation_reason,
+        cancelled_at,
+        updated_at
+      FROM orders
+      WHERE restaurant_id = $1
+        AND id = $2
+      LIMIT 1
+      `,
+      [restaurantId, Number(id)]
+    );
+    const reservationSnapshot = snapshotResult.rows?.[0] || null;
     const result = await pool.query(
       `UPDATE orders o
        SET reservation_date = NULL,
@@ -7047,6 +7200,19 @@ router.delete("/reservations/:id", async (req, res) => {
     };
     io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", payload);
     io.to(`restaurant_${restaurantId}`).emit("reservation_deleted", payload);
+
+    await sendOrderCustomerCancellationEmail({
+      pool,
+      restaurantId,
+      orderId: Number(cancelledReservation.id),
+      triggeredFrom: "orders.reservations.cancelled",
+      req,
+      orderSnapshot: {
+        ...(reservationSnapshot || {}),
+        cancellation_reason: deleteReason || reservationSnapshot?.cancellation_reason || null,
+        cancelled_at: new Date(),
+      },
+    });
 
     res.json({
       success: true,
@@ -7200,6 +7366,29 @@ router.delete("/:id/reservations", async (req, res) => {
   }
 
   try {
+    const snapshotResult = await pool.query(
+      `
+      SELECT
+        id,
+        order_number,
+        customer_name,
+        customer_phone,
+        reservation_date,
+        reservation_time,
+        reservation_clients,
+        reservation_notes,
+        table_number,
+        cancellation_reason,
+        cancelled_at,
+        updated_at
+      FROM orders
+      WHERE restaurant_id = $1
+        AND id = $2
+      LIMIT 1
+      `,
+      [restaurantId, orderId]
+    );
+    const reservationSnapshot = snapshotResult.rows?.[0] || null;
     const { rows } = await pool.query(
       `SELECT id, status, order_type, total
          FROM orders
@@ -7261,6 +7450,19 @@ router.delete("/:id/reservations", async (req, res) => {
       io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", reservationPayload);
       io.to(`restaurant_${restaurantId}`).emit("reservation_deleted", reservationPayload);
     }
+
+    await sendOrderCustomerCancellationEmail({
+      pool,
+      restaurantId,
+      orderId,
+      triggeredFrom: "orders.order_reservations.cancelled",
+      req,
+      orderSnapshot: {
+        ...(reservationSnapshot || {}),
+        cancellation_reason: shouldClose ? deleteReason || reservationSnapshot?.cancellation_reason || null : reservationSnapshot?.cancellation_reason || null,
+        cancelled_at: new Date(),
+      },
+    });
 
     return res.json({
       success: true,

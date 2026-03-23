@@ -16,7 +16,11 @@ const {
   updateBookingPaymentStatus,
   mapBookingResponse,
 } = require("../utils/concertsService");
-const { sendConcertCustomerConfirmationEmail } = require("../utils/customerConfirmationEmail");
+const {
+  sendConcertCustomerConfirmationEmail,
+  sendConcertCustomerCancellationEmail,
+  sendConcertOwnerReservationNotificationEmail,
+} = require("../utils/customerConfirmationEmail");
 
 router.use(authMiddleware);
 router.use(async (req, res, next) => {
@@ -272,6 +276,27 @@ router.post("/events/:eventId/bookings", async (req, res) => {
         reservation_time: result.data.reservation.reservation_time,
       });
     }
+    console.log("[owner-reservation-email] route.trigger.start", {
+      source: "concerts.bookings.create",
+      reservationType: "concert",
+      bookingId: Number(result.data?.booking?.id),
+      restaurantId,
+    });
+    const ownerNotificationResult = await sendConcertOwnerReservationNotificationEmail({
+      pool,
+      restaurantId,
+      bookingId: Number(result.data?.booking?.id),
+      explicitCustomerEmail: req.body?.customer_email || req.body?.email || "",
+      triggeredFrom: "concerts.bookings.create",
+      req,
+    });
+    console.log("[owner-reservation-email] route.trigger.result", {
+      source: "concerts.bookings.create",
+      reservationType: "concert",
+      bookingId: Number(result.data?.booking?.id),
+      restaurantId,
+      result: ownerNotificationResult,
+    });
 
     res.status(result.status).json({
       success: true,
@@ -403,12 +428,21 @@ router.patch("/bookings/:bookingId/payment-status", async (req, res) => {
     const io = req.app?.get?.("io");
     emitConcertBookingPaymentStatusEvents(io, restaurantId, result, cancellationReason);
 
-    if (String(result?.data?.booking?.payment_status || "").toLowerCase() === "confirmed") {
+    const normalizedPaymentStatus = String(result?.data?.booking?.payment_status || "").toLowerCase();
+    if (normalizedPaymentStatus === "confirmed") {
       await sendConcertCustomerConfirmationEmail({
         pool,
         restaurantId,
         bookingId,
         triggeredFrom: "concerts.bookings.payment_status_confirmed",
+        req,
+      });
+    } else if (normalizedPaymentStatus === "cancelled") {
+      await sendConcertCustomerCancellationEmail({
+        pool,
+        restaurantId,
+        bookingId,
+        triggeredFrom: "concerts.bookings.payment_status_cancelled",
         req,
       });
     }
