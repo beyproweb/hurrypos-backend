@@ -293,6 +293,7 @@ router.put("/supplier-carts/:id/confirm", async (req, res) => {
       await sendEmail(cart.email, "📦 Beypro Supplier Order", htmlBody, true, {
         replyTo: replyTo || undefined,
         fromName: "Beypro Orders",
+        provider: process.env.RESEND_API_KEY ? "resend" : undefined,
         throwOnError: true,
       });
 

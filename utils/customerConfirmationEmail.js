@@ -25,6 +25,8 @@ const EMAIL_STATUS = Object.freeze({
   SKIPPED_NO_EMAIL: "skipped_no_email",
 });
 
+const RESEND_PROVIDER = process.env.RESEND_API_KEY ? "resend" : undefined;
+
 let ensureEmailLogTablePromise = null;
 let ensureOwnerNotificationEmailLogTablePromise = null;
 const OWNER_NOTIFICATION_LOG_PREFIX = "[owner-reservation-email]";
@@ -1515,6 +1517,7 @@ async function sendCustomerConfirmationEmail({
       text,
       fromName: restaurantBranding.name,
       replyTo: restaurantBranding.contactEmail || undefined,
+      provider: RESEND_PROVIDER,
       throwOnError: true,
     });
 
@@ -2179,6 +2182,7 @@ async function sendOwnerReservationNotificationEmail({
       text,
       fromName: restaurantBranding.name,
       replyTo: restaurantBranding.contactEmail || undefined,
+      provider: RESEND_PROVIDER,
       throwOnError: true,
     });
     logOwnerNotification("provider.send.result", {

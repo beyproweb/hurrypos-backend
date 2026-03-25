@@ -476,6 +476,14 @@ const sendEmail = async (...args) => {
     if (!recipientsTo.length) throw new Error("Email recipient is missing.");
 
     const config = resolveMailEnv();
+    const requestedStrategy = String(
+      parsed.options.provider || parsed.options.strategy || ""
+    )
+      .trim()
+      .toLowerCase();
+    if (requestedStrategy) {
+      config.strategy = requestedStrategy;
+    }
     strategy = config.strategy || "auto";
     strategy = resolveDeliveryStrategy(config);
 

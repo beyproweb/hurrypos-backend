@@ -1,5 +1,7 @@
 const { sendEmail } = require("./notifications");
 
+const RESEND_PROVIDER = process.env.RESEND_API_KEY ? "resend" : undefined;
+
 async function sendNoOrderEmail(supplierName, supplierEmail, scheduledDate, options = {}) {
   if (!supplierEmail) {
     console.warn("📭 Skipped email not sent: No email address provided.");
@@ -44,6 +46,8 @@ async function sendNoOrderEmail(supplierName, supplierEmail, scheduledDate, opti
     await sendEmail(supplierEmail, subject, htmlBody, true, {
       replyTo: replyTo || undefined,
       fromName: "Beypro Orders",
+      provider: RESEND_PROVIDER,
+      throwOnError: true,
     });
     console.log(`📭 Skipped-order notice sent to ${supplierEmail}`);
   } catch (err) {

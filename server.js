@@ -185,6 +185,11 @@ app.use(
 // driver locations and socket rooms work across multiple backend instances.
 if (isDev && envBool("DISABLE_REDIS", false)) {
   process.env.REDIS_URL = "";
+  process.env.REDIS_HOST = "";
+  process.env.REDIS_PORT = "";
+  process.env.REDIS_PASSWORD = "";
+  process.env.REDIS_USERNAME = "";
+  process.env.REDIS_TLS = "false";
 
   try {
     const Redis = require("ioredis");
@@ -243,6 +248,7 @@ app.use("/api/public", publicQRRoutes);
 app.use("/public", publicQRRoutes);
 app.use("/api/public", require("./routes/publicCustomers"));
 app.use("/public", require("./routes/publicCustomers"));
+require("./scheduleMailer");
 app.get("/manifest.json", (req, res) => {
   const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
   res.redirect(302, `/api/public/manifest.json${qs}`);

@@ -4,13 +4,15 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { attachAllowedModules } = require("../middleware/moduleGuard");
 const { pool } = require("../db");
 const jwt = require("jsonwebtoken");
+const redis = require("../utils/redis");
+const { buildTablesCacheKey, invalidateTablesCache } = require("../utils/cache");
+const { getIO } = require("../utils/socket");
 
 // Secret for signing table-level QR tokens
 const TABLE_QR_SECRET =
   process.env.TABLE_QR_SECRET ||
   process.env.JWT_SECRET ||
   "table_qr_secret_2025";
-
 router.use(authMiddleware);
 router.use(async (req, res, next) => {
   const allowed = await attachAllowedModules(req);
@@ -36,7 +38,8 @@ async function ensureTableColumns() {
         ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE,
         ADD COLUMN IF NOT EXISTS seats INTEGER,
         ADD COLUMN IF NOT EXISTS area TEXT,
-        ADD COLUMN IF NOT EXISTS guests INTEGER
+        ADD COLUMN IF NOT EXISTS guests INTEGER,
+        ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE
     `);
   } catch (err) {
     console.warn("⚠️ Could not ensure tables columns:", err.message);
@@ -52,31 +55,86 @@ async function ensureTableColumns() {
   }
 }
 
+async function fetchTables(restaurantId) {
+  await ensureTableColumns();
+
+  const { rows } = await pool.query(
+    `SELECT number,
+            COALESCE(active, TRUE) AS active,
+            color, label,
+            seats,
+            area,
+            guests,
+            COALESCE(locked, FALSE) AS locked
+     FROM tables
+     WHERE restaurant_id = $1
+     ORDER BY number ASC`,
+    [restaurantId]
+  );
+
+  return rows;
+}
+
+function filterTablesForResponse(tables, activeOnly) {
+  if (!activeOnly) {
+    return tables;
+  }
+
+  return tables.filter((table) => table.active);
+}
 
 // GET /api/tables — list table configs
 router.get("/", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
-  await ensureTableColumns();
   const activeOnly =
     req.query.active === "true" ||
     (Array.isArray(req.allowed_modules) && !req.allowed_modules.includes("pos_core"));
+  const cacheKey = buildTablesCacheKey(restaurantId);
 
   try {
-    const { rows } = await pool.query(
-      `SELECT number,
-              COALESCE(active, TRUE) AS active,
-              color, label,
-              seats,
-              area,
-              guests
-       FROM tables
-       WHERE restaurant_id = $1
-         ${activeOnly ? "AND COALESCE(active, TRUE) = TRUE" : ""}
-       ORDER BY number ASC`,
-      [restaurantId]
-    );
+    let tables = null;
+    let cacheMissLogged = false;
 
-    res.json(rows);
+    try {
+      const cached = await redis.get(cacheKey);
+
+      if (cached) {
+        if (process.env.NODE_ENV !== "production") {
+          console.log("CACHE HIT", cacheKey);
+        }
+
+        try {
+          tables = JSON.parse(cached);
+        } catch (error) {
+          await redis.del(cacheKey);
+        }
+      } else if (process.env.NODE_ENV !== "production") {
+        console.log("CACHE MISS", cacheKey);
+        cacheMissLogged = true;
+      }
+    } catch (error) {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn("⚠️ Tables cache read failed:", error?.message || error);
+      }
+    }
+
+    if (!Array.isArray(tables)) {
+      if (process.env.NODE_ENV !== "production" && !cacheMissLogged) {
+        console.log("CACHE MISS", cacheKey);
+      }
+
+      tables = await fetchTables(restaurantId);
+
+      try {
+        await redis.set(cacheKey, JSON.stringify(tables), "EX", 10);
+      } catch (error) {
+        if (process.env.NODE_ENV !== "production") {
+          console.warn("⚠️ Tables cache write failed:", error?.message || error);
+        }
+      }
+    }
+
+    res.json(filterTablesForResponse(tables, activeOnly));
   } catch (err) {
     console.error("❌ Failed to fetch tables:", err);
     res.status(500).json({ error: "Failed to load tables" });
@@ -126,6 +184,7 @@ router.put("/count", async (req, res) => {
     );
 
     await client.query("COMMIT");
+    await invalidateTablesCache(restaurantId);
     res.json({ success: true, total });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -203,12 +262,13 @@ router.patch("/:number", async (req, res) => {
   }
 
   // Now receiving new fields:
-  const { color, label, active, seats, area, guests } = req.body || {};
+  const { color, label, active, seats, area, guests, locked, is_locked, occupied, unavailable } = req.body || {};
 
   await ensureTableColumns();
 
   try {
     let guestsValue = undefined;
+    let lockedValue = undefined;
     if (guests !== undefined) {
       if (guests === null || guests === "") {
         guestsValue = null;
@@ -219,6 +279,20 @@ router.patch("/:number", async (req, res) => {
         }
         guestsValue = Math.trunc(guestsNum);
       }
+    }
+
+    const lockCandidate =
+      locked !== undefined
+        ? locked
+        : is_locked !== undefined
+        ? is_locked
+        : occupied !== undefined
+        ? occupied
+        : unavailable !== undefined
+        ? unavailable
+        : undefined;
+    if (lockCandidate !== undefined) {
+      lockedValue = !!lockCandidate;
     }
 
     // Does table exist?
@@ -258,6 +332,10 @@ router.patch("/:number", async (req, res) => {
         fields.push(`guests = $${idx++}`);
         params.push(guestsValue);
       }
+      if (lockedValue !== undefined) {
+        fields.push(`locked = $${idx++}`);
+        params.push(lockedValue);
+      }
 
       // Nothing to update
       if (fields.length === 0) {
@@ -277,8 +355,8 @@ router.patch("/:number", async (req, res) => {
       // === INSERT NEW ENTRY ===
       await pool.query(
         `INSERT INTO tables 
-           (restaurant_id, number, color, label, active, seats, area, guests)
-         VALUES ($1, $2, $3, $4, COALESCE($5, TRUE), $6, $7, $8)`,
+           (restaurant_id, number, color, label, active, seats, area, guests, locked)
+         VALUES ($1, $2, $3, $4, COALESCE($5, TRUE), $6, $7, $8, COALESCE($9, FALSE))`,
         [
           restaurantId,
           number,
@@ -288,10 +366,24 @@ router.patch("/:number", async (req, res) => {
           seats || null,
           area || null,
           guestsValue === undefined ? null : guestsValue,
+          lockedValue === undefined ? false : lockedValue,
         ]
       );
     }
 
+    await invalidateTablesCache(restaurantId);
+    try {
+      const io = getIO();
+      io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+      if (lockedValue !== undefined) {
+        io.to(`restaurant_${restaurantId}`).emit("table_lock_updated", {
+          table_number: number,
+          locked: lockedValue,
+        });
+      }
+    } catch (socketErr) {
+      console.warn("⚠️ Failed to emit table update socket event:", socketErr?.message || socketErr);
+    }
     res.json({ success: true });
   } catch (err) {
     console.error("❌ Failed to update table:", err);

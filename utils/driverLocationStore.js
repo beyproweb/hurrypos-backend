@@ -9,7 +9,7 @@ function getRedisClient() {
   if (redisInitialized) return redisClient;
   redisInitialized = true;
 
-  if (!process.env.REDIS_URL) {
+  if (!process.env.REDIS_HOST || !process.env.REDIS_PORT) {
     console.log("⚠️ Redis not configured — using in-memory driver location store");
     redisClient = null;
     return redisClient;

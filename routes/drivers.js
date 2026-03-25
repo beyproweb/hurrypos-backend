@@ -15,6 +15,10 @@ module.exports = function (io) {
   let ordersColumnSetPromise = null;
   const QR_ORDER_ORIGIN_DELIVERY = "qr_menu_delivery";
 
+  function isRedisConfigured() {
+    return Boolean(String(process.env.REDIS_HOST || "").trim());
+  }
+
   async function getOrdersColumnSet() {
     if (ordersColumnSetCache) return ordersColumnSetCache;
     if (!ordersColumnSetPromise) {
@@ -210,7 +214,7 @@ module.exports = function (io) {
         role: req.user?.role,
         lookupKey: key,
         memoryKnownDriverIds,
-        redisEnabled: Boolean(process.env.REDIS_URL),
+        redisEnabled: isRedisConfigured(),
       });
 
       return res.status(404).json({ error: "No location for driver" });

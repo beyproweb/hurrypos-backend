@@ -1,11 +1,21 @@
 const { pool } = require("../db");
+const { invalidateTablesCache } = require("./cache");
 
 /* ---------------------------------------------
    🔊 Real-time socket helpers for tenant rooms
 --------------------------------------------- */
 
+function invalidateTablesCacheInBackground(restaurantId) {
+  if (!restaurantId) return;
+
+  invalidateTablesCache(restaurantId).catch((error) => {
+    console.error("❌ Failed to invalidate tables cache:", error);
+  });
+}
+
 // Emits generic order update
 const emitOrderUpdate = (io, restaurantId) => {
+  invalidateTablesCacheInBackground(restaurantId);
   io.to(`restaurant_${restaurantId}`).emit("orders_updated");
 };
 
@@ -188,6 +198,8 @@ const emitPaymentMade = (
     order_total_with_extras = null,
   } = {}
 ) => {
+  invalidateTablesCacheInBackground(restaurantId);
+
   const key = `${restaurantId}_${orderId}`;
   const now = Date.now();
   const lastEmit = _paymentEmitLock.get(key) || 0;

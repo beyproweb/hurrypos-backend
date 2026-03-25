@@ -1840,6 +1840,7 @@ function mapBookingResponse(row) {
     ticket_type_name: row.ticket_type_name || null,
     area_name: row.area_name || null,
     booking_type: normalizeBookingType(row.booking_type),
+    booking_source: "concert",
     quantity: asInt(row.quantity, 0),
     guests_count: row.guests_count == null ? null : asInt(row.guests_count, 0),
     male_guests_count: row.male_guests_count == null ? null : asInt(row.male_guests_count, 0),

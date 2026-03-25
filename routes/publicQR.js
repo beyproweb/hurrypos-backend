@@ -1090,6 +1090,7 @@ router.get("/tables/:identifier", async (req, res) => {
              label,
              seats,
              area,
+            COALESCE(locked, FALSE) AS locked,
              COALESCE(active, TRUE) AS active
       FROM tables
       WHERE restaurant_id = $1
@@ -1139,6 +1140,18 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
         AND table_number IS NOT NULL
         AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
       ORDER BY table_number ASC
+      `,
+      [restaurantId]
+    );
+
+    const { rows: lockedRows } = await pool.query(
+      `
+      SELECT number AS table_number
+      FROM tables
+      WHERE restaurant_id = $1
+        AND COALESCE(active, TRUE) = TRUE
+        AND COALESCE(locked, FALSE) = TRUE
+      ORDER BY number ASC
       `,
       [restaurantId]
     );
@@ -1222,6 +1235,12 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
 
       unavailableSet.add(tableNumber);
       reservedSet.add(tableNumber);
+    });
+
+    lockedRows.forEach((row) => {
+      const tableNumber = Number(row?.table_number);
+      if (!Number.isFinite(tableNumber) || tableNumber <= 0) return;
+      unavailableSet.add(tableNumber);
     });
 
     const tableNumbers = Array.from(unavailableSet);

@@ -11,6 +11,7 @@
     "deploy:bridge": "mkdir -p public/bridge && cp -f ../bridge-mini/out/* public/bridge/"
   },
   "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
     "axios": "^1.8.4",
     "bcrypt": "^5.1.1",
     "bcryptjs": "^3.0.2",
@@ -26,7 +27,7 @@
     "escpos-serialport": "^3.0.0-alpha.4",
     "escpos-usb": "^3.0.0-alpha.4",
     "express": "^4.21.2",
-    "ioredis": "^5.8.1",
+    "ioredis": "^5.10.1",
     "iyzipay": "^2.0.64",
     "json2csv": "^6.0.0-alpha.2",
     "jsonwebtoken": "^9.0.3",

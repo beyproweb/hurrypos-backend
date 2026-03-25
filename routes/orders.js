@@ -13,6 +13,7 @@ module.exports = function(io) {
     clearMiddlewareBearerForCallbackUrl,
   } = require("../utils/dhMiddlewareToken");
   const { sendYsPartnerFulfillment } = require("../utils/ysPartnerFulfillment");
+  const { invalidateTablesCache } = require("../utils/cache");
   const dlog = (...args) =>
     console.log(new Date().toISOString(), "[orders]", ...args);
   const authMiddleware = require("../middleware/authMiddleware");
@@ -4202,9 +4203,11 @@ router.post("/:id/close", async (req, res) => {
       }
     }
 
-    await cancelLinkedConcertBookings(client, restaurantId, id, {
-      cancellationReason: "linked_order_closed",
-    });
+    if (!preserveReservationCheckoutBadge) {
+      await cancelLinkedConcertBookings(client, restaurantId, id, {
+        cancellationReason: "linked_order_closed",
+      });
+    }
 
     if (needsDebtAdjustment) {
       if (delta > 0) {
@@ -4226,7 +4229,10 @@ router.post("/:id/close", async (req, res) => {
 
     await client.query("COMMIT");
 
-    io.to(`restaurant_${restaurantId}`).emit("order_closed", { orderId: Number(order.id) });
+    io.to(`restaurant_${restaurantId}`).emit("order_closed", { 
+      orderId: Number(order.id),
+      table_number: order.table_number 
+    });
     if (reservationClearedOrder) {
       const reservationPayload = {
         reservation_id: reservationClearedOrder.id,
@@ -4236,13 +4242,14 @@ router.post("/:id/close", async (req, res) => {
         order_type: reservationClearedOrder.order_type,
         cancellation_reason: reservationClearedOrder.cancellation_reason || null,
       };
-      io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", reservationPayload);
-      io.to(`restaurant_${restaurantId}`).emit("reservation_deleted", reservationPayload);
       if (reservationCheckedOutPayload) {
         io.to(`restaurant_${restaurantId}`).emit(
           "reservation_checked_out",
           reservationCheckedOutPayload
         );
+      } else {
+        io.to(`restaurant_${restaurantId}`).emit("reservation_cancelled", reservationPayload);
+        io.to(`restaurant_${restaurantId}`).emit("reservation_deleted", reservationPayload);
       }
     }
     res.json({
@@ -4814,7 +4821,10 @@ router.post("/:id/add-debt", async (req, res) => {
 
     await client.query("COMMIT");
 
-    io.to(`restaurant_${restaurantId}`).emit("order_closed", { orderId: Number(order.id) });
+    io.to(`restaurant_${restaurantId}`).emit("order_closed", { 
+      orderId: Number(order.id),
+      table_number: order.table_number 
+    });
 
     res.json({
       message: "✅ Order amount added to customer debt",
@@ -5059,8 +5069,9 @@ router.patch("/:id/reset-if-empty", async (req, res) => {
     const itemCount = parseInt(itemsRes.rows[0].count, 10);
 
 if (itemCount === 0) {
-  const typeRes = await client.query("SELECT order_type FROM orders WHERE id = $1", [id]);
+  const typeRes = await client.query("SELECT order_type, table_number FROM orders WHERE id = $1", [id]);
   const type = typeRes.rows[0]?.order_type;
+  const tableNumber = typeRes.rows[0]?.table_number;
 
   if (type !== 'quick') {
     await client.query(
@@ -5074,7 +5085,10 @@ if (itemCount === 0) {
       cancellationReason: "empty_order_auto_closed",
     });
     await client.query("COMMIT");
-    io.to(`restaurant_${req.user.restaurant_id}`).emit("order_closed", { orderId: parseInt(id, 10) });
+    io.to(`restaurant_${req.user.restaurant_id}`).emit("order_closed", { 
+      orderId: parseInt(id, 10),
+      table_number: tableNumber 
+    });
     return res.json({ message: "Order status reset to closed" });
   }
 
@@ -6436,20 +6450,37 @@ router.post("/reservations", async (req, res) => {
     const clientCount = parseInt(reservation_clients) || 0;
     const notes = (reservation_notes || "").trim();
     const qrCustomization = await getQrMenuCustomization(restaurantId);
-    const guestCompositionValidation = validateReservationGuestComposition({
-      config: qrCustomization,
-      guestCount: clientCount,
-      reservationMen: reservation_men,
-      reservationWomen: reservation_women,
-    });
-    if (guestCompositionValidation?.error) {
-      return res.status(400).json({ error: guestCompositionValidation.error });
+    const shouldSkipGuestCompositionValidation =
+      req.body?.skip_guest_composition_validation === true ||
+      req.body?.skipGuestCompositionValidation === true ||
+      req.body?.restore_existing_reservation === true ||
+      req.body?.restoreExistingReservation === true;
+
+    // Only validate guest composition if the fields are explicitly being provided
+    const isExplicitlyProvidingGuestComposition =
+      Object.prototype.hasOwnProperty.call(req.body || {}, "reservation_men") ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, "reservation_women");
+
+    if (!shouldSkipGuestCompositionValidation && isExplicitlyProvidingGuestComposition) {
+      const guestCompositionValidation = validateReservationGuestComposition({
+        config: qrCustomization,
+        guestCount: clientCount,
+        reservationMen: reservation_men,
+        reservationWomen: reservation_women,
+      });
+      if (guestCompositionValidation?.error) {
+        return res.status(400).json({ error: guestCompositionValidation.error });
+      }
     }
 
     const createStandaloneReservationForTable = async ({
       resolvedTableNumber,
       fallbackCustomerName = null,
       fallbackCustomerPhone = null,
+      fallbackReservationMen = null,
+      fallbackReservationWomen = null,
+      sourceOrderId = null,
+      relinkConcertBooking = false,
     }) => {
       const newOrderResult = await pool.query(
         `INSERT INTO orders (
@@ -6478,13 +6509,53 @@ router.post("/reservations", async (req, res) => {
           reservation_date,
           reservation_time,
           clientCount,
-          reservation_men == null ? null : Number(reservation_men) || 0,
-          reservation_women == null ? null : Number(reservation_women) || 0,
+          reservation_men == null
+            ? fallbackReservationMen == null
+              ? null
+              : Number(fallbackReservationMen) || 0
+            : Number(reservation_men) || 0,
+          reservation_women == null
+            ? fallbackReservationWomen == null
+              ? null
+              : Number(fallbackReservationWomen) || 0
+            : Number(reservation_women) || 0,
           notes,
         ]
       );
 
       const reservation = newOrderResult.rows[0];
+
+      if (
+        relinkConcertBooking &&
+        Number.isFinite(Number(sourceOrderId)) &&
+        Number(sourceOrderId) > 0 &&
+        Number.isFinite(Number(reservation?.id)) &&
+        Number(reservation.id) > 0
+      ) {
+        try {
+          await ensureConcertTables(pool);
+          await pool.query(
+            `UPDATE concert_bookings
+                SET reservation_order_id = $3,
+                    reserved_table_number = COALESCE($4::int, reserved_table_number),
+                    updated_at = NOW()
+              WHERE restaurant_id = $1
+                AND reservation_order_id = $2
+                AND LOWER(COALESCE(payment_status, '')) NOT IN ('cancelled', 'canceled')`,
+            [
+              restaurantId,
+              Number(sourceOrderId),
+              Number(reservation.id),
+              Number.isFinite(Number(resolvedTableNumber)) ? Number(resolvedTableNumber) : null,
+            ]
+          );
+        } catch (relinkErr) {
+          console.warn(
+            "⚠️ Failed to relink concert booking to restored reservation order:",
+            relinkErr?.message || relinkErr
+          );
+        }
+      }
 
       if (fallbackCustomerPhone) {
         await pool.query(
@@ -6559,6 +6630,8 @@ router.post("/reservations", async (req, res) => {
            reservation_date,
            reservation_time,
            reservation_clients,
+           reservation_men,
+           reservation_women,
            reservation_notes
          FROM orders
          WHERE restaurant_id = $1 AND id = $2
@@ -6601,20 +6674,39 @@ router.post("/reservations", async (req, res) => {
           resolvedTableNumber,
           fallbackCustomerName: safeCustomerName ?? sourceOrder?.customer_name ?? null,
           fallbackCustomerPhone: safeCustomerPhone ?? sourceOrder?.customer_phone ?? null,
+          fallbackReservationMen: sourceOrder?.reservation_men ?? null,
+          fallbackReservationWomen: sourceOrder?.reservation_women ?? null,
+          sourceOrderId,
+          relinkConcertBooking: shouldSkipGuestCompositionValidation,
         });
       }
+
+      const hasReservationMenInPayload = Object.prototype.hasOwnProperty.call(
+        req.body || {},
+        "reservation_men"
+      );
+      const hasReservationWomenInPayload = Object.prototype.hasOwnProperty.call(
+        req.body || {},
+        "reservation_women"
+      );
 
       const result = await pool.query(
         `UPDATE orders
          SET reservation_date = $1,
              reservation_time = $2,
              reservation_clients = $3,
-             reservation_men = $4,
-             reservation_women = $5,
-             reservation_notes = $6,
-             table_number = COALESCE($7::int, table_number),
-             customer_name = COALESCE($8::text, customer_name),
-             customer_phone = COALESCE($9::text, customer_phone),
+             reservation_men = CASE
+               WHEN $4::boolean THEN $5
+               ELSE reservation_men
+             END,
+             reservation_women = CASE
+               WHEN $6::boolean THEN $7
+               ELSE reservation_women
+             END,
+             reservation_notes = $8,
+             table_number = COALESCE($9::int, table_number),
+             customer_name = COALESCE($10::text, customer_name),
+             customer_phone = COALESCE($11::text, customer_phone),
              order_type = CASE
                WHEN LOWER(COALESCE(order_type,'')) = 'reservation' THEN 'table'
                ELSE COALESCE(order_type, 'table')
@@ -6625,13 +6717,15 @@ router.post("/reservations", async (req, res) => {
                ELSE COALESCE(status, 'reserved')
              END,
              updated_at = NOW()
-         WHERE restaurant_id = $10 AND id = $11
+         WHERE restaurant_id = $12 AND id = $13
          RETURNING *`,
         [
           reservation_date,
           reservation_time,
           clientCount,
+          hasReservationMenInPayload,
           reservation_men == null ? null : Number(reservation_men) || 0,
+          hasReservationWomenInPayload,
           reservation_women == null ? null : Number(reservation_women) || 0,
           notes,
           safeTableNumber,
@@ -6942,9 +7036,9 @@ router.get("/reservations/:id", async (req, res) => {
   }
 });
 
-const emitReservationStateUpdate = (restaurantId, reservationOrder, extraPayload = {}) => {
-  if (!reservationOrder || !restaurantId) return;
-  const payload = {
+  const emitReservationStateUpdate = (restaurantId, reservationOrder, extraPayload = {}) => {
+    if (!reservationOrder || !restaurantId) return;
+    const payload = {
     reservation_id: reservationOrder.id,
     order_id: reservationOrder.id,
     table_number: reservationOrder.table_number,
@@ -6957,18 +7051,21 @@ const emitReservationStateUpdate = (restaurantId, reservationOrder, extraPayload
     reservation_women: reservationOrder.reservation_women ?? null,
     reservation_notes: reservationOrder.reservation_notes,
     customer_name: reservationOrder.customer_name || null,
-    customer_phone: reservationOrder.customer_phone || null,
-    ...extraPayload,
+      customer_phone: reservationOrder.customer_phone || null,
+      ...extraPayload,
+    };
+
+    invalidateTablesCache(restaurantId).catch((error) => {
+      console.error("❌ Failed to invalidate tables cache:", error);
+    });
+    io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+    io.to(`restaurant_${restaurantId}`).emit("reservation_updated", payload);
+    return payload;
   };
 
-  io.to(`restaurant_${restaurantId}`).emit("orders_updated");
-  io.to(`restaurant_${restaurantId}`).emit("reservation_updated", payload);
-  return payload;
-};
-
-const emitReservationCreated = (restaurantId, reservationOrder, extraPayload = {}) => {
-  if (!reservationOrder || !restaurantId) return;
-  const payload = {
+  const emitReservationCreated = (restaurantId, reservationOrder, extraPayload = {}) => {
+    if (!reservationOrder || !restaurantId) return;
+    const payload = {
     reservation_id: reservationOrder.id,
     order_id: reservationOrder.id,
     table_number: reservationOrder.table_number,
@@ -6981,14 +7078,17 @@ const emitReservationCreated = (restaurantId, reservationOrder, extraPayload = {
     reservation_women: reservationOrder.reservation_women ?? null,
     reservation_notes: reservationOrder.reservation_notes,
     customer_name: reservationOrder.customer_name || null,
-    customer_phone: reservationOrder.customer_phone || null,
-    ...extraPayload,
-  };
+      customer_phone: reservationOrder.customer_phone || null,
+      ...extraPayload,
+    };
 
-  io.to(`restaurant_${restaurantId}`).emit("orders_updated");
-  io.to(`restaurant_${restaurantId}`).emit("reservation_created", payload);
-  return payload;
-};
+    invalidateTablesCache(restaurantId).catch((error) => {
+      console.error("❌ Failed to invalidate tables cache:", error);
+    });
+    io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+    io.to(`restaurant_${restaurantId}`).emit("reservation_created", payload);
+    return payload;
+  };
 
 const checkInReservationOrder = async ({ restaurantId, orderId }) => {
   try {
@@ -7186,6 +7286,7 @@ router.delete("/reservations/:id", async (req, res) => {
     await cancelLinkedConcertBookings(pool, restaurantId, id, {
       cancellationReason: "reservation_deleted",
     });
+    await invalidateTablesCache(restaurantId);
 
     // Emit cancellation to frontend
     io.to(`restaurant_${restaurantId}`).emit("orders_updated");
@@ -7277,6 +7378,7 @@ router.post("/:id/reservations", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
+    await invalidateTablesCache(restaurantId);
     res.json({
       message: "✅ Reservation created",
       reservation: result.rows[0],
@@ -7340,6 +7442,7 @@ router.put("/:id/reservations", async (req, res) => {
       return res.status(404).json({ error: "Order not found" });
     }
 
+    await invalidateTablesCache(restaurantId);
     res.json({
       message: "✅ Reservation updated",
       reservation: result.rows[0],
@@ -7437,6 +7540,7 @@ router.delete("/:id/reservations", async (req, res) => {
     await cancelLinkedConcertBookings(pool, restaurantId, orderId, {
       cancellationReason: "reservation_deleted",
     });
+    await invalidateTablesCache(restaurantId);
     io.to(`restaurant_${restaurantId}`).emit("orders_updated");
     if (updatedOrder) {
       const reservationPayload = {

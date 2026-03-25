@@ -7,6 +7,8 @@ const { loadLocalizationForRestaurant } = require("./utils/localization");
 const { getCurrencyMeta } = require("./utils/currency");
 const dayjs = require("dayjs");
 
+const RESEND_PROVIDER = process.env.RESEND_API_KEY ? "resend" : undefined;
+
 console.log("⏰ Scheduled mailer started. Waiting for carts...");
 
 const restaurantContactCache = new Map();
@@ -175,6 +177,8 @@ const runScheduledMailer = async () => {
           await sendEmail(cart.email, `📦 Beypro Scheduled Order`, htmlBody, true, {
             replyTo,
             fromName: "Beypro Orders",
+            provider: RESEND_PROVIDER,
+            throwOnError: true,
           });
           console.log(`✅ Email sent to: ${cart.email}`);
         } else {

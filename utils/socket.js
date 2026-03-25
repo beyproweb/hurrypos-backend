@@ -3,6 +3,16 @@ const { Server } = require("socket.io");
 const { saveNotification } = require("./realtime");
 let io = null;
 
+function isRedisDisabled() {
+  if (process.env.NODE_ENV === "production") return false;
+  const value = String(process.env.DISABLE_REDIS || "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(value);
+}
+
+function isRedisConfigured() {
+  return Boolean(String(process.env.REDIS_HOST || "").trim());
+}
+
 function initSocket(server) {
   if (io) {
     console.log("⚠️ Socket.IO already initialized");
@@ -70,20 +80,18 @@ function initSocket(server) {
   });
 
   /* ------------------------------------------------------------------
-     🧠 Optional Redis adapter (auto-skipped in local dev if no REDIS_URL)
+     🧠 Optional Redis adapter (auto-skipped when Redis is not configured)
   ------------------------------------------------------------------ */
-  if (process.env.REDIS_URL) {
+  if (isRedisConfigured() && !isRedisDisabled()) {
     try {
       const { createAdapter } = require("@socket.io/redis-adapter");
-      const { createClient } = require("redis");
-      const pubClient = createClient({ url: process.env.REDIS_URL });
-      const subClient = pubClient.duplicate();
+      const redis = require("./redis");
+      const pubClient = redis;
+      const subClient = redis.duplicate();
 
       pubClient.on("error", (err) => console.error("❌ Redis pub error:", err));
       subClient.on("error", (err) => console.error("❌ Redis sub error:", err));
 
-      pubClient.connect();
-      subClient.connect();
       io.adapter(createAdapter(pubClient, subClient));
 
       console.log("✅ Redis adapter enabled for multi-instance scaling");
@@ -91,7 +99,7 @@ function initSocket(server) {
       console.warn("⚠️ Redis adapter skipped:", err.message);
     }
   } else {
-    console.log("⚠️ No REDIS_URL found — running without Redis adapter");
+    console.log("⚠️ Redis adapter disabled — running without Redis adapter");
   }
 
   /* ------------------------------------------------------------------
