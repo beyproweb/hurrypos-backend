@@ -305,11 +305,61 @@ function appendBeforeBodyEnd(html, snippet) {
     : html + snippet;
 }
 
+function isLocalHostname(hostname = "") {
+  const normalized = String(hostname || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^\[/, "")
+    .replace(/\]$/, "");
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized === "0.0.0.0"
+  );
+}
+
 function getSafeOrigin(req) {
-  let raw = process.env.PUBLIC_TRACKING_ORIGIN || `${req.protocol}://${req.get("host")}`;
-  raw = String(raw || "").trim();
-  if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
-  return raw.replace(/\/+$/, "");
+  const candidates = [
+    process.env.PUBLIC_TRACKING_ORIGIN,
+    (() => {
+      const forwardedHost = String(req.headers["x-forwarded-host"] || "")
+        .split(",")[0]
+        .trim();
+      const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
+        .split(",")[0]
+        .trim()
+        .toLowerCase();
+      if (!forwardedHost) return "";
+      const protocol = forwardedProto === "http" || forwardedProto === "https"
+        ? forwardedProto
+        : "https";
+      return `${protocol}://${forwardedHost}`;
+    })(),
+    `${req.protocol}://${req.get("host") || ""}`,
+    process.env.APP_URL,
+    process.env.FRONTEND_URL,
+    process.env.PUBLIC_APP_URL,
+    "https://pos.beypro.com",
+  ];
+
+  for (const candidate of candidates) {
+    let raw = String(candidate || "").trim();
+    if (!raw) continue;
+    if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
+
+    try {
+      const parsed = new URL(raw);
+      if (isLocalHostname(parsed.hostname) && process.env.NODE_ENV === "production") {
+        continue;
+      }
+      return raw.replace(/\/+$/, "");
+    } catch {
+      continue;
+    }
+  }
+
+  return "https://pos.beypro.com";
 }
 
 function truthyStr(s) {

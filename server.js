@@ -29,6 +29,7 @@ console.log("Runtime PATH:", process.env.PATH);
 
 const express = require("express");
 const app = express();
+app.set("trust proxy", true);
 const { pool } = require('./db');
 const cors = require("cors");
 const { ensureMinimalSchema } = require("./utils/ensureSchema");
