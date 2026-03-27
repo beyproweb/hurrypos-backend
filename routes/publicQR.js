@@ -22,6 +22,7 @@ const QR_BRANDING_DEFAULTS = {
   pwa_primary_color: "#4F46E5",
   pwa_background_color: "#FFFFFF",
   qrmenu_font_family: "gotham",
+  concert_reservation_button_color: "#111827",
 };
 
 function parseCustomizationPayload(row) {
