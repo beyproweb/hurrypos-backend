@@ -32,6 +32,12 @@ const {
   buildGuestQrPngBuffer,
   buildGuestQrScanUrl,
 } = require("../utils/guestQrImage");
+const {
+  ensureBookingSlotSchema,
+  loadBookingSlotSettings,
+  computeConcertCheckinWindow,
+  isCurrentTimeInsideWindow,
+} = require("../utils/bookingSlots");
 
 router.use((req, res, next) => {
   if (
@@ -369,6 +375,7 @@ router.get("/bookings/qr/:token", async (req, res) => {
 
   try {
     await ensureBookingQrSchema(pool);
+    await ensureBookingSlotSchema(pool);
 
     if (shouldServePublicQrImage(req)) {
       const decoded = decodeGuestQrToken(token, ["concert_booking"]);
@@ -444,6 +451,11 @@ router.get("/bookings/qr/:token", async (req, res) => {
         cb.customer_phone,
         cb.quantity,
         cb.confirmed_at,
+        cb.slot_start_datetime,
+        cb.slot_end_datetime,
+        cb.entry_open_datetime,
+        cb.entry_close_datetime,
+        cb.allow_reentry,
         cb.qr_status,
         cb.qr_url,
         cb.qr_ready_at,
@@ -485,12 +497,27 @@ router.get("/bookings/qr/:token", async (req, res) => {
     const normalizedPaymentStatus = String(booking.payment_status || "").toLowerCase();
     const normalizedBookingStatus = String(booking.booking_status || "").toLowerCase();
     const isCheckedIn = normalizedOrderStatus === "checked_in";
+    const bookingSettings = await loadBookingSlotSettings(pool, restaurantId);
+    const computedWindow = computeConcertCheckinWindow({
+      slotStartDateTime: booking.slot_start_datetime || null,
+      settings: bookingSettings,
+    });
+    const entryOpenDateTime =
+      booking.entry_open_datetime || computedWindow.entry_open_datetime || null;
+    const entryCloseDateTime =
+      booking.entry_close_datetime || computedWindow.entry_close_datetime || null;
+    const allowReentry = Boolean(booking.allow_reentry);
+    const withinCheckinWindow = isCurrentTimeInsideWindow({
+      openDateTime: entryOpenDateTime,
+      closeDateTime: entryCloseDateTime,
+    });
     const canCheckIn =
       Number.isFinite(Number(booking.reservation_order_id)) &&
       Number(booking.reservation_order_id) > 0 &&
       normalizedPaymentStatus === "confirmed" &&
       normalizedBookingStatus !== "cancelled" &&
-      !isCheckedIn;
+      withinCheckinWindow &&
+      (!isCheckedIn || allowReentry);
 
     return res.json({
       success: true,
@@ -503,6 +530,9 @@ router.get("/bookings/qr/:token", async (req, res) => {
         guest_name: booking.customer_name || "",
         is_checked_in: isCheckedIn,
         can_check_in: canCheckIn,
+        entry_open_datetime: entryOpenDateTime,
+        entry_close_datetime: entryCloseDateTime,
+        allow_reentry: allowReentry,
         current_status:
           booking.reservation_order_status ||
           booking.booking_status ||

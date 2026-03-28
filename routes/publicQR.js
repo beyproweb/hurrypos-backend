@@ -8,6 +8,19 @@ const { getIO } = require("../utils/socket");
 const { saveNotification } = require("../utils/realtime");
 const { ensureConcertTables } = require("../utils/concertsService");
 const { getDriverLocation } = require("../utils/driverLocationStore");
+const {
+  DEFAULT_BOOKING_SLOT_SETTINGS,
+  normalizeBookingSlotSettings,
+  loadBookingSlotSettings,
+  computeReservationSlot,
+  buildTimeSlotsForDay,
+  getDayNameForYmd,
+  isDateWithinAdvanceLimit,
+  ensureBookingSlotSchema,
+  normalizeTimeValue,
+  parseLocalDateTime,
+  addMinutesToDateTime,
+} = require("../utils/bookingSlots");
 
 const CALL_WAITER_COOLDOWN_MS = 15000;
 const callWaiterRateLimit = new Map();
@@ -23,6 +36,10 @@ const QR_BRANDING_DEFAULTS = {
   pwa_background_color: "#FFFFFF",
   qrmenu_font_family: "gotham",
   concert_reservation_button_color: "#111827",
+};
+
+const QR_BOOKING_DEFAULTS = {
+  ...DEFAULT_BOOKING_SLOT_SETTINGS,
 };
 
 function parseCustomizationPayload(row) {
@@ -203,6 +220,29 @@ function safeDecodeURIComponent(value) {
   }
 }
 
+function currentLocalYmd(timeZone = process.env.REPORTS_TIMEZONE || "Europe/Istanbul") {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+function normalizeYmd(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (match?.[1]) return match[1];
+  const parsed = new Date(raw);
+  if (!Number.isFinite(parsed.getTime())) return "";
+  return parsed.toISOString().slice(0, 10);
+}
+
 function resolveIdentifierFromReferer(refererValue) {
   const raw = String(refererValue || "").trim();
   if (!raw) return "";
@@ -329,6 +369,286 @@ async function getOrdersColumnSet() {
       });
   }
   return ordersColumnSetPromise;
+}
+
+function asPositiveInt(value, fallback = 0) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function normalizePublicReservationRowSlot(row, bookingSettings) {
+  const reservationDate = normalizeYmd(row?.reservation_date);
+  const reservationTime = normalizeTimeValue(row?.reservation_time) || "00:00:00";
+  const fallbackStart =
+    reservationDate && reservationTime ? `${reservationDate} ${reservationTime}` : null;
+  const slotStartDateTime =
+    row?.slot_start_datetime != null ? String(row.slot_start_datetime) : fallbackStart;
+  if (!slotStartDateTime) return null;
+
+  const durationMinutes = Math.max(
+    1,
+    asPositiveInt(
+      row?.reservation_duration_minutes,
+      bookingSettings.reservation_default_duration_minutes
+    )
+  );
+  const slotEndDateTime =
+    row?.slot_end_datetime != null
+      ? String(row.slot_end_datetime)
+      : addMinutesToDateTime(slotStartDateTime, durationMinutes);
+  if (!slotEndDateTime) return null;
+
+  const bufferMinutes = Math.max(
+    0,
+    asPositiveInt(row?.reservation_buffer_minutes, bookingSettings.reservation_buffer_minutes) || 0
+  );
+  const bufferedEndDateTime = addMinutesToDateTime(slotEndDateTime, bufferMinutes);
+  return {
+    table_number: Number(row?.table_number),
+    reservation_date: reservationDate,
+    slot_start_datetime: slotStartDateTime,
+    slot_end_datetime: slotEndDateTime,
+    slot_end_with_buffer_datetime: bufferedEndDateTime || slotEndDateTime,
+  };
+}
+
+function publicReservationSlotsOverlap(requestedSlot, existingSlot) {
+  const newStart = parseLocalDateTime(requestedSlot?.slot_start_datetime);
+  const newEnd = parseLocalDateTime(requestedSlot?.slot_end_datetime);
+  const existingStart = parseLocalDateTime(existingSlot?.slot_start_datetime);
+  const existingEnd = parseLocalDateTime(existingSlot?.slot_end_with_buffer_datetime);
+  if (!newStart || !newEnd || !existingStart || !existingEnd) return false;
+  return newStart < existingEnd && newEnd > existingStart;
+}
+
+function sortPublicTablesByBestFit(tables, guestCount) {
+  const safeGuestCount = asPositiveInt(guestCount, 0);
+  return [...tables].sort((left, right) => {
+    const leftSeats = asPositiveInt(left?.seats, 0);
+    const rightSeats = asPositiveInt(right?.seats, 0);
+    if (safeGuestCount > 0) {
+      const leftDelta = leftSeats > 0 ? leftSeats - safeGuestCount : Number.MAX_SAFE_INTEGER;
+      const rightDelta = rightSeats > 0 ? rightSeats - safeGuestCount : Number.MAX_SAFE_INTEGER;
+      const leftScore = leftDelta >= 0 ? leftDelta : Number.MAX_SAFE_INTEGER - safeGuestCount;
+      const rightScore = rightDelta >= 0 ? rightDelta : Number.MAX_SAFE_INTEGER - safeGuestCount;
+      if (leftScore !== rightScore) return leftScore - rightScore;
+    }
+    return Number(left?.table_number || 0) - Number(right?.table_number || 0);
+  });
+}
+
+function evaluatePublicReservationAvailability({
+  tables,
+  reservationRows,
+  requestedSlot,
+  bookingSettings,
+  guestCount = 0,
+  targetDateYmd = "",
+}) {
+  const maxPerTablePerDay = asPositiveInt(bookingSettings.reservation_max_per_table_per_day, 0);
+  const overlappingTableSet = new Set();
+  const perDayReservationCount = new Map();
+
+  for (const row of reservationRows) {
+    const normalizedRow = normalizePublicReservationRowSlot(row, bookingSettings);
+    if (!normalizedRow) continue;
+    const tableNumber = Number(normalizedRow.table_number);
+    if (!Number.isFinite(tableNumber) || tableNumber <= 0) continue;
+
+    const reservationDate = normalizeYmd(normalizedRow.reservation_date);
+    if (reservationDate && reservationDate === targetDateYmd) {
+      perDayReservationCount.set(
+        tableNumber,
+        Number(perDayReservationCount.get(tableNumber) || 0) + 1
+      );
+    }
+
+    if (publicReservationSlotsOverlap(requestedSlot, normalizedRow)) {
+      overlappingTableSet.add(tableNumber);
+    }
+  }
+
+  const availableTables = [];
+  const unavailableTableNumbers = new Set();
+  const reservedTableNumbers = new Set();
+
+  for (const table of Array.isArray(tables) ? tables : []) {
+    const tableNumber = Number(table?.table_number ?? table?.number);
+    if (!Number.isFinite(tableNumber) || tableNumber <= 0) continue;
+
+    const seats = asPositiveInt(table?.seats, 0);
+    const isLocked = Boolean(table?.locked);
+    const exceedsGuestCount = guestCount > 0 && seats > 0 && guestCount > seats;
+    const exceedsDailyLimit =
+      maxPerTablePerDay > 0 &&
+      Number(perDayReservationCount.get(tableNumber) || 0) >= maxPerTablePerDay;
+    const overlaps = overlappingTableSet.has(tableNumber);
+
+    if (isLocked || exceedsGuestCount || exceedsDailyLimit || overlaps) {
+      unavailableTableNumbers.add(tableNumber);
+      if (overlaps || exceedsDailyLimit) {
+        reservedTableNumbers.add(tableNumber);
+      }
+      continue;
+    }
+
+    availableTables.push({
+      table_number: tableNumber,
+      seats,
+      area_name: table?.area || null,
+      status: "available",
+    });
+  }
+
+  const totalBookableTables = (Array.isArray(tables) ? tables : []).filter(
+    (table) => !Boolean(table?.locked)
+  ).length;
+  const limitedThreshold = Math.max(1, Math.ceil(totalBookableTables / 3));
+  const availabilityStatus =
+    availableTables.length <= 0
+      ? "fully_booked"
+      : availableTables.length <= limitedThreshold
+      ? "limited"
+      : "available";
+
+  return {
+    availableTables: sortPublicTablesByBestFit(availableTables, guestCount),
+    unavailableTableNumbers: Array.from(unavailableTableNumbers).sort((a, b) => a - b),
+    reservedTableNumbers: Array.from(reservedTableNumbers).sort((a, b) => a - b),
+    availabilityStatus,
+  };
+}
+
+async function loadPublicReservationAvailabilityContext(restaurantId) {
+  const bookingSettings = await loadBookingSlotSettings(pool, restaurantId);
+  const [{ rows: tables }, { rows: reservationRows }] = await Promise.all([
+    pool.query(
+      `
+      SELECT
+        number AS table_number,
+        seats,
+        area,
+        COALESCE(locked, FALSE) AS locked
+      FROM tables
+      WHERE restaurant_id = $1
+        AND COALESCE(active, TRUE) = TRUE
+      ORDER BY number ASC
+      `,
+      [restaurantId]
+    ),
+    pool.query(
+      `
+      SELECT
+        table_number,
+        reservation_date,
+        reservation_time,
+        reservation_duration_minutes,
+        reservation_buffer_minutes,
+        slot_start_datetime,
+        slot_end_datetime,
+        status,
+        order_type
+      FROM orders
+      WHERE restaurant_id = $1
+        AND table_number IS NOT NULL
+        AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled', 'deleted', 'void')
+        AND (
+          slot_start_datetime IS NOT NULL
+          OR reservation_date IS NOT NULL
+          OR reservation_time IS NOT NULL
+        )
+      `,
+      [restaurantId]
+    ),
+  ]);
+
+  return {
+    bookingSettings,
+    tables,
+    reservationRows,
+  };
+}
+
+async function loadPublicReservationHoursRow(restaurantId, targetDateYmd) {
+  const dayName = getDayNameForYmd(targetDateYmd);
+  if (!dayName) return null;
+  const { rows } = await pool.query(
+    `
+    SELECT open_time, close_time
+    FROM shop_hours
+    WHERE restaurant_id = $1
+      AND LOWER(day) = LOWER($2)
+    LIMIT 1
+    `,
+    [restaurantId, dayName]
+  );
+  return rows?.[0] || null;
+}
+
+function buildPublicReservationTimeSlots({
+  restaurantId,
+  bookingSettings,
+  tables,
+  reservationRows,
+  targetDateYmd,
+  guestCount = 0,
+  hoursRow = null,
+}) {
+  if (!isDateWithinAdvanceLimit(targetDateYmd, bookingSettings.booking_max_days_in_advance)) {
+    return [];
+  }
+
+  const serverNow = new Date();
+  const currentYmd = currentLocalYmd();
+  const minDateTime =
+    targetDateYmd === currentYmd
+      ? `${targetDateYmd} ${String(serverNow.getHours()).padStart(2, "0")}:${String(
+          serverNow.getMinutes()
+        ).padStart(2, "0")}:00`
+      : "";
+
+  const candidateTimes = buildTimeSlotsForDay({
+    dateValue: targetDateYmd,
+    openTime: hoursRow?.open_time || "00:00:00",
+    closeTime: hoursRow?.close_time || "23:59:00",
+    stepMinutes: bookingSettings.booking_time_interval_minutes,
+    minDateTime,
+  });
+
+  return candidateTimes
+    .map((candidateTime) => {
+      const requestedSlot = computeReservationSlot({
+        reservationDate: targetDateYmd,
+        reservationTime: candidateTime,
+        settings: bookingSettings,
+      });
+      if (!requestedSlot) return null;
+
+      const evaluation = evaluatePublicReservationAvailability({
+        tables,
+        reservationRows,
+        requestedSlot,
+        bookingSettings,
+        guestCount,
+        targetDateYmd,
+      });
+
+      return {
+        time: String(candidateTime || "").slice(0, 5),
+        slot_start_datetime: requestedSlot.slot_start_datetime,
+        slot_end_datetime: requestedSlot.slot_end_datetime,
+        reservation_duration_minutes: requestedSlot.reservation_duration_minutes,
+        reservation_buffer_minutes: requestedSlot.reservation_buffer_minutes,
+        availability_status:
+          evaluation.availableTables.length > 0
+            ? evaluation.availabilityStatus
+            : "fully_booked",
+        is_available: evaluation.availableTables.length > 0,
+        available_table_count: evaluation.availableTables.length,
+      };
+    })
+    .filter(Boolean);
 }
 
 const APPROX_CITY_SPEED_KMH = 28;
@@ -1112,6 +1432,19 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
   try {
     const identifier = (req.params.identifier || "").trim();
     if (!identifier) return res.json({ table_numbers: [], reserved_table_numbers: [] });
+    const requestedDateRaw = String(req.query?.date || "").trim();
+    const requestedDateYmd =
+      /^\d{4}-\d{2}-\d{2}$/.test(requestedDateRaw) ? requestedDateRaw : "";
+    const requestedTime = normalizeTimeValue(req.query?.time);
+    const shouldIncludeSlots =
+      req.query?.slots === "1" ||
+      String(req.query?.slots || "").toLowerCase() === "true" ||
+      req.query?.include_slots === "1" ||
+      String(req.query?.include_slots || "").toLowerCase() === "true";
+    const requestedGuestCount = asPositiveInt(
+      req.query?.guest_count ?? req.query?.guests_count ?? req.query?.guests,
+      0
+    );
 
     await ensureConcertTables(pool);
 
@@ -1127,6 +1460,117 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
 
     if (!rows.length) return res.json({ table_numbers: [], reserved_table_numbers: [] });
     const restaurantId = rows[0].id;
+
+    if (requestedDateYmd && shouldIncludeSlots && !requestedTime) {
+      await ensureBookingSlotSchema(pool);
+
+      const [{ bookingSettings, tables, reservationRows }, hoursRow] = await Promise.all([
+        loadPublicReservationAvailabilityContext(restaurantId),
+        loadPublicReservationHoursRow(restaurantId, requestedDateYmd),
+      ]);
+
+      const timeSlots = buildPublicReservationTimeSlots({
+        bookingSettings,
+        tables,
+        reservationRows,
+        targetDateYmd: requestedDateYmd,
+        guestCount: requestedGuestCount,
+        hoursRow,
+      });
+
+      return res.json({
+        date: requestedDateYmd,
+        time_slots: timeSlots,
+        interval_minutes: bookingSettings.booking_time_interval_minutes,
+        reservation_duration_minutes: bookingSettings.reservation_default_duration_minutes,
+        reservation_buffer_minutes: bookingSettings.reservation_buffer_minutes,
+      });
+    }
+
+    if (requestedDateYmd && requestedTime) {
+      await ensureBookingSlotSchema(pool);
+
+      const [{ bookingSettings, tables, reservationRows }, hoursRow] = await Promise.all([
+        loadPublicReservationAvailabilityContext(restaurantId),
+        loadPublicReservationHoursRow(restaurantId, requestedDateYmd),
+      ]);
+      const requestedSlot = computeReservationSlot({
+        reservationDate: requestedDateYmd,
+        reservationTime: requestedTime,
+        settings: bookingSettings,
+      });
+
+      if (!requestedSlot) {
+        return res.json({
+          table_numbers: [],
+          reserved_table_numbers: [],
+          available_tables: [],
+          availability_status: "fully_booked",
+          next_available_time: null,
+          selected_slot: null,
+        });
+      }
+
+      const evaluation = evaluatePublicReservationAvailability({
+        tables,
+        reservationRows,
+        requestedSlot,
+        bookingSettings,
+        guestCount: requestedGuestCount,
+        targetDateYmd: requestedDateYmd,
+      });
+
+      let nextAvailableTime = null;
+      if (evaluation.availableTables.length <= 0) {
+        const candidateTimes = buildTimeSlotsForDay({
+          dateValue: requestedDateYmd,
+          openTime: hoursRow?.open_time || "00:00:00",
+          closeTime: hoursRow?.close_time || "23:59:00",
+          stepMinutes: bookingSettings.booking_time_interval_minutes,
+          minDateTime: addMinutesToDateTime(
+            requestedSlot.slot_start_datetime,
+            bookingSettings.booking_time_interval_minutes
+          ),
+        });
+
+        for (const candidateTime of candidateTimes) {
+          const candidateSlot = computeReservationSlot({
+            reservationDate: requestedDateYmd,
+            reservationTime: candidateTime,
+            settings: bookingSettings,
+          });
+          if (!candidateSlot) continue;
+          const candidateEvaluation = evaluatePublicReservationAvailability({
+            tables,
+            reservationRows,
+            requestedSlot: candidateSlot,
+            bookingSettings,
+            guestCount: requestedGuestCount,
+            targetDateYmd: requestedDateYmd,
+          });
+          if (candidateEvaluation.availableTables.length > 0) {
+            nextAvailableTime = String(candidateTime || "").slice(0, 5);
+            break;
+          }
+        }
+      }
+
+      return res.json({
+        table_numbers: evaluation.unavailableTableNumbers,
+        reserved_table_numbers: evaluation.reservedTableNumbers,
+        available_tables: evaluation.availableTables,
+        availability_status: evaluation.availabilityStatus,
+        next_available_time: nextAvailableTime,
+        selected_slot: {
+          date: requestedDateYmd,
+          time: requestedTime.slice(0, 5),
+          slot_start_datetime: requestedSlot.slot_start_datetime,
+          slot_end_datetime: requestedSlot.slot_end_datetime,
+          reservation_duration_minutes: requestedSlot.reservation_duration_minutes,
+          reservation_buffer_minutes: requestedSlot.reservation_buffer_minutes,
+        },
+      });
+    }
 
     const { rows: busyRows } = await pool.query(
       `
@@ -1211,6 +1655,17 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
       );
     };
 
+    const targetDateYmd = requestedDateYmd || currentLocalYmd();
+    const isScheduledForToday = (row) => {
+      const bookingDate = normalizeYmd(row?.reservation_date);
+      if (!bookingDate) return true;
+      return bookingDate === targetDateYmd;
+    };
+    const isCheckedInLike = (value) => {
+      const normalized = String(value || "").trim().toLowerCase();
+      return normalized === "checked_in" || normalized === "checked-in" || normalized === "checkin";
+    };
+
     const unavailableSet = new Set();
     const reservedSet = new Set();
 
@@ -1224,8 +1679,12 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
         return;
       }
 
+      if (!isCheckedInLike(status) && !isScheduledForToday(row)) {
+        return;
+      }
+
       unavailableSet.add(tableNumber);
-      if (status !== "checked_in") {
+      if (!isCheckedInLike(status)) {
         reservedSet.add(tableNumber);
       }
     });
@@ -1234,8 +1693,15 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
       const tableNumber = Number(row?.table_number);
       if (!Number.isFinite(tableNumber) || tableNumber <= 0) return;
 
+      const reservationOrderStatus = String(row?.reservation_order_status || "").toLowerCase();
+      if (!isCheckedInLike(reservationOrderStatus) && !isScheduledForToday(row)) {
+        return;
+      }
+
       unavailableSet.add(tableNumber);
-      reservedSet.add(tableNumber);
+      if (!isCheckedInLike(reservationOrderStatus)) {
+        reservedSet.add(tableNumber);
+      }
     });
 
     lockedRows.forEach((row) => {
@@ -1376,9 +1842,11 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
       reservation_guest_composition_field_mode: "optional",
       reservation_guest_composition_restriction_rule: "no_restriction",
       reservation_guest_composition_validation_message: "",
+      reservation_guest_composition_disabled_tables: [],
       disable_all_products: false,
       table_geo_enabled: false,
       table_geo_radius_meters: 150,
+      ...QR_BOOKING_DEFAULTS,
       ...QR_BRANDING_DEFAULTS,
       app_display_name: restaurant.name || "Restaurant",
     };

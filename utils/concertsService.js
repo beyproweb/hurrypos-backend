@@ -20,6 +20,13 @@ const GUEST_COMPOSITION_RESTRICTION_RULES = new Set([
   "couple_only",
   "custom_rule_later",
 ]);
+const {
+  loadBookingSlotSettings,
+  computeConcertSlot,
+  ensureBookingSlotSchema,
+  addMinutesToDateTime,
+  parseLocalDateTime,
+} = require("./bookingSlots");
 
 let concertTablesEnsured = false;
 
@@ -252,6 +259,45 @@ function normalizeArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function normalizeConcertReservationSlot(row, bookingSettings) {
+  const reservationDate = normalizeDateInput(row?.reservation_date);
+  const reservationTime = normalizeTimeInput(row?.reservation_time) || "00:00:00";
+  const fallbackStart =
+    reservationDate && reservationTime ? `${reservationDate} ${reservationTime}` : null;
+  const slotStartDateTime =
+    row?.slot_start_datetime != null ? String(row.slot_start_datetime) : fallbackStart;
+  if (!slotStartDateTime) return null;
+
+  const slotEndDateTime =
+    row?.slot_end_datetime != null
+      ? String(row.slot_end_datetime)
+      : addMinutesToDateTime(
+          slotStartDateTime,
+          asInt(row?.reservation_duration_minutes, bookingSettings.reservation_default_duration_minutes)
+        );
+  if (!slotEndDateTime) return null;
+
+  const bufferedEndDateTime = addMinutesToDateTime(
+    slotEndDateTime,
+    asInt(row?.reservation_buffer_minutes, bookingSettings.reservation_buffer_minutes)
+  );
+  return {
+    table_number: Number(row?.table_number),
+    slot_start_datetime: slotStartDateTime,
+    slot_end_datetime: slotEndDateTime,
+    slot_end_with_buffer_datetime: bufferedEndDateTime || slotEndDateTime,
+  };
+}
+
+function concertReservationSlotsOverlap(requestedSlot, existingSlot) {
+  const newStart = parseLocalDateTime(requestedSlot?.slot_start_datetime);
+  const newEnd = parseLocalDateTime(requestedSlot?.slot_end_datetime);
+  const existingStart = parseLocalDateTime(existingSlot?.slot_start_datetime);
+  const existingEnd = parseLocalDateTime(existingSlot?.slot_end_with_buffer_datetime);
+  if (!newStart || !newEnd || !existingStart || !existingEnd) return false;
+  return newStart < existingEnd && newEnd > existingStart;
+}
+
 function isActiveBooking(row) {
   const payment = asText(row?.payment_status, "").toLowerCase();
   const booking = asText(row?.booking_status, "").toLowerCase();
@@ -332,6 +378,8 @@ function sanitizeEventInput(payload = {}, { isPatch = false } = {}) {
 
 async function ensureConcertTables(pool) {
   if (concertTablesEnsured) return;
+
+  await ensureBookingSlotSchema(pool);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS concert_events (
@@ -748,12 +796,19 @@ function evaluateSoldOut({ eventRow, ticketTypes, areaAllocations, availableTick
   return tablesSoldOut;
 }
 
-async function buildEventView(client, eventRow) {
+async function buildEventView(client, eventRow, bookingSettings = null) {
   const restaurantId = Number(eventRow.restaurant_id);
   const eventId = Number(eventRow.id);
+  const resolvedBookingSettings =
+    bookingSettings || (await loadBookingSlotSettings(client, restaurantId));
   const { bookedTickets, bookedTables } = await getEventBookingCounters(client, restaurantId, eventId);
   const ticketTypes = await getTicketTypesWithAvailability(client, restaurantId, eventId);
   const areaAllocations = await getAreaAllocationsWithAvailability(client, restaurantId, eventId);
+  const eventSlot = computeConcertSlot({
+    eventDate: eventRow.event_date,
+    eventTime: eventRow.event_time,
+    settings: resolvedBookingSettings,
+  });
 
   const totalTickets = asInt(eventRow.total_ticket_quantity, 0);
   const totalTables = asInt(eventRow.total_table_quantity, 0);
@@ -775,6 +830,13 @@ async function buildEventView(client, eventRow) {
     event_title: eventRow.event_title || "",
     event_date: eventRow.event_date,
     event_time: eventRow.event_time,
+    slot_start_datetime: eventSlot?.slot_start_datetime || null,
+    slot_end_datetime: eventSlot?.slot_end_datetime || null,
+    event_duration_minutes: eventSlot?.event_duration_minutes || null,
+    event_end_time: eventSlot?.event_end_time || null,
+    entry_open_datetime: eventSlot?.entry_open_datetime || null,
+    entry_close_datetime: eventSlot?.entry_close_datetime || null,
+    allow_reentry: Boolean(eventSlot?.allow_reentry),
     description: eventRow.description || "",
     event_image: eventRow.event_image || "",
     ticket_price: asMoney(eventRow.ticket_price, 0),
@@ -814,7 +876,8 @@ async function refreshEventStatus(client, restaurantId, eventId) {
   const currentStatus = normalizeEventStatus(eventRow.status);
   if (currentStatus === "hidden") return "hidden";
 
-  const view = await buildEventView(client, eventRow);
+  const bookingSettings = await loadBookingSlotSettings(client, restaurantId);
+  const view = await buildEventView(client, eventRow, bookingSettings);
   const nextStatus =
     view.auto_sold_out || currentStatus === "sold_out" ? "sold_out" : "active";
   if (currentStatus !== nextStatus) {
@@ -853,9 +916,10 @@ async function listEvents(client, restaurantId, { includeHidden = true, upcoming
   `;
 
   const result = await client.query(query, params);
+  const bookingSettings = await loadBookingSlotSettings(client, restaurantId);
   const events = [];
   for (const row of result.rows) {
-    events.push(await buildEventView(client, row));
+    events.push(await buildEventView(client, row, bookingSettings));
   }
   return events;
 }
@@ -863,7 +927,8 @@ async function listEvents(client, restaurantId, { includeHidden = true, upcoming
 async function getEventById(client, restaurantId, eventId) {
   const row = await fetchEventRow(client, restaurantId, eventId);
   if (!row) return null;
-  return buildEventView(client, row);
+  const bookingSettings = await loadBookingSlotSettings(client, restaurantId);
+  return buildEventView(client, row, bookingSettings);
 }
 
 async function createEvent(pool, restaurantId, payload) {
@@ -1042,7 +1107,13 @@ async function listAreas(pool, restaurantId) {
   return result.rows.map((row) => row.area).filter(Boolean);
 }
 
-async function chooseAvailableTable(client, restaurantId, eventDate, eventTime, areaName = null) {
+async function chooseAvailableTable(
+  client,
+  restaurantId,
+  requestedSlot,
+  bookingSettings,
+  areaName = null
+) {
   const tablesResult = await client.query(
     `
     SELECT number, area, seats
@@ -1058,21 +1129,31 @@ async function chooseAvailableTable(client, restaurantId, eventDate, eventTime, 
 
   const busyResult = await client.query(
     `
-    SELECT DISTINCT table_number
+    SELECT
+      id,
+      table_number,
+      reservation_date,
+      reservation_time,
+      reservation_duration_minutes,
+      reservation_buffer_minutes,
+      slot_start_datetime,
+      slot_end_datetime
     FROM orders
     WHERE restaurant_id = $1
       AND table_number IS NOT NULL
       AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
-      AND reservation_date = $2::date
       AND (
-        $3::time IS NULL
-        OR COALESCE(reservation_time, '00:00:00'::time) = $3::time
+        slot_start_datetime IS NOT NULL
+        OR reservation_date IS NOT NULL
+        OR reservation_time IS NOT NULL
       )
     `,
-    [restaurantId, eventDate, eventTime]
+    [restaurantId]
   );
   const busy = new Set(
     busyResult.rows
+      .map((row) => normalizeConcertReservationSlot(row, bookingSettings))
+      .filter((row) => concertReservationSlotsOverlap(requestedSlot, row))
       .map((row) => Number(row.table_number))
       .filter((n) => Number.isFinite(n) && n > 0)
   );
@@ -1088,8 +1169,8 @@ async function chooseAvailableTable(client, restaurantId, eventDate, eventTime, 
 async function chooseSpecificAvailableTable(
   client,
   restaurantId,
-  eventDate,
-  eventTime,
+  requestedSlot,
+  bookingSettings,
   requestedTableNumber,
   areaName = null
 ) {
@@ -1113,21 +1194,34 @@ async function chooseSpecificAvailableTable(
 
   const busyResult = await client.query(
     `
-    SELECT id
+    SELECT
+      id,
+      table_number,
+      reservation_date,
+      reservation_time,
+      reservation_duration_minutes,
+      reservation_buffer_minutes,
+      slot_start_datetime,
+      slot_end_datetime
     FROM orders
     WHERE restaurant_id = $1
       AND table_number = $2
       AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
-      AND reservation_date = $3::date
       AND (
-        $4::time IS NULL
-        OR COALESCE(reservation_time, '00:00:00'::time) = $4::time
+        slot_start_datetime IS NOT NULL
+        OR reservation_date IS NOT NULL
+        OR reservation_time IS NOT NULL
       )
-    LIMIT 1
     `,
-    [restaurantId, tableNumber, eventDate, eventTime]
+    [restaurantId, tableNumber]
   );
-  if (busyResult.rows?.length) return null;
+  const hasOverlap = busyResult.rows.some((row) =>
+    concertReservationSlotsOverlap(
+      requestedSlot,
+      normalizeConcertReservationSlot(row, bookingSettings)
+    )
+  );
+  if (hasOverlap) return null;
 
   return {
     table_number: Number(tableRow.number),
@@ -1147,6 +1241,7 @@ async function listAvailableTablesForEvent(
   try {
     const eventRow = await fetchEventRow(client, restaurantId, eventId);
     if (!eventRow) return null;
+    const bookingSettings = await loadBookingSlotSettings(client, restaurantId);
 
     let resolvedAreaName = normalizeAreaName(areaName);
     const numericTicketTypeId = Number(ticketTypeId);
@@ -1165,9 +1260,12 @@ async function listAvailableTablesForEvent(
       resolvedAreaName = normalizeAreaName(ticketTypeResult.rows?.[0]?.area_name);
     }
 
-    const eventDate = normalizeDateInput(eventRow.event_date);
-    const eventTime = normalizeTimeInput(eventRow.event_time) || "00:00:00";
-    if (!eventDate) return [];
+    const eventSlot = computeConcertSlot({
+      eventDate: eventRow.event_date,
+      eventTime: eventRow.event_time,
+      settings: bookingSettings,
+    });
+    if (!eventSlot) return [];
 
     const tablesResult = await client.query(
       `
@@ -1183,21 +1281,31 @@ async function listAvailableTablesForEvent(
 
     const busyResult = await client.query(
       `
-      SELECT DISTINCT table_number
+      SELECT
+        id,
+        table_number,
+        reservation_date,
+        reservation_time,
+        reservation_duration_minutes,
+        reservation_buffer_minutes,
+        slot_start_datetime,
+        slot_end_datetime
       FROM orders
       WHERE restaurant_id = $1
         AND table_number IS NOT NULL
         AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
-        AND reservation_date = $2::date
         AND (
-          $3::time IS NULL
-          OR COALESCE(reservation_time, '00:00:00'::time) = $3::time
+          slot_start_datetime IS NOT NULL
+          OR reservation_date IS NOT NULL
+          OR reservation_time IS NOT NULL
         )
       `,
-      [restaurantId, eventDate, eventTime]
+      [restaurantId]
     );
     const busy = new Set(
       busyResult.rows
+        .map((row) => normalizeConcertReservationSlot(row, bookingSettings))
+        .filter((row) => concertReservationSlotsOverlap(eventSlot, row))
         .map((row) => Number(row.table_number))
         .filter((n) => Number.isFinite(n) && n > 0)
     );
@@ -1229,10 +1337,14 @@ async function createReservationOrder(client, payload) {
       reservation_time,
       reservation_clients,
       reservation_notes,
+      slot_start_datetime,
+      slot_end_datetime,
+      reservation_duration_minutes,
+      reservation_buffer_minutes,
       created_at
     )
     VALUES (
-      $1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, $7, $8, NOW()
+      $1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW()
     )
     RETURNING id, table_number, status, reservation_date, reservation_time
     `,
@@ -1245,6 +1357,10 @@ async function createReservationOrder(client, payload) {
       payload.reservation_time,
       payload.reservation_clients,
       payload.reservation_notes,
+      payload.slot_start_datetime || null,
+      payload.slot_end_datetime || null,
+      payload.reservation_duration_minutes || null,
+      payload.reservation_buffer_minutes || null,
     ]
   );
   return result.rows?.[0] || null;
@@ -1333,10 +1449,25 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const bookingSettings = await loadBookingSlotSettings(client, restaurantId);
     const eventRow = await fetchEventRow(client, restaurantId, eventId, { forUpdate: true });
     if (!eventRow) {
       await client.query("ROLLBACK");
       return { status: 404, error: "Concert event not found" };
+    }
+    const eventSlot = computeConcertSlot({
+      eventDate: eventRow.event_date,
+      eventTime: eventRow.event_time,
+      settings: bookingSettings,
+    });
+    if (!eventSlot) {
+      await client.query("ROLLBACK");
+      return { status: 400, error: "Concert event slot is invalid" };
+    }
+    const slotStartDate = parseLocalDateTime(eventSlot.slot_start_datetime);
+    if (!slotStartDate || slotStartDate < new Date()) {
+      await client.query("ROLLBACK");
+      return { status: 409, error: "Past events cannot be booked" };
     }
 
     const lockedStatus = normalizeEventStatus(eventRow.status);
@@ -1505,8 +1636,6 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
     let linkedOrder = null;
     let reservedTableNumber = null;
     if (bookingType === "table") {
-      const eventDate = normalizeDateInput(eventRow.event_date);
-      const eventTime = normalizeTimeInput(eventRow.event_time) || "00:00:00";
       const requestedTableNumber = asInt(
         rawPayload.requested_table_number || rawPayload.table_number,
         0
@@ -1516,16 +1645,16 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
           ? await chooseSpecificAvailableTable(
               client,
               restaurantId,
-              eventDate,
-              eventTime,
+              eventSlot,
+              bookingSettings,
               requestedTableNumber,
               areaName
             )
           : await chooseAvailableTable(
               client,
               restaurantId,
-              eventDate,
-              eventTime,
+              eventSlot,
+              bookingSettings,
               areaName
             );
       if (!tableChoice) {
@@ -1545,10 +1674,22 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         table_number: reservedTableNumber,
         customer_name: customerName,
         customer_phone: customerPhone,
-        reservation_date: eventDate,
-        reservation_time: eventTime,
+        reservation_date: normalizeDateInput(eventRow.event_date),
+        reservation_time: normalizeTimeInput(eventRow.event_time) || "00:00:00",
         reservation_clients: guestsCount || Math.max(1, tableChoice.seats || 1),
         reservation_notes: makeConcertReservationNote(eventRow, customerNote),
+        slot_start_datetime: eventSlot.slot_start_datetime,
+        slot_end_datetime: eventSlot.slot_end_datetime,
+        reservation_duration_minutes:
+          Math.max(
+            1,
+            Math.round(
+              (parseLocalDateTime(eventSlot.slot_end_datetime) -
+                parseLocalDateTime(eventSlot.slot_start_datetime)) /
+                60000
+            )
+          ) || bookingSettings.concert_event_duration_minutes,
+        reservation_buffer_minutes: 0,
       });
       if (!reservationOrder) {
         await client.query("ROLLBACK");
@@ -1610,12 +1751,17 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         booking_status,
         reservation_order_id,
         reserved_table_number,
+        slot_start_datetime,
+        slot_end_datetime,
+        entry_open_datetime,
+        entry_close_datetime,
+        allow_reentry,
         updated_at
       )
       VALUES (
         $1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10, $11, $12, $13, $14,
-        $15, $16, 'pending', $17, $18, NOW()
+        $15, $16, 'pending', $17, $18, $19, $20, $21, $22, $23, NOW()
       )
       RETURNING *
       `,
@@ -1638,6 +1784,11 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         paymentStatus,
         linkedOrder?.id || null,
         reservedTableNumber,
+        eventSlot.slot_start_datetime,
+        eventSlot.slot_end_datetime,
+        eventSlot.entry_open_datetime,
+        eventSlot.entry_close_datetime,
+        eventSlot.allow_reentry,
       ]
     );
 
@@ -1758,6 +1909,10 @@ async function updateBookingPaymentStatus(
               reservation_time = NULL,
               reservation_clients = NULL,
               reservation_notes = NULL,
+              slot_start_datetime = NULL,
+              slot_end_datetime = NULL,
+              reservation_duration_minutes = NULL,
+              reservation_buffer_minutes = NULL,
               updated_at = NOW()
           WHERE restaurant_id = $1
             AND id = $2
@@ -1857,6 +2012,14 @@ function mapBookingResponse(row) {
     reservation_order_id: row.reservation_order_id || null,
     reservation_order_status: row.reservation_order_status || null,
     reserved_table_number: row.reserved_table_number || null,
+    slot_start_datetime: row.slot_start_datetime || null,
+    slot_end_datetime: row.slot_end_datetime || null,
+    entry_open_datetime: row.entry_open_datetime || null,
+    entry_close_datetime: row.entry_close_datetime || null,
+    allow_reentry:
+      row.allow_reentry === undefined || row.allow_reentry === null
+        ? null
+        : Boolean(row.allow_reentry),
     bank_reference: row.bank_reference || null,
     cancellation_reason: asText(row.cancellation_reason, "") || null,
     cancel_reason: asText(row.cancellation_reason, "") || null,

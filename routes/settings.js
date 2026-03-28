@@ -14,6 +14,7 @@ const {
   normalizeCustomDomain,
   parseCustomDomain,
 } = require("../utils/restaurantSlug");
+const { DEFAULT_BOOKING_SLOT_SETTINGS } = require("../utils/bookingSlots");
 
 // ✅ protect all setting
 // ✅ protect all settings routes with tenant-safe auth
@@ -69,6 +70,10 @@ const BRANDING_UPLOAD_MIME_TYPES = new Set([
   "image/jpg",
   "image/svg+xml",
 ]);
+
+const QR_BOOKING_DEFAULTS = {
+  ...DEFAULT_BOOKING_SLOT_SETTINGS,
+};
 
 const brandingUpload = multer({
   storage: multer.memoryStorage(),
@@ -928,9 +933,11 @@ router.get("/qr-menu-customization", async (req, res) => {
       reservation_guest_composition_field_mode: "optional",
       reservation_guest_composition_restriction_rule: "no_restriction",
       reservation_guest_composition_validation_message: "",
+      reservation_guest_composition_disabled_tables: [],
       disable_all_products: false,
       table_geo_enabled: false,
       table_geo_radius_meters: 150,
+      ...QR_BOOKING_DEFAULTS,
       ...BRANDING_DEFAULTS,
       app_display_name: restaurantName || "Restaurant",
     };

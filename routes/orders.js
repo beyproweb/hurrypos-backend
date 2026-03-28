@@ -38,6 +38,22 @@ module.exports = function(io) {
     buildGuestQrScanUrl,
   } = require("../utils/guestQrImage");
   const {
+    loadBookingSlotSettings,
+    computeReservationSlot,
+    computeReservationCheckinWindow,
+    computeConcertCheckinWindow,
+    ensureBookingSlotSchema,
+    isDateWithinAdvanceLimit,
+    isTimeAlignedToStep,
+    buildTimeSlotsForDay,
+    getDayNameForYmd,
+    normalizeYmd,
+    normalizeTimeValue,
+    parseLocalDateTime,
+    addMinutesToDateTime,
+    isCurrentTimeInsideWindow,
+  } = require("../utils/bookingSlots");
+  const {
     CONFIRMATION_TYPES,
     sendOrderCustomerConfirmationEmail,
     sendOrderCustomerDeliveredEmail,
@@ -1259,6 +1275,356 @@ async function getQrMenuCustomization(restaurantId) {
   }
 }
 
+function parsePositiveInteger(value, fallback = 0) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function normalizeExistingReservationSlot(row, bookingSettings) {
+  const reservationDate = normalizeYmd(row?.reservation_date);
+  const reservationTime = normalizeTimeValue(row?.reservation_time) || "00:00:00";
+  const fallbackStart =
+    reservationDate && reservationTime ? `${reservationDate} ${reservationTime}` : null;
+  const slotStartDateTime =
+    row?.slot_start_datetime != null ? String(row.slot_start_datetime) : fallbackStart;
+  if (!slotStartDateTime) return null;
+
+  const durationMinutes = Math.max(
+    1,
+    parsePositiveInteger(
+      row?.reservation_duration_minutes,
+      bookingSettings.reservation_default_duration_minutes
+    )
+  );
+  const slotEndDateTime =
+    row?.slot_end_datetime != null
+      ? String(row.slot_end_datetime)
+      : addMinutesToDateTime(slotStartDateTime, durationMinutes);
+  if (!slotEndDateTime) return null;
+
+  const bufferMinutes = Math.max(
+    0,
+    parsePositiveInteger(row?.reservation_buffer_minutes, bookingSettings.reservation_buffer_minutes) ||
+      0
+  );
+  return {
+    id: Number(row?.id),
+    table_number: Number(row?.table_number),
+    reservation_date: reservationDate,
+    slot_start_datetime: slotStartDateTime,
+    slot_end_datetime: slotEndDateTime,
+    slot_end_with_buffer_datetime:
+      addMinutesToDateTime(slotEndDateTime, bufferMinutes) || slotEndDateTime,
+  };
+}
+
+function reservationSlotsOverlap(requestedSlot, existingSlot) {
+  const newStart = parseLocalDateTime(requestedSlot?.slot_start_datetime);
+  const newEnd = parseLocalDateTime(requestedSlot?.slot_end_datetime);
+  const existingStart = parseLocalDateTime(existingSlot?.slot_start_datetime);
+  const existingEnd = parseLocalDateTime(existingSlot?.slot_end_with_buffer_datetime);
+  if (!newStart || !newEnd || !existingStart || !existingEnd) return false;
+  return newStart < existingEnd && newEnd > existingStart;
+}
+
+function sortReservationTablesByBestFit(tables, guestCount) {
+  const safeGuestCount = parsePositiveInteger(guestCount, 0);
+  return [...(Array.isArray(tables) ? tables : [])].sort((left, right) => {
+    const leftSeats = parsePositiveInteger(left?.seats, 0);
+    const rightSeats = parsePositiveInteger(right?.seats, 0);
+    if (safeGuestCount > 0) {
+      const leftDelta = leftSeats > 0 ? leftSeats - safeGuestCount : Number.MAX_SAFE_INTEGER;
+      const rightDelta = rightSeats > 0 ? rightSeats - safeGuestCount : Number.MAX_SAFE_INTEGER;
+      const leftScore = leftDelta >= 0 ? leftDelta : Number.MAX_SAFE_INTEGER - safeGuestCount;
+      const rightScore = rightDelta >= 0 ? rightDelta : Number.MAX_SAFE_INTEGER - safeGuestCount;
+      if (leftScore !== rightScore) return leftScore - rightScore;
+    }
+    return Number(left?.table_number || 0) - Number(right?.table_number || 0);
+  });
+}
+
+function isReservationSlotInsideOpeningHours({ reservationDate, slot, openTime, closeTime }) {
+  const slotStart = parseLocalDateTime(slot?.slot_start_datetime);
+  const slotEnd = parseLocalDateTime(slot?.slot_end_datetime);
+  const normalizedOpen = normalizeTimeValue(openTime);
+  const normalizedClose = normalizeTimeValue(closeTime);
+  if (!slotStart || !slotEnd || !reservationDate || !normalizedOpen || !normalizedClose) {
+    return false;
+  }
+
+  const openDateTime = parseLocalDateTime(`${reservationDate} ${normalizedOpen}`);
+  const closeDateTime = parseLocalDateTime(`${reservationDate} ${normalizedClose}`);
+  if (!openDateTime || !closeDateTime) return false;
+  if (closeDateTime <= openDateTime) {
+    closeDateTime.setDate(closeDateTime.getDate() + 1);
+  }
+
+  return slotStart >= openDateTime && slotStart < closeDateTime && slotEnd <= closeDateTime;
+}
+
+async function loadShopHoursForReservationDay(restaurantId, reservationDate) {
+  const dayName = getDayNameForYmd(reservationDate);
+  if (!dayName) return null;
+  const result = await pool.query(
+    `
+    SELECT open_time, close_time
+    FROM shop_hours
+    WHERE restaurant_id = $1
+      AND LOWER(day) = LOWER($2)
+    LIMIT 1
+    `,
+    [restaurantId, dayName]
+  );
+  return result.rows?.[0] || null;
+}
+
+async function loadReservationAvailabilityForSlot({
+  restaurantId,
+  requestedSlot,
+  bookingSettings,
+  guestCount = 0,
+  excludeOrderId = null,
+}) {
+  const [{ rows: tables }, { rows: activeReservations }] = await Promise.all([
+    pool.query(
+      `
+      SELECT
+        number AS table_number,
+        seats,
+        area,
+        COALESCE(locked, FALSE) AS locked
+      FROM tables
+      WHERE restaurant_id = $1
+        AND COALESCE(active, TRUE) = TRUE
+      ORDER BY number ASC
+      `,
+      [restaurantId]
+    ),
+    pool.query(
+      `
+      SELECT
+        id,
+        table_number,
+        reservation_date,
+        reservation_time,
+        reservation_duration_minutes,
+        reservation_buffer_minutes,
+        slot_start_datetime,
+        slot_end_datetime,
+        status
+      FROM orders
+      WHERE restaurant_id = $1
+        AND table_number IS NOT NULL
+        AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled', 'deleted', 'void')
+        AND (
+          slot_start_datetime IS NOT NULL
+          OR reservation_date IS NOT NULL
+          OR reservation_time IS NOT NULL
+        )
+        AND ($2::int IS NULL OR id <> $2::int)
+      `,
+      [restaurantId, Number.isFinite(Number(excludeOrderId)) ? Number(excludeOrderId) : null]
+    ),
+  ]);
+
+  const targetDate = normalizeYmd(String(requestedSlot?.slot_start_datetime || "").slice(0, 10));
+  const maxPerTablePerDay = parsePositiveInteger(
+    bookingSettings.reservation_max_per_table_per_day,
+    0
+  );
+  const overlapByTable = new Map();
+  const perDayCountByTable = new Map();
+
+  for (const row of activeReservations) {
+    const normalizedSlot = normalizeExistingReservationSlot(row, bookingSettings);
+    if (!normalizedSlot) continue;
+    const tableNumber = Number(normalizedSlot.table_number);
+    if (!Number.isFinite(tableNumber) || tableNumber <= 0) continue;
+    if (normalizedSlot.reservation_date && normalizedSlot.reservation_date === targetDate) {
+      perDayCountByTable.set(tableNumber, Number(perDayCountByTable.get(tableNumber) || 0) + 1);
+    }
+    if (reservationSlotsOverlap(requestedSlot, normalizedSlot) && !overlapByTable.has(tableNumber)) {
+      overlapByTable.set(tableNumber, row);
+    }
+  }
+
+  const availableTables = [];
+  for (const table of tables) {
+    const tableNumber = Number(table?.table_number);
+    if (!Number.isFinite(tableNumber) || tableNumber <= 0) continue;
+    if (Boolean(table?.locked)) continue;
+
+    const seats = parsePositiveInteger(table?.seats, 0);
+    if (guestCount > 0 && seats > 0 && guestCount > seats) continue;
+    if (overlapByTable.has(tableNumber)) continue;
+    if (
+      maxPerTablePerDay > 0 &&
+      Number(perDayCountByTable.get(tableNumber) || 0) >= maxPerTablePerDay
+    ) {
+      continue;
+    }
+
+    availableTables.push({
+      table_number: tableNumber,
+      seats,
+      area_name: table?.area || null,
+    });
+  }
+
+  return {
+    availableTables: sortReservationTablesByBestFit(availableTables, guestCount),
+    overlappingReservations: overlapByTable,
+  };
+}
+
+async function buildValidatedReservationSlot({
+  restaurantId,
+  reservationDate,
+  reservationTime,
+  guestCount = 0,
+  requestedTableNumber = null,
+  excludeOrderId = null,
+}) {
+  await ensureBookingSlotSchema(pool);
+  const bookingSettings = await loadBookingSlotSettings(pool, restaurantId);
+
+  if (!normalizeYmd(reservationDate) || !normalizeTimeValue(reservationTime)) {
+    return { status: 400, error: "Reservation date and time are required" };
+  }
+  if (!isDateWithinAdvanceLimit(reservationDate, bookingSettings.booking_max_days_in_advance)) {
+    return {
+      status: 400,
+      error: `Bookings can only be made up to ${bookingSettings.booking_max_days_in_advance} day(s) in advance.`,
+    };
+  }
+  if (!isTimeAlignedToStep(reservationTime, bookingSettings.booking_time_interval_minutes)) {
+    return {
+      status: 400,
+      error: `Reservation time must follow ${bookingSettings.booking_time_interval_minutes}-minute slots.`,
+    };
+  }
+
+  const requestedSlot = computeReservationSlot({
+    reservationDate,
+    reservationTime,
+    settings: bookingSettings,
+  });
+  if (!requestedSlot) {
+    return { status: 400, error: "Invalid reservation slot" };
+  }
+
+  const shopHours = await loadShopHoursForReservationDay(restaurantId, reservationDate);
+  if (
+    !shopHours ||
+    !isReservationSlotInsideOpeningHours({
+      reservationDate,
+      slot: requestedSlot,
+      openTime: shopHours.open_time,
+      closeTime: shopHours.close_time,
+    })
+  ) {
+    return { status: 400, error: "Selected reservation time is outside opening hours" };
+  }
+
+  const availability = await loadReservationAvailabilityForSlot({
+    restaurantId,
+    requestedSlot,
+    bookingSettings,
+    guestCount,
+    excludeOrderId,
+  });
+
+  const numericRequestedTable = parsePositiveInteger(requestedTableNumber, 0);
+  let selectedTable = null;
+  if (numericRequestedTable > 0) {
+    selectedTable =
+      availability.availableTables.find(
+        (row) => Number(row.table_number) === numericRequestedTable
+      ) || null;
+    if (!selectedTable) {
+      return { status: 409, error: "Selected table is not available for this slot" };
+    }
+  } else {
+    selectedTable = availability.availableTables[0] || null;
+    if (!selectedTable) {
+      return { status: 409, error: "No available tables for this slot" };
+    }
+  }
+
+  return {
+    status: 200,
+    bookingSettings,
+    requestedSlot,
+    selectedTable,
+    availableTables: availability.availableTables,
+  };
+}
+
+function getReservationSlotStartDateTime(row) {
+  const reservationDate = normalizeYmd(row?.reservation_date);
+  const reservationTime = normalizeTimeValue(row?.reservation_time) || "00:00:00";
+  if (row?.slot_start_datetime) {
+    return String(row.slot_start_datetime);
+  }
+  if (!reservationDate || !reservationTime) return null;
+  return `${reservationDate} ${reservationTime}`;
+}
+
+async function validateReservationOrderCheckinWindow(restaurantId, reservationOrder) {
+  const slotStartDateTime = getReservationSlotStartDateTime(reservationOrder);
+  if (!slotStartDateTime) return;
+  const bookingSettings = await loadBookingSlotSettings(pool, restaurantId);
+  const window = computeReservationCheckinWindow({
+    slotStartDateTime,
+    settings: bookingSettings,
+  });
+  const insideWindow = isCurrentTimeInsideWindow({
+    openDateTime: window.checkin_open_datetime,
+    closeDateTime: window.checkin_close_datetime,
+  });
+  if (insideWindow) return;
+
+  const err = new Error("Reservation is outside the allowed check-in window.");
+  err.status = 409;
+  err.code = "reservation_checkin_window_closed";
+  err.checkinOpenDateTime = window.checkin_open_datetime || null;
+  err.checkinCloseDateTime = window.checkin_close_datetime || null;
+  throw err;
+}
+
+async function validateConcertBookingCheckinWindow(restaurantId, concertBooking) {
+  const slotStartDateTime = concertBooking?.slot_start_datetime
+    ? String(concertBooking.slot_start_datetime)
+    : null;
+  if (!slotStartDateTime) return;
+  const bookingSettings = await loadBookingSlotSettings(pool, restaurantId);
+  const computedWindow = computeConcertCheckinWindow({
+    slotStartDateTime,
+    settings: bookingSettings,
+  });
+  const entryOpenDateTime =
+    concertBooking?.entry_open_datetime != null
+      ? String(concertBooking.entry_open_datetime)
+      : computedWindow.entry_open_datetime;
+  const entryCloseDateTime =
+    concertBooking?.entry_close_datetime != null
+      ? String(concertBooking.entry_close_datetime)
+      : computedWindow.entry_close_datetime;
+  const insideWindow = isCurrentTimeInsideWindow({
+    openDateTime: entryOpenDateTime,
+    closeDateTime: entryCloseDateTime,
+  });
+  if (insideWindow) return;
+
+  const err = new Error("Concert entry is outside the allowed check-in window.");
+  err.status = 409;
+  err.code = "concert_checkin_window_closed";
+  err.checkinOpenDateTime = entryOpenDateTime || null;
+  err.checkinCloseDateTime = entryCloseDateTime || null;
+  throw err;
+}
+
 function parseReservationGuestCompositionValue(value) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
@@ -1318,13 +1684,28 @@ function reservationRestrictionRuleRequiresInput(rule) {
   ].includes(normalized);
 }
 
+function normalizeReservationGuestCompositionDisabledTables(values) {
+  return Array.from(
+    new Set(
+      (Array.isArray(values) ? values : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value > 0)
+    )
+  );
+}
+
 function validateReservationGuestComposition({
   config,
   guestCount,
   reservationMen,
   reservationWomen,
+  tableNumber,
 }) {
   const enabled = Boolean(config?.reservation_guest_composition_enabled);
+  const excludedTableNumbers = normalizeReservationGuestCompositionDisabledTables(
+    config?.reservation_guest_composition_disabled_tables
+  );
+  const normalizedTableNumber = Number(tableNumber);
   const restrictionRule = normalizeReservationGuestCompositionRestrictionRule(
     config?.reservation_guest_composition_restriction_rule,
     "no_restriction"
@@ -1336,7 +1717,13 @@ function validateReservationGuestComposition({
   const effectiveFieldMode = reservationRestrictionRuleRequiresInput(restrictionRule)
     ? "required"
     : fieldMode;
-  if (!enabled || effectiveFieldMode === "hidden") {
+  if (
+    !enabled ||
+    effectiveFieldMode === "hidden" ||
+    (Number.isFinite(normalizedTableNumber) &&
+      normalizedTableNumber > 0 &&
+      excludedTableNumbers.includes(normalizedTableNumber))
+  ) {
     return {
       reservationMenCount: null,
       reservationWomenCount: null,
@@ -6500,6 +6887,7 @@ router.post("/reservations", async (req, res) => {
         guestCount: clientCount,
         reservationMen: reservation_men,
         reservationWomen: reservation_women,
+        tableNumber: table_number,
       });
       if (guestCompositionValidation?.error) {
         return res.status(400).json({ error: guestCompositionValidation.error });
@@ -6508,6 +6896,7 @@ router.post("/reservations", async (req, res) => {
 
     const createStandaloneReservationForTable = async ({
       resolvedTableNumber,
+      slotContext,
       fallbackCustomerName = null,
       fallbackCustomerPhone = null,
       fallbackReservationMen = null,
@@ -6530,9 +6919,13 @@ router.post("/reservations", async (req, res) => {
           reservation_men,
           reservation_women,
           reservation_notes,
+          slot_start_datetime,
+          slot_end_datetime,
+          reservation_duration_minutes,
+          reservation_buffer_minutes,
           created_at
         )
-        VALUES ($1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        VALUES ($1, $2, 'reserved', 0, 'reservation', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
         RETURNING *`,
         [
           restaurantId,
@@ -6553,6 +6946,10 @@ router.post("/reservations", async (req, res) => {
               : Number(fallbackReservationWomen) || 0
             : Number(reservation_women) || 0,
           notes,
+          slotContext?.requestedSlot?.slot_start_datetime || null,
+          slotContext?.requestedSlot?.slot_end_datetime || null,
+          slotContext?.requestedSlot?.reservation_duration_minutes || null,
+          slotContext?.requestedSlot?.reservation_buffer_minutes || null,
         ]
       );
 
@@ -6718,17 +7115,25 @@ router.post("/reservations", async (req, res) => {
           sourceTotal <= 0);
 
       if (!isReservationOnlySource) {
-        const resolvedTableNumber = Number.isFinite(safeTableNumber)
+        const requestedTableNumber = Number.isFinite(safeTableNumber)
           ? safeTableNumber
           : Number.isFinite(sourceTableNumber)
-            ? sourceTableNumber
-            : null;
-        if (!Number.isFinite(resolvedTableNumber)) {
-          return res.status(400).json({ error: "Table number is required for reservation" });
+          ? sourceTableNumber
+          : null;
+        const slotContext = await buildValidatedReservationSlot({
+          restaurantId,
+          reservationDate: reservation_date,
+          reservationTime: reservation_time,
+          guestCount: clientCount,
+          requestedTableNumber,
+        });
+        if (slotContext?.status >= 400) {
+          return res.status(slotContext.status).json({ error: slotContext.error });
         }
 
         return await createStandaloneReservationForTable({
-          resolvedTableNumber,
+          resolvedTableNumber: Number(slotContext.selectedTable.table_number),
+          slotContext,
           fallbackCustomerName: safeCustomerName ?? sourceOrder?.customer_name ?? null,
           fallbackCustomerPhone: safeCustomerPhone ?? sourceOrder?.customer_phone ?? null,
           fallbackReservationMen: sourceOrder?.reservation_men ?? null,
@@ -6746,6 +7151,22 @@ router.post("/reservations", async (req, res) => {
         req.body || {},
         "reservation_women"
       );
+      const requestedTableNumber = Number.isFinite(safeTableNumber)
+        ? safeTableNumber
+        : Number.isFinite(sourceTableNumber)
+        ? sourceTableNumber
+        : null;
+      const slotContext = await buildValidatedReservationSlot({
+        restaurantId,
+        reservationDate: reservation_date,
+        reservationTime: reservation_time,
+        guestCount: clientCount,
+        requestedTableNumber,
+        excludeOrderId: sourceOrderId,
+      });
+      if (slotContext?.status >= 400) {
+        return res.status(slotContext.status).json({ error: slotContext.error });
+      }
 
       const result = await pool.query(
         `UPDATE orders
@@ -6764,6 +7185,10 @@ router.post("/reservations", async (req, res) => {
              table_number = COALESCE($9::int, table_number),
              customer_name = COALESCE($10::text, customer_name),
              customer_phone = COALESCE($11::text, customer_phone),
+             slot_start_datetime = $12,
+             slot_end_datetime = $13,
+             reservation_duration_minutes = $14,
+             reservation_buffer_minutes = $15,
              order_type = CASE
                WHEN LOWER(COALESCE(order_type,'')) = 'reservation' THEN 'table'
                ELSE COALESCE(order_type, 'table')
@@ -6774,7 +7199,7 @@ router.post("/reservations", async (req, res) => {
                ELSE COALESCE(status, 'reserved')
              END,
              updated_at = NOW()
-         WHERE restaurant_id = $12 AND id = $13
+         WHERE restaurant_id = $16 AND id = $17
          RETURNING *`,
         [
           reservation_date,
@@ -6785,9 +7210,13 @@ router.post("/reservations", async (req, res) => {
           hasReservationWomenInPayload,
           reservation_women == null ? null : Number(reservation_women) || 0,
           notes,
-          safeTableNumber,
+          Number(slotContext.selectedTable.table_number),
           safeCustomerName,
           safeCustomerPhone,
+          slotContext?.requestedSlot?.slot_start_datetime || null,
+          slotContext?.requestedSlot?.slot_end_datetime || null,
+          slotContext?.requestedSlot?.reservation_duration_minutes || null,
+          slotContext?.requestedSlot?.reservation_buffer_minutes || null,
           restaurantId,
           sourceOrderId,
         ]
@@ -6867,18 +7296,25 @@ router.post("/reservations", async (req, res) => {
       return;
     }
 
-    // If table_number provided, create a standalone reservation (new order)
-    if (table_number) {
-      const safeCustomerName = (customer_name || "").trim() || null;
-      const safeCustomerPhone = (customer_phone || "").trim() || null;
-      return await createStandaloneReservationForTable({
-        resolvedTableNumber: Number(table_number),
-        fallbackCustomerName: safeCustomerName,
-        fallbackCustomerPhone: safeCustomerPhone,
-      });
+    const safeCustomerName = (customer_name || "").trim() || null;
+    const safeCustomerPhone = (customer_phone || "").trim() || null;
+    const slotContext = await buildValidatedReservationSlot({
+      restaurantId,
+      reservationDate: reservation_date,
+      reservationTime: reservation_time,
+      guestCount: clientCount,
+      requestedTableNumber: table_number,
+    });
+    if (slotContext?.status >= 400) {
+      return res.status(slotContext.status).json({ error: slotContext.error });
     }
 
-    return res.status(400).json({ error: "Either order_id or table_number is required" });
+    return await createStandaloneReservationForTable({
+      resolvedTableNumber: Number(slotContext.selectedTable.table_number),
+      slotContext,
+      fallbackCustomerName: safeCustomerName,
+      fallbackCustomerPhone: safeCustomerPhone,
+    });
   } catch (err) {
     console.error("❌ Error creating reservation:", err);
     res.status(500).json({ error: "Failed to create reservation" });
@@ -6992,6 +7428,7 @@ router.get("/reservations/qr/:token", async (req, res) => {
 
   try {
     await ensureBookingQrSchema(pool);
+    await ensureBookingSlotSchema(pool);
 
     if (shouldServePublicQrImage(req)) {
       const decoded = decodeGuestQrToken(token, ["order_reservation"]);
@@ -7062,6 +7499,8 @@ router.get("/reservations/qr/:token", async (req, res) => {
         reservation_clients,
         customer_name,
         customer_phone,
+        slot_start_datetime,
+        slot_end_datetime,
         status,
         order_type,
         qr_status,
@@ -7085,6 +7524,22 @@ router.get("/reservations/qr/:token", async (req, res) => {
     }
 
     const normalizedStatus = String(reservation.status || "").toLowerCase();
+    let reservationCheckinWindow = null;
+    try {
+      reservationCheckinWindow = computeReservationCheckinWindow({
+        slotStartDateTime: getReservationSlotStartDateTime(reservation),
+        settings: await loadBookingSlotSettings(pool, restaurantId),
+      });
+    } catch {
+      reservationCheckinWindow = null;
+    }
+    const canCheckInNow =
+      ["reserved", "confirmed"].includes(normalizedStatus) &&
+      (!reservationCheckinWindow ||
+        isCurrentTimeInsideWindow({
+          openDateTime: reservationCheckinWindow.checkin_open_datetime,
+          closeDateTime: reservationCheckinWindow.checkin_close_datetime,
+        }));
     return res.json({
       success: true,
       reservation: {
@@ -7093,7 +7548,9 @@ router.get("/reservations/qr/:token", async (req, res) => {
         checkin_order_id: reservation.id,
         guest_name: reservation.customer_name || "",
         is_checked_in: normalizedStatus === "checked_in",
-        can_check_in: ["reserved", "confirmed"].includes(normalizedStatus),
+        can_check_in: canCheckInNow,
+        checkin_open_datetime: reservationCheckinWindow?.checkin_open_datetime || null,
+        checkin_close_datetime: reservationCheckinWindow?.checkin_close_datetime || null,
       },
     });
   } catch (err) {
@@ -7197,6 +7654,40 @@ router.put("/reservations/:id", async (req, res) => {
 
   try {
     await ensureReservationGuestCompositionFields();
+    await ensureBookingSlotSchema(pool);
+
+    const existingResult = await pool.query(
+      `
+      SELECT id, table_number, reservation_date, reservation_time, reservation_clients
+      FROM orders
+      WHERE restaurant_id = $1
+        AND id = $2
+      LIMIT 1
+      `,
+      [restaurantId, id]
+    );
+    const existingReservation = existingResult.rows?.[0] || null;
+    if (!existingReservation) {
+      return res.status(404).json({ error: "Reservation not found" });
+    }
+
+    const nextReservationDate = reservation_date || existingReservation.reservation_date;
+    const nextReservationTime = reservation_time || existingReservation.reservation_time;
+    const nextReservationClients =
+      reservation_clients !== undefined
+        ? parseInt(reservation_clients) || 0
+        : parseInt(existingReservation.reservation_clients) || 0;
+    const slotContext = await buildValidatedReservationSlot({
+      restaurantId,
+      reservationDate: nextReservationDate,
+      reservationTime: nextReservationTime,
+      guestCount: nextReservationClients,
+      requestedTableNumber: existingReservation.table_number,
+      excludeOrderId: id,
+    });
+    if (slotContext?.status >= 400) {
+      return res.status(slotContext.status).json({ error: slotContext.error });
+    }
 
     // Build dynamic UPDATE query
     const updates = [];
@@ -7234,6 +7725,17 @@ router.put("/reservations/:id", async (req, res) => {
       updates.push(`reservation_notes = $${paramIdx++}::text`);
       params.push((reservation_notes || "").trim());
     }
+
+    updates.push(`table_number = $${paramIdx++}::integer`);
+    params.push(Number(slotContext.selectedTable.table_number));
+    updates.push(`slot_start_datetime = $${paramIdx++}`);
+    params.push(slotContext?.requestedSlot?.slot_start_datetime || null);
+    updates.push(`slot_end_datetime = $${paramIdx++}`);
+    params.push(slotContext?.requestedSlot?.slot_end_datetime || null);
+    updates.push(`reservation_duration_minutes = $${paramIdx++}::integer`);
+    params.push(slotContext?.requestedSlot?.reservation_duration_minutes || null);
+    updates.push(`reservation_buffer_minutes = $${paramIdx++}::integer`);
+    params.push(slotContext?.requestedSlot?.reservation_buffer_minutes || null);
 
     if (updates.length === 0) {
       return res.status(400).json({ error: "No fields to update" });
@@ -7376,6 +7878,7 @@ router.get("/reservations/:id", async (req, res) => {
   };
 
 const checkInReservationOrder = async ({ restaurantId, orderId }) => {
+  let linkedConcertBooking = null;
   try {
     await ensureConcertTables(pool);
     const concertBookingResult = await pool.query(
@@ -7383,7 +7886,11 @@ const checkInReservationOrder = async ({ restaurantId, orderId }) => {
          id,
          booking_type,
          payment_status,
-         booking_status
+         booking_status,
+         slot_start_datetime,
+         entry_open_datetime,
+         entry_close_datetime,
+         allow_reentry
        FROM concert_bookings
        WHERE restaurant_id = $1
          AND reservation_order_id = $2
@@ -7392,7 +7899,7 @@ const checkInReservationOrder = async ({ restaurantId, orderId }) => {
        LIMIT 1`,
       [restaurantId, orderId]
     );
-    const linkedConcertBooking = concertBookingResult.rows?.[0] || null;
+    linkedConcertBooking = concertBookingResult.rows?.[0] || null;
     if (linkedConcertBooking) {
       const paymentStatus = String(linkedConcertBooking.payment_status || "").toLowerCase();
       const bookingStatus = String(linkedConcertBooking.booking_status || "").toLowerCase();
@@ -7408,15 +7915,53 @@ const checkInReservationOrder = async ({ restaurantId, orderId }) => {
         err.bookingStatus = bookingStatus || null;
         throw err;
       }
+      await validateConcertBookingCheckinWindow(restaurantId, linkedConcertBooking);
     }
   } catch (err) {
-    if (err?.code === "concert_booking_unconfirmed") {
+    if (
+      err?.code === "concert_booking_unconfirmed" ||
+      err?.code === "concert_checkin_window_closed"
+    ) {
       throw err;
     }
     console.warn(
       "⚠️ Failed to validate concert booking confirmation before check-in:",
       err?.message || err
     );
+  }
+
+  if (!linkedConcertBooking) {
+    try {
+      const reservationOrderResult = await pool.query(
+        `
+        SELECT
+          id,
+          reservation_date,
+          reservation_time,
+          slot_start_datetime,
+          slot_end_datetime,
+          reservation_duration_minutes,
+          reservation_buffer_minutes
+        FROM orders
+        WHERE restaurant_id = $1
+          AND id = $2
+        LIMIT 1
+        `,
+        [restaurantId, orderId]
+      );
+      const reservationOrder = reservationOrderResult.rows?.[0] || null;
+      if (reservationOrder) {
+        await validateReservationOrderCheckinWindow(restaurantId, reservationOrder);
+      }
+    } catch (err) {
+      if (err?.code === "reservation_checkin_window_closed") {
+        throw err;
+      }
+      console.warn(
+        "⚠️ Failed to validate reservation check-in window:",
+        err?.message || err
+      );
+    }
   }
 
   const result = await pool.query(
@@ -7484,12 +8029,21 @@ router.post("/reservations/:id/checkin", async (req, res) => {
       reservation: updatedReservation,
     });
   } catch (err) {
-    if (Number(err?.status) === 409 && err?.code === "concert_booking_unconfirmed") {
+    if (
+      Number(err?.status) === 409 &&
+      [
+        "concert_booking_unconfirmed",
+        "concert_checkin_window_closed",
+        "reservation_checkin_window_closed",
+      ].includes(err?.code)
+    ) {
       return res.status(409).json({
         error: err.message,
         code: err.code,
         payment_status: err.paymentStatus || null,
         booking_status: err.bookingStatus || null,
+        checkin_open_datetime: err.checkinOpenDateTime || null,
+        checkin_close_datetime: err.checkinCloseDateTime || null,
       });
     }
     console.error("❌ Error checking in reservation:", err);
@@ -7536,6 +8090,10 @@ router.delete("/reservations/:id", async (req, res) => {
            reservation_time = NULL,
            reservation_clients = NULL,
            reservation_notes = NULL,
+           slot_start_datetime = NULL,
+           slot_end_datetime = NULL,
+           reservation_duration_minutes = NULL,
+           reservation_buffer_minutes = NULL,
            status = CASE
              WHEN COALESCE(o.total, 0) <= 0
                AND NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id LIMIT 1)
@@ -7635,6 +8193,24 @@ router.post("/:id/reservations", async (req, res) => {
     const notes = (reservation_notes || "").trim();
     const dateStr = String(reservation_date).trim();
     const timeStr = String(reservation_time).trim();
+    const existingOrderResult = await pool.query(
+      `SELECT id, table_number FROM orders WHERE id = $1 AND restaurant_id = $2 LIMIT 1`,
+      [id, restaurantId]
+    );
+    if (existingOrderResult.rows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    const slotContext = await buildValidatedReservationSlot({
+      restaurantId,
+      reservationDate: dateStr,
+      reservationTime: timeStr,
+      guestCount: clientCount,
+      requestedTableNumber: existingOrderResult.rows[0]?.table_number,
+      excludeOrderId: id,
+    });
+    if (slotContext?.status >= 400) {
+      return res.status(slotContext.status).json({ error: slotContext.error });
+    }
 
     const result = await pool.query(
       `UPDATE orders 
@@ -7644,8 +8220,13 @@ router.post("/:id/reservations", async (req, res) => {
            reservation_men = $4,
            reservation_women = $5,
            reservation_notes = $6,
+           table_number = COALESCE($7::int, table_number),
+           slot_start_datetime = $8,
+           slot_end_datetime = $9,
+           reservation_duration_minutes = $10,
+           reservation_buffer_minutes = $11,
            updated_at = NOW()
-       WHERE id = $7 AND restaurant_id = $8
+       WHERE id = $12 AND restaurant_id = $13
        RETURNING id, reservation_date, reservation_time, reservation_clients, reservation_men, reservation_women, reservation_notes`,
       [
         dateStr,
@@ -7654,6 +8235,11 @@ router.post("/:id/reservations", async (req, res) => {
         reservation_men === null || reservation_men === "" ? null : parseInt(reservation_men) || 0,
         reservation_women === null || reservation_women === "" ? null : parseInt(reservation_women) || 0,
         notes,
+        Number(slotContext.selectedTable.table_number),
+        slotContext?.requestedSlot?.slot_start_datetime || null,
+        slotContext?.requestedSlot?.slot_end_datetime || null,
+        slotContext?.requestedSlot?.reservation_duration_minutes || null,
+        slotContext?.requestedSlot?.reservation_buffer_minutes || null,
         id,
         restaurantId,
       ]
@@ -7699,6 +8285,24 @@ router.put("/:id/reservations", async (req, res) => {
     const notes = (reservation_notes || "").trim();
     const dateStr = String(reservation_date).trim();
     const timeStr = String(reservation_time).trim();
+    const existingOrderResult = await pool.query(
+      `SELECT id, table_number FROM orders WHERE id = $1 AND restaurant_id = $2 LIMIT 1`,
+      [id, restaurantId]
+    );
+    if (existingOrderResult.rows.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    const slotContext = await buildValidatedReservationSlot({
+      restaurantId,
+      reservationDate: dateStr,
+      reservationTime: timeStr,
+      guestCount: clientCount,
+      requestedTableNumber: existingOrderResult.rows[0]?.table_number,
+      excludeOrderId: id,
+    });
+    if (slotContext?.status >= 400) {
+      return res.status(slotContext.status).json({ error: slotContext.error });
+    }
 
     const result = await pool.query(
       `UPDATE orders 
@@ -7708,8 +8312,13 @@ router.put("/:id/reservations", async (req, res) => {
            reservation_men = $4,
            reservation_women = $5,
            reservation_notes = $6,
+           table_number = COALESCE($7::int, table_number),
+           slot_start_datetime = $8,
+           slot_end_datetime = $9,
+           reservation_duration_minutes = $10,
+           reservation_buffer_minutes = $11,
            updated_at = NOW()
-       WHERE id = $7 AND restaurant_id = $8
+       WHERE id = $12 AND restaurant_id = $13
        RETURNING id, reservation_date, reservation_time, reservation_clients, reservation_men, reservation_women, reservation_notes`,
       [
         dateStr,
@@ -7718,6 +8327,11 @@ router.put("/:id/reservations", async (req, res) => {
         reservation_men === null || reservation_men === "" ? null : parseInt(reservation_men) || 0,
         reservation_women === null || reservation_women === "" ? null : parseInt(reservation_women) || 0,
         notes,
+        Number(slotContext.selectedTable.table_number),
+        slotContext?.requestedSlot?.slot_start_datetime || null,
+        slotContext?.requestedSlot?.slot_end_datetime || null,
+        slotContext?.requestedSlot?.reservation_duration_minutes || null,
+        slotContext?.requestedSlot?.reservation_buffer_minutes || null,
         id,
         restaurantId,
       ]
@@ -7802,6 +8416,10 @@ router.delete("/:id/reservations", async (req, res) => {
               reservation_time = NULL,
               reservation_clients = NULL,
               reservation_notes = NULL,
+              slot_start_datetime = NULL,
+              slot_end_datetime = NULL,
+              reservation_duration_minutes = NULL,
+              reservation_buffer_minutes = NULL,
               status = CASE
                 WHEN $3 THEN 'closed'
                 WHEN LOWER(COALESCE(status,'')) = 'reserved' THEN 'confirmed'
@@ -7896,12 +8514,21 @@ router.post("/:id/reservations/checkin", async (req, res) => {
       reservation: updatedOrder,
     });
   } catch (err) {
-    if (Number(err?.status) === 409 && err?.code === "concert_booking_unconfirmed") {
+    if (
+      Number(err?.status) === 409 &&
+      [
+        "concert_booking_unconfirmed",
+        "concert_checkin_window_closed",
+        "reservation_checkin_window_closed",
+      ].includes(err?.code)
+    ) {
       return res.status(409).json({
         error: err.message,
         code: err.code,
         payment_status: err.paymentStatus || null,
         booking_status: err.bookingStatus || null,
+        checkin_open_datetime: err.checkinOpenDateTime || null,
+        checkin_close_datetime: err.checkinCloseDateTime || null,
       });
     }
     console.error("❌ Error checking in reservation for order:", err);
