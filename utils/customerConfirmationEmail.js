@@ -1,5 +1,6 @@
 const { sendEmail } = require("./notifications");
 const { loadLocalizationForRestaurant } = require("./localization");
+const { ensureBookingQrSchema } = require("./bookingQrAsync");
 
 const CONFIRMATION_TYPES = Object.freeze({
   CONCERT_TICKET: "concert_ticket",
@@ -187,6 +188,7 @@ const EMAIL_I18N = Object.freeze({
     quantity: "Quantity",
     reserved_table: "Reserved table",
     concert_subject: "Your concert ticket is confirmed at {{restaurant}}",
+    concert_pending_subject: "Your concert booking was received at {{restaurant}}",
     concert_cancelled_subject: "Your concert booking was cancelled at {{restaurant}}",
     reservation_subject: "Your reservation is confirmed at {{restaurant}}",
     reservation_cancelled_subject: "Your reservation was cancelled at {{restaurant}}",
@@ -195,6 +197,7 @@ const EMAIL_I18N = Object.freeze({
     delivery_cancelled_subject: "Your delivery order from {{restaurant}} was cancelled",
     pickup_subject: "Thank you for your order - Pickup confirmed",
     concert_headline: "Your concert ticket is confirmed",
+    concert_pending_headline: "Your concert booking was received",
     concert_cancelled_headline: "Your concert booking was cancelled",
     reservation_headline: "Your reservation is confirmed",
     reservation_cancelled_headline: "Your reservation was cancelled",
@@ -203,6 +206,8 @@ const EMAIL_I18N = Object.freeze({
     delivery_cancelled_headline: "Your delivery order was cancelled",
     pickup_headline: "Your order is confirmed",
     concert_lead: "Thank you for your order. Your concert booking has been confirmed.",
+    concert_pending_lead:
+      "Thank you for your order. We received your concert booking and attached your QR code for later check-in.",
     concert_cancelled_lead: "Your concert booking has been cancelled.",
     reservation_lead: "Thank you for your reservation. Your table booking is now confirmed.",
     reservation_cancelled_lead: "Your table reservation has been cancelled.",
@@ -232,6 +237,8 @@ const EMAIL_I18N = Object.freeze({
       "Your reservation has been cancelled. If this was unexpected, please contact {{restaurant}}.",
     order_closing:
       "Thank you for choosing {{restaurant}}. Your order is confirmed. We look forward to seeing you soon.",
+    concert_pending_closing:
+      "We will notify you again if your booking status changes. If this was unexpected, please contact {{restaurant}}.",
     delivery_delivered_closing:
       "Your order has been delivered. If anything is missing, please contact {{restaurant}}.",
     delivery_cancelled_closing:
@@ -276,6 +283,7 @@ const EMAIL_I18N = Object.freeze({
     quantity: "Adet",
     reserved_table: "Rezerve masa",
     concert_subject: "{{restaurant}} için konser biletiniz onaylandı",
+    concert_pending_subject: "{{restaurant}} için konser rezervasyonunuz alındı",
     concert_cancelled_subject: "{{restaurant}} için konser rezervasyonunuz iptal edildi",
     reservation_subject: "{{restaurant}} için rezervasyonunuz onaylandı",
     reservation_cancelled_subject: "{{restaurant}} için rezervasyonunuz iptal edildi",
@@ -284,6 +292,7 @@ const EMAIL_I18N = Object.freeze({
     delivery_cancelled_subject: "{{restaurant}} teslimat siparişiniz iptal edildi",
     pickup_subject: "Siparişiniz için teşekkürler - Gel al onaylandı",
     concert_headline: "Konser biletiniz onaylandı",
+    concert_pending_headline: "Konser rezervasyonunuz alındı",
     concert_cancelled_headline: "Konser rezervasyonunuz iptal edildi",
     reservation_headline: "Rezervasyonunuz onaylandı",
     reservation_cancelled_headline: "Rezervasyonunuz iptal edildi",
@@ -292,6 +301,8 @@ const EMAIL_I18N = Object.freeze({
     delivery_cancelled_headline: "Teslimat siparişiniz iptal edildi",
     pickup_headline: "Siparişiniz onaylandı",
     concert_lead: "Siparişiniz için teşekkürler. Konser rezervasyonunuz onaylandı.",
+    concert_pending_lead:
+      "Siparişiniz için teşekkürler. Konser rezervasyonunuzu aldık ve sonraki check-in işlemleri için QR kodunuzu ekledik.",
     concert_cancelled_lead: "Konser rezervasyonunuz iptal edildi.",
     reservation_lead: "Rezervasyonunuz için teşekkürler. Masa rezervasyonunuz onaylandı.",
     reservation_cancelled_lead: "Masa rezervasyonunuz iptal edildi.",
@@ -317,6 +328,8 @@ const EMAIL_I18N = Object.freeze({
       "Rezervasyonunuz iptal edildi. Beklenmedik bir durum ise lütfen {{restaurant}} ile iletişime geçin.",
     order_closing:
       "{{restaurant}} tercihiniz için teşekkürler. Siparişiniz onaylandı. Sizi yakında görmek için sabırsızlanıyoruz.",
+    concert_pending_closing:
+      "Rezervasyon durumunuz değişirse size tekrar haber vereceğiz. Beklenmedik bir durum ise lütfen {{restaurant}} ile iletişime geçin.",
     delivery_delivered_closing:
       "Siparişiniz teslim edildi. Eksik bir şey varsa lütfen {{restaurant}} ile iletişime geçin.",
     delivery_cancelled_closing:
@@ -361,6 +374,7 @@ const EMAIL_I18N = Object.freeze({
     quantity: "Menge",
     reserved_table: "Reservierter Tisch",
     concert_subject: "Ihr Konzertticket bei {{restaurant}} ist bestätigt",
+    concert_pending_subject: "Ihre Konzertbuchung bei {{restaurant}} ist eingegangen",
     concert_cancelled_subject: "Ihre Konzertbuchung bei {{restaurant}} wurde storniert",
     reservation_subject: "Ihre Reservierung bei {{restaurant}} ist bestätigt",
     reservation_cancelled_subject: "Ihre Reservierung bei {{restaurant}} wurde storniert",
@@ -369,6 +383,7 @@ const EMAIL_I18N = Object.freeze({
     delivery_cancelled_subject: "Ihre Lieferbestellung von {{restaurant}} wurde storniert",
     pickup_subject: "Vielen Dank für Ihre Bestellung - Abholung bestätigt",
     concert_headline: "Ihr Konzertticket ist bestätigt",
+    concert_pending_headline: "Ihre Konzertbuchung ist eingegangen",
     concert_cancelled_headline: "Ihre Konzertbuchung wurde storniert",
     reservation_headline: "Ihre Reservierung ist bestätigt",
     reservation_cancelled_headline: "Ihre Reservierung wurde storniert",
@@ -377,6 +392,8 @@ const EMAIL_I18N = Object.freeze({
     delivery_cancelled_headline: "Ihre Lieferbestellung wurde storniert",
     pickup_headline: "Ihre Bestellung ist bestätigt",
     concert_lead: "Vielen Dank für Ihre Bestellung. Ihre Konzertbuchung wurde bestätigt.",
+    concert_pending_lead:
+      "Vielen Dank für Ihre Bestellung. Wir haben Ihre Konzertbuchung erhalten und Ihren QR-Code für den späteren Check-in beigefügt.",
     concert_cancelled_lead: "Ihre Konzertbuchung wurde storniert.",
     reservation_lead: "Vielen Dank für Ihre Reservierung. Ihre Tischreservierung wurde bestätigt.",
     reservation_cancelled_lead: "Ihre Tischreservierung wurde storniert.",
@@ -406,6 +423,8 @@ const EMAIL_I18N = Object.freeze({
       "Ihre Reservierung wurde storniert. Falls dies unerwartet ist, kontaktieren Sie bitte {{restaurant}}.",
     order_closing:
       "Vielen Dank, dass Sie sich für {{restaurant}} entschieden haben. Ihre Bestellung ist bestätigt. Wir freuen uns auf Sie.",
+    concert_pending_closing:
+      "Wir informieren Sie erneut, falls sich Ihr Buchungsstatus ändert. Falls dies unerwartet ist, kontaktieren Sie bitte {{restaurant}}.",
     delivery_delivered_closing:
       "Ihre Bestellung wurde zugestellt. Falls etwas fehlt, kontaktieren Sie bitte {{restaurant}}.",
     delivery_cancelled_closing:
@@ -450,6 +469,7 @@ const EMAIL_I18N = Object.freeze({
     quantity: "Quantité",
     reserved_table: "Table réservée",
     concert_subject: "Votre billet de concert est confirmé chez {{restaurant}}",
+    concert_pending_subject: "Votre réservation de concert a été reçue chez {{restaurant}}",
     concert_cancelled_subject: "Votre réservation de concert a été annulée chez {{restaurant}}",
     reservation_subject: "Votre réservation est confirmée chez {{restaurant}}",
     reservation_cancelled_subject: "Votre réservation a été annulée chez {{restaurant}}",
@@ -458,6 +478,7 @@ const EMAIL_I18N = Object.freeze({
     delivery_cancelled_subject: "Votre commande en livraison de {{restaurant}} a été annulée",
     pickup_subject: "Merci pour votre commande - Retrait confirmé",
     concert_headline: "Votre billet de concert est confirmé",
+    concert_pending_headline: "Votre réservation de concert a été reçue",
     concert_cancelled_headline: "Votre réservation de concert a été annulée",
     reservation_headline: "Votre réservation est confirmée",
     reservation_cancelled_headline: "Votre réservation a été annulée",
@@ -466,6 +487,8 @@ const EMAIL_I18N = Object.freeze({
     delivery_cancelled_headline: "Votre commande en livraison a été annulée",
     pickup_headline: "Votre commande est confirmée",
     concert_lead: "Merci pour votre commande. Votre réservation de concert a été confirmée.",
+    concert_pending_lead:
+      "Merci pour votre commande. Nous avons bien reçu votre réservation de concert et joint votre QR code pour le check-in ultérieur.",
     concert_cancelled_lead: "Votre réservation de concert a été annulée.",
     reservation_lead: "Merci pour votre réservation. Votre réservation de table est confirmée.",
     reservation_cancelled_lead: "Votre réservation de table a été annulée.",
@@ -495,6 +518,8 @@ const EMAIL_I18N = Object.freeze({
       "Votre réservation a été annulée. Si cela est inattendu, veuillez contacter {{restaurant}}.",
     order_closing:
       "Merci d'avoir choisi {{restaurant}}. Votre commande est confirmée. Nous avons hâte de vous accueillir.",
+    concert_pending_closing:
+      "Nous vous informerons à nouveau si le statut de votre réservation change. Si cela est inattendu, veuillez contacter {{restaurant}}.",
     delivery_delivered_closing:
       "Votre commande a été livrée. S'il manque quelque chose, veuillez contacter {{restaurant}}.",
     delivery_cancelled_closing:
@@ -603,6 +628,11 @@ function buildSubject(confirmationType, restaurantName, language = "en") {
   }
 }
 
+function buildConcertPendingSubject(restaurantName, language = "en") {
+  const safeName = asText(restaurantName, translateEmail(language, "our_restaurant"));
+  return translateEmail(language, "concert_pending_subject", { restaurant: safeName });
+}
+
 function buildHeadline(confirmationType, language = "en") {
   switch (confirmationType) {
     case CONFIRMATION_TYPES.CONCERT_TICKET:
@@ -623,6 +653,10 @@ function buildHeadline(confirmationType, language = "en") {
     default:
       return translateEmail(language, "pickup_headline");
   }
+}
+
+function buildConcertPendingHeadline(language = "en") {
+  return translateEmail(language, "concert_pending_headline");
 }
 
 function buildLeadMessage(confirmationType, language = "en") {
@@ -647,6 +681,10 @@ function buildLeadMessage(confirmationType, language = "en") {
   }
 }
 
+function buildConcertPendingLeadMessage(language = "en") {
+  return translateEmail(language, "concert_pending_lead");
+}
+
 function buildClosingMessage(confirmationType, restaurantName, language = "en") {
   const safeRestaurant = asText(restaurantName, translateEmail(language, "our_restaurant"));
   if (confirmationType === CONFIRMATION_TYPES.TABLE_RESERVATION) {
@@ -665,6 +703,11 @@ function buildClosingMessage(confirmationType, restaurantName, language = "en") 
     return translateEmail(language, "delivery_cancelled_closing", { restaurant: safeRestaurant });
   }
   return translateEmail(language, "order_closing", { restaurant: safeRestaurant });
+}
+
+function buildConcertPendingClosingMessage(restaurantName, language = "en") {
+  const safeRestaurant = asText(restaurantName, translateEmail(language, "our_restaurant"));
+  return translateEmail(language, "concert_pending_closing", { restaurant: safeRestaurant });
 }
 
 function buildOwnerNotificationSubject(notificationType, restaurantName, language = "en") {
@@ -745,7 +788,11 @@ function buildHtmlTemplate({
   customerName,
   details,
   items,
+  headline = "",
+  leadMessage = "",
   closingMessage,
+  qrUrl = "",
+  qrImage = "",
   language = "en",
 }) {
   const t = (key, params) => translateEmail(language, key, params);
@@ -790,6 +837,24 @@ function buildHtmlTemplate({
         </ul>
       </div>`
     : "";
+  const qrSectionHtml =
+    qrUrl || qrImage
+      ? `<div style="margin-top:20px;padding:18px;border:1px solid #E5E7EB;border-radius:16px;background:#F9FAFB;text-align:center;">
+          <div style="font-size:13px;color:#6B7280;letter-spacing:.02em;margin-bottom:10px;">QR Code</div>
+          ${
+            qrImage
+              ? `<img src="${escapeHtml(qrImage)}" alt="QR Code" style="display:block;width:180px;height:180px;margin:0 auto 12px auto;border-radius:12px;background:#FFFFFF;padding:10px;border:1px solid #E5E7EB;" />`
+              : ""
+          }
+          ${
+            qrUrl
+              ? `<div style="font-size:13px;line-height:1.6;word-break:break-all;color:#111827;">${escapeHtml(
+                  qrUrl
+                )}</div>`
+              : ""
+          }
+        </div>`
+      : "";
   const footerParts = [
     restaurant.name,
     restaurant.contactEmail ? `${t("email_label")}: ${restaurant.contactEmail}` : "",
@@ -821,15 +886,16 @@ function buildHtmlTemplate({
                         : t("greeting_generic")
                     )}</p>
                     <h1 style="margin:0 0 10px 0;font-size:24px;line-height:1.25;color:#111827;">${escapeHtml(
-                      buildHeadline(confirmationType, language)
+                      headline || buildHeadline(confirmationType, language)
                     )}</h1>
                     <p style="margin:0 0 16px 0;font-size:15px;line-height:1.6;color:#374151;">${escapeHtml(
-                      buildLeadMessage(confirmationType, language)
+                      leadMessage || buildLeadMessage(confirmationType, language)
                     )}</p>
                     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-top:1px solid #E5E7EB;border-bottom:1px solid #E5E7EB;padding:10px 0;">
                       ${detailRowsHtml}
                     </table>
                     ${itemsHtml}
+                    ${qrSectionHtml}
                     <p style="margin:18px 0 0 0;font-size:15px;line-height:1.6;color:#374151;">${escapeHtml(
                       closingMessage
                     )}</p>
@@ -854,7 +920,10 @@ function buildTextTemplate({
   customerName,
   details,
   items,
+  headline = "",
+  leadMessage = "",
   closingMessage,
+  qrUrl = "",
   language = "en",
 }) {
   const t = (key, params) => translateEmail(language, key, params);
@@ -865,15 +934,17 @@ function buildTextTemplate({
   const itemLines = items.length
     ? `\n${t("items")}:\n${items.map((line) => `- ${line}`).join("\n")}\n`
     : "";
+  const qrLines = qrUrl ? `\nQR Code:\n${qrUrl}\n` : "";
 
   return [
     greeting,
     "",
-    buildHeadline(confirmationType, language),
-    buildLeadMessage(confirmationType, language),
+    headline || buildHeadline(confirmationType, language),
+    leadMessage || buildLeadMessage(confirmationType, language),
     "",
     detailLines,
     itemLines,
+    qrLines,
     closingMessage,
     "",
     `${restaurant.name}${restaurant.contactEmail ? ` | ${t("email_label")}: ${restaurant.contactEmail}` : ""}${
@@ -1485,10 +1556,23 @@ async function sendCustomerConfirmationEmail({
       return { sent: false, skipped: "restaurant_not_found" };
     }
 
-    const subject = buildSubject(confirmationType, restaurantBranding.name, language);
+    const shouldUseConcertPendingCopy =
+      confirmationType === CONFIRMATION_TYPES.CONCERT_TICKET &&
+      String(loadedData.concertEmailState || "").toLowerCase() === "pending";
+    const subject = shouldUseConcertPendingCopy
+      ? buildConcertPendingSubject(restaurantBranding.name, language)
+      : buildSubject(confirmationType, restaurantBranding.name, language);
+    const headline = shouldUseConcertPendingCopy
+      ? buildConcertPendingHeadline(language)
+      : buildHeadline(confirmationType, language);
+    const leadMessage = shouldUseConcertPendingCopy
+      ? buildConcertPendingLeadMessage(language)
+      : buildLeadMessage(confirmationType, language);
     const details = Array.isArray(loadedData.details) ? loadedData.details.filter(Boolean) : [];
     const items = Array.isArray(loadedData.items) ? loadedData.items.filter(Boolean) : [];
-    const closingMessage = buildClosingMessage(confirmationType, restaurantBranding.name, language);
+    const closingMessage = shouldUseConcertPendingCopy
+      ? buildConcertPendingClosingMessage(restaurantBranding.name, language)
+      : buildClosingMessage(confirmationType, restaurantBranding.name, language);
 
     const html = buildHtmlTemplate({
       subject,
@@ -1497,7 +1581,11 @@ async function sendCustomerConfirmationEmail({
       customerName: loadedData.customerName,
       details,
       items,
+      headline,
+      leadMessage,
       closingMessage,
+      qrUrl: loadedData.qrUrl,
+      qrImage: loadedData.qrImage,
       language,
     });
     const text = buildTextTemplate({
@@ -1506,7 +1594,10 @@ async function sendCustomerConfirmationEmail({
       customerName: loadedData.customerName,
       details,
       items,
+      headline,
+      leadMessage,
       closingMessage,
+      qrUrl: loadedData.qrUrl,
       language,
     });
 
@@ -1570,6 +1661,10 @@ async function loadOrderEmailContext(
     t = (key, params) => translateEmail(language, key, params),
   }
 ) {
+  await ensureBookingQrSchema({
+    query: (...args) => client.query(...args),
+  });
+
   let order = orderSnapshot;
   if (!order) {
     const orderResult = await client.query(
@@ -1594,7 +1689,10 @@ async function loadOrderEmailContext(
         reservation_notes,
         takeaway_notes,
         table_number,
-        cancellation_reason
+        cancellation_reason,
+        qr_status,
+        qr_url,
+        qr_image
       FROM orders
       WHERE restaurant_id = $1
         AND id = $2
@@ -1703,6 +1801,9 @@ async function loadOrderEmailContext(
         ? []
         : normalizeItems(itemResult.rows, { language, t }),
     notes: asText(order.takeaway_notes || order.reservation_notes, ""),
+    qrStatus: asText(order.qr_status, ""),
+    qrUrl: asText(order.qr_url, ""),
+    qrImage: asText(order.qr_image, ""),
   };
 }
 
@@ -1753,6 +1854,9 @@ async function sendConcertCustomerConfirmationEmail({
     triggeredFrom,
     req,
     dataLoader: async (client, { language = "en", t = (key, params) => translateEmail(language, key, params) }) => {
+      await ensureBookingQrSchema({
+        query: (...args) => client.query(...args),
+      });
       const bookingResult = await client.query(
         `
         SELECT
@@ -1766,6 +1870,9 @@ async function sendConcertCustomerConfirmationEmail({
           cb.payment_status,
           cb.booking_type,
           cb.confirmed_at,
+          cb.qr_status,
+          cb.qr_url,
+          cb.qr_image,
           cb.reservation_order_id,
           tt.name AS ticket_type_name,
           ce.event_title,
@@ -1785,6 +1892,8 @@ async function sendConcertCustomerConfirmationEmail({
       );
       const booking = bookingResult.rows?.[0];
       if (!booking) return null;
+      const normalizedPaymentStatus = asText(booking.payment_status, "").toLowerCase();
+      const concertEmailState = normalizedPaymentStatus === "confirmed" ? "confirmed" : "pending";
 
       const details = [
         { label: t("booking_number"), value: `#${booking.id}` },
@@ -1832,6 +1941,10 @@ async function sendConcertCustomerConfirmationEmail({
         customerEmail: "",
         details,
         items: itemLine ? [itemLine] : [],
+        qrStatus: asText(booking.qr_status, ""),
+        qrUrl: asText(booking.qr_url, ""),
+        qrImage: asText(booking.qr_image, ""),
+        concertEmailState,
       };
     },
   });

@@ -11,6 +11,11 @@ const {
   mapBookingResponse,
 } = require("../utils/concertsService");
 const { sendConcertOwnerReservationNotificationEmail } = require("../utils/customerConfirmationEmail");
+const {
+  markConcertBookingQrPending,
+  queueConcertBookingQrEmailJob,
+  scheduleBackgroundTask,
+} = require("../utils/bookingQrAsync");
 
 router.get("/:identifier/events", async (req, res) => {
   const identifier = String(req.params.identifier || "").trim();
@@ -127,33 +132,14 @@ router.post("/:identifier/events/:eventId/bookings", async (req, res) => {
         reservation_time: result.data.reservation.reservation_time,
       });
     }
-    console.log("[owner-reservation-email] route.trigger.start", {
-      source: "public_concerts.bookings.create",
-      reservationType: "concert",
-      bookingId: Number(result.data?.booking?.id),
-      restaurantId,
-    });
-    const ownerNotificationResult = await sendConcertOwnerReservationNotificationEmail({
-      pool,
-      restaurantId,
-      bookingId: Number(result.data?.booking?.id),
-      explicitCustomerEmail: req.body?.customer_email || req.body?.email || "",
-      triggeredFrom: "public_concerts.bookings.create",
-      req,
-    });
-    console.log("[owner-reservation-email] route.trigger.result", {
-      source: "public_concerts.bookings.create",
-      reservationType: "concert",
-      bookingId: Number(result.data?.booking?.id),
-      restaurantId,
-      result: ownerNotificationResult,
-    });
+    await markConcertBookingQrPending(pool, restaurantId, Number(result.data?.booking?.id));
 
     const bookingResponse = mapBookingResponse(result.data.booking || {});
     res.status(result.status).json({
       success: true,
       booking: {
         ...bookingResponse,
+        qr_status: bookingResponse?.qr_status || "pending",
         payment_instructions:
           result.data?.booking?.payment_instructions ||
           result.data?.event?.bank_transfer_instructions ||
@@ -162,6 +148,43 @@ router.post("/:identifier/events/:eventId/bookings", async (req, res) => {
       reservation: result.data?.reservation || null,
       event: result.data?.event || null,
     });
+
+    scheduleBackgroundTask(
+      `public_concerts.bookings.create:${Number(result.data?.booking?.id)}`,
+      async () => {
+        await queueConcertBookingQrEmailJob({
+          pool,
+          restaurantId,
+          bookingId: Number(result.data?.booking?.id),
+          explicitCustomerEmail: req.body?.customer_email || req.body?.email || "",
+          triggeredFrom: "public_concerts.bookings.create.qr_ready",
+          req,
+          sendEmail: true,
+        });
+
+        console.log("[owner-reservation-email] route.trigger.start", {
+          source: "public_concerts.bookings.create",
+          reservationType: "concert",
+          bookingId: Number(result.data?.booking?.id),
+          restaurantId,
+        });
+        const ownerNotificationResult = await sendConcertOwnerReservationNotificationEmail({
+          pool,
+          restaurantId,
+          bookingId: Number(result.data?.booking?.id),
+          explicitCustomerEmail: req.body?.customer_email || req.body?.email || "",
+          triggeredFrom: "public_concerts.bookings.create",
+          req,
+        });
+        console.log("[owner-reservation-email] route.trigger.result", {
+          source: "public_concerts.bookings.create",
+          reservationType: "concert",
+          bookingId: Number(result.data?.booking?.id),
+          restaurantId,
+          result: ownerNotificationResult,
+        });
+      }
+    );
   } catch (err) {
     console.error("❌ Failed to create public concert booking:", err);
     res.status(500).json({ error: "Failed to create booking" });

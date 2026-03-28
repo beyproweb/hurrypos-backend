@@ -8,7 +8,12 @@ const sharp = require("sharp");
 const authMiddleware = require("../middleware/authMiddleware");
 const { attachAllowedModules } = require("../middleware/moduleGuard");
 const { ensureCashLogColumns } = require("../utils/registerLogColumns");
-const { generateUniqueRestaurantSlug, isMissingRestaurantSlug } = require("../utils/restaurantSlug");
+const {
+  generateUniqueRestaurantSlug,
+  isMissingRestaurantSlug,
+  normalizeCustomDomain,
+  parseCustomDomain,
+} = require("../utils/restaurantSlug");
 
 // ✅ protect all setting
 // ✅ protect all settings routes with tenant-safe auth
@@ -93,6 +98,24 @@ async function ensureTablesColumn() {
   );
 }
 
+let ensureRestaurantCustomDomainColumnPromise = null;
+
+async function ensureRestaurantCustomDomainColumn() {
+  if (!ensureRestaurantCustomDomainColumnPromise) {
+    ensureRestaurantCustomDomainColumnPromise = (async () => {
+      await pool.query("ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS custom_domain TEXT");
+      await pool.query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS restaurants_custom_domain_unique_idx ON restaurants (lower(custom_domain)) WHERE custom_domain IS NOT NULL AND btrim(custom_domain) <> ''"
+      );
+    })().catch((err) => {
+      ensureRestaurantCustomDomainColumnPromise = null;
+      throw err;
+    });
+  }
+
+  return ensureRestaurantCustomDomainColumnPromise;
+}
+
 
 // inside settings.js
 const jwt = require("jsonwebtoken");
@@ -131,14 +154,15 @@ router.post("/qr-token", async (req, res) => {
 // ✅ GET /api/settings/qr-link — short permanent QR link
 router.get("/qr-link", async (req, res) => {
   try {
+    await ensureRestaurantCustomDomainColumn();
     const restaurantId = req.user.restaurant_id;
     const { rows } = await pool.query(
-      "SELECT id, name, slug, qr_token, qr_code_id FROM restaurants WHERE id = $1",
+      "SELECT id, name, slug, custom_domain, qr_token, qr_code_id FROM restaurants WHERE id = $1",
       [restaurantId]
     );
     if (!rows.length) return res.status(404).json({ error: "Restaurant not found" });
 
-    let { id, name, slug, qr_token, qr_code_id } = rows[0];
+    let { id, name, slug, custom_domain, qr_token, qr_code_id } = rows[0];
     const jwt = require("jsonwebtoken");
 
     // ⚙️ Ensure slug exists (fixes legacy rows where slug is NULL → /qr-menu/null/...)
@@ -176,7 +200,13 @@ router.get("/qr-link", async (req, res) => {
     // ✅ Final short link (easy to share/print)
     const link = `https://pos.beypro.com/${slug}`;
 
-    res.json({ success: true, link, name: name || "" });
+    res.json({
+      success: true,
+      link,
+      name: name || "",
+      slug,
+      custom_domain: normalizeCustomDomain(custom_domain) || "",
+    });
   } catch (err) {
     console.error("❌ Failed to build QR link:", err);
     res.status(500).json({ error: "Failed to build QR link" });
@@ -741,24 +771,42 @@ function sanitizeSlugForPath(value, fallback = "restaurant") {
 }
 
 async function ensureRestaurantSlugForBranding(restaurantId, fallbackName = "restaurant") {
+  await ensureRestaurantCustomDomainColumn();
   const { rows } = await pool.query(
-    "SELECT slug, name FROM restaurants WHERE id = $1 LIMIT 1",
+    "SELECT slug, name, custom_domain FROM restaurants WHERE id = $1 LIMIT 1",
     [restaurantId]
   );
 
   if (!rows.length) {
-    return { slug: null, name: "" };
+    return { slug: null, name: "", custom_domain: "" };
   }
 
   let slug = rows[0].slug;
   const name = rows[0].name || fallbackName;
+  const custom_domain = normalizeCustomDomain(rows[0].custom_domain) || "";
   if (isMissingRestaurantSlug(slug)) {
     const nextSlug = await generateUniqueRestaurantSlug(pool, name || `restaurant-${restaurantId}`);
     await pool.query("UPDATE restaurants SET slug = $1 WHERE id = $2", [nextSlug, restaurantId]);
     slug = nextSlug;
   }
 
-  return { slug, name };
+  return { slug, name, custom_domain };
+}
+
+async function findRestaurantSlugConflict(db, slug, restaurantId) {
+  const { rows } = await db.query(
+    "SELECT id FROM restaurants WHERE lower(slug) = lower($1) AND id <> $2 LIMIT 1",
+    [slug, restaurantId]
+  );
+  return rows[0] || null;
+}
+
+async function findRestaurantCustomDomainConflict(db, customDomain, restaurantId) {
+  const { rows } = await db.query(
+    "SELECT id FROM restaurants WHERE lower(custom_domain) = lower($1) AND id <> $2 LIMIT 1",
+    [customDomain, restaurantId]
+  );
+  return rows[0] || null;
 }
 
 function colorHexToRgba(input, fallback = { r: 255, g: 255, b: 255, alpha: 1 }) {
@@ -776,8 +824,8 @@ function colorHexToRgba(input, fallback = { r: 255, g: 255, b: 255, alpha: 1 }) 
   };
 }
 
-async function readQrMenuCustomization(restaurantId) {
-  const result = await pool.query(
+async function readQrMenuCustomization(restaurantId, db = pool) {
+  const result = await db.query(
     `
       SELECT qr_menu_customization, value
       FROM settings
@@ -807,7 +855,11 @@ async function saveQrMenuCustomization(restaurantId, payload) {
 router.get("/qr-menu-customization", async (req, res) => {
   try {
     const restaurantId = req.user.restaurant_id;
-    const { name: restaurantName } = await ensureRestaurantSlugForBranding(restaurantId);
+    const {
+      name: restaurantName,
+      slug: restaurantSlug,
+      custom_domain: restaurantCustomDomain,
+    } = await ensureRestaurantSlugForBranding(restaurantId);
 
     const result = await pool.query(
       `
@@ -889,6 +941,10 @@ router.get("/qr-menu-customization", async (req, res) => {
         ...defaults,
         ...data,
       },
+      restaurant: {
+        slug: restaurantSlug || "",
+        custom_domain: restaurantCustomDomain || "",
+      },
     });
   } catch (err) {
     console.error("❌ Failed to load QR menu customization:", err);
@@ -897,22 +953,105 @@ router.get("/qr-menu-customization", async (req, res) => {
 });
 
 router.post("/qr-menu-customization", async (req, res) => {
+  const client = await pool.connect();
   try {
-    const restaurantId = req.user.restaurant_id;
+    await ensureRestaurantCustomDomainColumn();
+    const restaurantId = Number(req.user.restaurant_id);
     const newData = req.body;
 
-    if (!newData || typeof newData !== "object") {
+    if (!newData || typeof newData !== "object" || Array.isArray(newData)) {
       return res.status(400).json({ error: "Invalid customization payload" });
     }
 
-    const existingData = await readQrMenuCustomization(restaurantId);
+    await client.query("BEGIN");
+
+    const restaurantResult = await client.query(
+      `
+      SELECT id, name, slug, custom_domain
+      FROM restaurants
+      WHERE id = $1
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [restaurantId]
+    );
+
+    if (!restaurantResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    const restaurant = restaurantResult.rows[0];
+    const restaurantName = String(restaurant.name || "").trim() || `restaurant-${restaurantId}`;
+    let nextSlug = restaurant.slug;
+    let nextCustomDomain = normalizeCustomDomain(restaurant.custom_domain) || "";
+
+    if (isMissingRestaurantSlug(nextSlug)) {
+      nextSlug = await generateUniqueRestaurantSlug(client, restaurantName);
+      await client.query("UPDATE restaurants SET slug = $1 WHERE id = $2", [nextSlug, restaurantId]);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(newData, "custom_domain")) {
+      const rawCustomDomain = String(newData.custom_domain || "").trim();
+
+      if (!rawCustomDomain) {
+        nextCustomDomain = "";
+        await client.query("UPDATE restaurants SET custom_domain = NULL WHERE id = $1", [restaurantId]);
+      } else {
+        const parsedDomain = parseCustomDomain(rawCustomDomain);
+        if (!parsedDomain.normalizedDomain || !parsedDomain.slug) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: "Invalid custom domain format",
+            field: "custom_domain",
+          });
+        }
+
+        const customDomainConflict = await findRestaurantCustomDomainConflict(
+          client,
+          parsedDomain.normalizedDomain,
+          restaurantId
+        );
+        if (customDomainConflict) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error: "This custom domain is already in use",
+            field: "custom_domain",
+          });
+        }
+
+        const slugConflict = await findRestaurantSlugConflict(client, parsedDomain.slug, restaurantId);
+        if (slugConflict) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error: "Another restaurant already uses the generated slug for this domain",
+            field: "custom_domain",
+            slug: parsedDomain.slug,
+          });
+        }
+
+        nextCustomDomain = parsedDomain.normalizedDomain;
+        nextSlug = parsedDomain.slug;
+        await client.query(
+          "UPDATE restaurants SET custom_domain = $1, slug = $2 WHERE id = $3",
+          [nextCustomDomain, nextSlug, restaurantId]
+        );
+      }
+    }
+
+    const existingData = await readQrMenuCustomization(restaurantId, client);
+    const sanitizedNewData = { ...newData };
+    delete sanitizedNewData.custom_domain;
+    delete sanitizedNewData.slug;
+    delete sanitizedNewData.generated_slug;
+    delete sanitizedNewData.restaurant_slug;
+
     const mergedData = {
       ...existingData,
-      ...newData,
+      ...sanitizedNewData,
     };
 
-    // Upsert jsonb
-    await pool.query(
+    await client.query(
       `
       INSERT INTO settings (restaurant_id, key, qr_menu_customization)
       VALUES ($1, 'qr-menu-customization', $2::jsonb)
@@ -922,10 +1061,26 @@ router.post("/qr-menu-customization", async (req, res) => {
       [restaurantId, JSON.stringify(mergedData)]
     );
 
-    res.json({ success: true, customization: mergedData });
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      customization: mergedData,
+      restaurant: {
+        slug: nextSlug || "",
+        custom_domain: nextCustomDomain || "",
+      },
+    });
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // Ignore rollback failures after early returns.
+    }
     console.error("❌ Failed to save QR customization:", err);
     res.status(500).json({ error: "Failed to save qr-menu-customization" });
+  } finally {
+    client.release();
   }
 });
 

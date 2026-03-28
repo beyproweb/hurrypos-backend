@@ -13,6 +13,37 @@ const DEFAULT_RESERVED = new Set([
   "login",
   "dashboard",
 ]);
+const COMPOUND_PUBLIC_SUFFIXES = new Set([
+  "ac.uk",
+  "co.id",
+  "co.in",
+  "co.jp",
+  "co.nz",
+  "co.uk",
+  "co.za",
+  "com.ar",
+  "com.au",
+  "com.br",
+  "com.cn",
+  "com.eg",
+  "com.hk",
+  "com.mx",
+  "com.my",
+  "com.ng",
+  "com.sg",
+  "com.tr",
+  "com.ua",
+  "firm.in",
+  "gen.tr",
+  "gov.uk",
+  "net.au",
+  "net.in",
+  "net.tr",
+  "org.au",
+  "org.in",
+  "org.tr",
+  "org.uk",
+]);
 
 function slugifyRestaurantName(name) {
   const raw = String(name || "").trim();
@@ -36,13 +67,95 @@ function clampSlug(value, maxLen) {
   return s.slice(0, maxLen).replace(/-+$/g, "");
 }
 
+function stripDomainInput(value) {
+  let normalized = String(value || "")
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "");
+
+  if (!normalized) return "";
+
+  normalized = normalized
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+    .replace(/^\/\//, "")
+    .split(/[/?#]/, 1)[0]
+    .replace(/:\d+$/, "")
+    .replace(/\.+$/g, "")
+    .replace(/^www\./, "");
+
+  return normalized;
+}
+
+function isValidDomainLabel(label) {
+  return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(String(label || ""));
+}
+
+function isValidTld(label) {
+  const value = String(label || "");
+  return /^[a-z]{2,63}$/.test(value) || /^xn--[a-z0-9-]{2,59}$/.test(value);
+}
+
+function normalizeCustomDomain(value) {
+  const host = stripDomainInput(value);
+  if (!host) return "";
+
+  const labels = host.split(".").filter(Boolean);
+  if (labels.length < 2) return "";
+  if (!isValidTld(labels[labels.length - 1])) return "";
+  if (labels.some((label) => !isValidDomainLabel(label))) return "";
+
+  return labels.join(".");
+}
+
+function deriveRestaurantSlugFromDomain(value, options = {}) {
+  const maxLen =
+    Number.isFinite(options.maxLen) && options.maxLen > 10
+      ? Math.floor(options.maxLen)
+      : DEFAULT_MAX_LEN;
+  const reserved = options.reserved instanceof Set ? options.reserved : DEFAULT_RESERVED;
+  const domain = normalizeCustomDomain(value);
+  if (!domain) return "";
+
+  const labels = domain.split(".");
+  const compoundSuffix =
+    labels.length >= 3
+      ? `${labels[labels.length - 2]}.${labels[labels.length - 1]}`
+      : "";
+  const registrableIndex =
+    compoundSuffix && COMPOUND_PUBLIC_SUFFIXES.has(compoundSuffix)
+      ? labels.length - 3
+      : labels.length - 2;
+
+  const slugSource = labels[Math.max(0, registrableIndex)] || "";
+  const fallbackSource = labels.slice(0, Math.max(1, registrableIndex + 1)).join("-");
+  const candidate =
+    clampSlug(slugifyRestaurantName(slugSource), maxLen) ||
+    clampSlug(slugifyRestaurantName(fallbackSource), maxLen);
+
+  if (!candidate || reserved.has(candidate)) return "";
+  return candidate;
+}
+
+function parseCustomDomain(value, options = {}) {
+  const normalizedDomain = normalizeCustomDomain(value);
+  const slug = normalizedDomain ? deriveRestaurantSlugFromDomain(normalizedDomain, options) : "";
+
+  return {
+    input: String(value || ""),
+    normalizedDomain,
+    slug,
+    isValid: Boolean(normalizedDomain && slug),
+  };
+}
+
 function randomSuffix() {
   return crypto.randomBytes(3).toString("hex"); // 6 chars
 }
 
 async function slugExists(db, slug) {
   const { rows } = await db.query(
-    "SELECT 1 FROM restaurants WHERE slug = $1 LIMIT 1",
+    "SELECT 1 FROM restaurants WHERE lower(slug) = lower($1) LIMIT 1",
     [slug]
   );
   return rows.length > 0;
@@ -90,9 +203,12 @@ function isMissingRestaurantSlug(slug) {
 }
 
 module.exports = {
+  clampSlug,
+  normalizeCustomDomain,
+  deriveRestaurantSlugFromDomain,
+  parseCustomDomain,
   slugifyRestaurantName,
   generateUniqueRestaurantSlug,
   isMissingRestaurantSlug,
   DEFAULT_RESERVED,
 };
-

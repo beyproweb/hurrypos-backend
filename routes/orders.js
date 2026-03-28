@@ -26,6 +26,12 @@ module.exports = function(io) {
   const { updateStockForOrder } = require("../utils/orderStock");
   const { ensureConcertTables } = require("../utils/concertsService");
   const {
+    ensureBookingQrSchema,
+    scheduleBackgroundTask,
+    markOrderQrPending,
+    queueOrderReservationQrEmailJob,
+  } = require("../utils/bookingQrAsync");
+  const {
     CONFIRMATION_TYPES,
     sendOrderCustomerConfirmationEmail,
     sendOrderCustomerDeliveredEmail,
@@ -3277,14 +3283,18 @@ router.put("/:id/status", async (req, res) => {
       (normalizedOrderType === "table" || normalizedOrderType === "reservation") &&
       hasReservationSchedule
     ) {
-      await sendOrderCustomerConfirmationEmail({
-        pool,
-        restaurantId,
-        orderId: Number(parsedId),
-        confirmationType: CONFIRMATION_TYPES.TABLE_RESERVATION,
-        explicitCustomerEmail: normalizedCustomerEmailFromPayload,
-        triggeredFrom: "orders.status.tableoverview_confirmed",
-        req,
+      await markOrderQrPending(pool, restaurantId, Number(parsedId));
+      scheduleBackgroundTask(`orders.status.tableoverview_confirmed:${Number(parsedId)}`, async () => {
+        await queueOrderReservationQrEmailJob({
+          pool,
+          restaurantId,
+          orderId: Number(parsedId),
+          confirmationType: CONFIRMATION_TYPES.TABLE_RESERVATION,
+          explicitCustomerEmail: normalizedCustomerEmailFromPayload,
+          triggeredFrom: "orders.status.tableoverview_confirmed",
+          req,
+          sendEmail: true,
+        });
       });
     }
 
@@ -3299,14 +3309,16 @@ router.put("/:id/status", async (req, res) => {
             : null;
 
       if (confirmationType) {
-        await sendOrderCustomerConfirmationEmail({
-          pool,
-          restaurantId,
-          orderId: Number(parsedId),
-          confirmationType,
-          explicitCustomerEmail: normalizedCustomerEmailFromPayload,
-          triggeredFrom: "orders.status.qr_confirmed",
-          req,
+        scheduleBackgroundTask(`orders.status.qr_confirmed:${Number(parsedId)}`, async () => {
+          await sendOrderCustomerConfirmationEmail({
+            pool,
+            restaurantId,
+            orderId: Number(parsedId),
+            confirmationType,
+            explicitCustomerEmail: normalizedCustomerEmailFromPayload,
+            triggeredFrom: "orders.status.qr_confirmed",
+            req,
+          });
         });
       }
     }
@@ -6441,6 +6453,7 @@ router.post("/reservations", async (req, res) => {
 
   try {
     await ensureReservationGuestCompositionFields();
+    await ensureBookingQrSchema(pool);
 
     // Validate required fields
     if (!reservation_date || !reservation_time) {
@@ -6577,33 +6590,57 @@ router.post("/reservations", async (req, res) => {
       }
 
       emitReservationCreated(restaurantId, reservation);
-      console.log("[owner-reservation-email] route.trigger.start", {
-        source: "orders.reservations.create.table",
-        reservationType: "table",
-        reservationId: Number(reservation.id),
-        restaurantId,
-      });
-      const ownerNotificationResult = await sendTableReservationOwnerNotificationEmail({
-        pool,
-        restaurantId,
-        reservationId: Number(reservation.id),
-        explicitCustomerEmail: normalizedCustomerEmail,
-        triggeredFrom: "orders.reservations.create.table",
-        req,
-      });
-      console.log("[owner-reservation-email] route.trigger.result", {
-        source: "orders.reservations.create.table",
-        reservationType: "table",
-        reservationId: Number(reservation.id),
-        restaurantId,
-        result: ownerNotificationResult,
-      });
+      await markOrderQrPending(pool, restaurantId, Number(reservation.id));
 
-      return res.json({
+      const responsePayload = {
         success: true,
         message: "✅ Reservation created for table",
-        reservation,
-      });
+        reservation: {
+          ...reservation,
+          qr_status: "pending",
+        },
+      };
+      res.json(responsePayload);
+
+      scheduleBackgroundTask(
+        `orders.reservations.create.table:${Number(reservation.id)}`,
+        async () => {
+          await queueOrderReservationQrEmailJob({
+            pool,
+            restaurantId,
+            orderId: Number(reservation.id),
+            confirmationType: CONFIRMATION_TYPES.TABLE_RESERVATION,
+            explicitCustomerEmail: normalizedCustomerEmail,
+            triggeredFrom: "orders.reservations.create.table.qr_ready",
+            req,
+            sendEmail: true,
+          });
+
+          console.log("[owner-reservation-email] route.trigger.start", {
+            source: "orders.reservations.create.table",
+            reservationType: "table",
+            reservationId: Number(reservation.id),
+            restaurantId,
+          });
+          const ownerNotificationResult = await sendTableReservationOwnerNotificationEmail({
+            pool,
+            restaurantId,
+            reservationId: Number(reservation.id),
+            explicitCustomerEmail: normalizedCustomerEmail,
+            triggeredFrom: "orders.reservations.create.table",
+            req,
+          });
+          console.log("[owner-reservation-email] route.trigger.result", {
+            source: "orders.reservations.create.table",
+            reservationType: "table",
+            reservationId: Number(reservation.id),
+            restaurantId,
+            result: ownerNotificationResult,
+          });
+        }
+      );
+
+      return;
     };
 
     // If order_id provided, attach to an existing reservation row or create a standalone
@@ -6757,33 +6794,57 @@ router.post("/reservations", async (req, res) => {
       emitReservationCreated(restaurantId, result.rows[0], {
         order_id: sourceOrderId,
       });
-      console.log("[owner-reservation-email] route.trigger.start", {
-        source: "orders.reservations.create.order",
-        reservationType: "table",
-        reservationId: Number(result.rows[0].id),
-        restaurantId,
-      });
-      const ownerNotificationResult = await sendTableReservationOwnerNotificationEmail({
-        pool,
-        restaurantId,
-        reservationId: Number(result.rows[0].id),
-        explicitCustomerEmail: normalizedCustomerEmail,
-        triggeredFrom: "orders.reservations.create.order",
-        req,
-      });
-      console.log("[owner-reservation-email] route.trigger.result", {
-        source: "orders.reservations.create.order",
-        reservationType: "table",
-        reservationId: Number(result.rows[0].id),
-        restaurantId,
-        result: ownerNotificationResult,
-      });
+      await markOrderQrPending(pool, restaurantId, Number(result.rows[0].id));
 
-      return res.json({
+      const responsePayload = {
         success: true,
         message: "✅ Reservation created and order updated",
-        reservation: result.rows[0],
-      });
+        reservation: {
+          ...result.rows[0],
+          qr_status: "pending",
+        },
+      };
+      res.json(responsePayload);
+
+      scheduleBackgroundTask(
+        `orders.reservations.create.order:${Number(result.rows[0].id)}`,
+        async () => {
+          await queueOrderReservationQrEmailJob({
+            pool,
+            restaurantId,
+            orderId: Number(result.rows[0].id),
+            confirmationType: CONFIRMATION_TYPES.TABLE_RESERVATION,
+            explicitCustomerEmail: normalizedCustomerEmail,
+            triggeredFrom: "orders.reservations.create.order.qr_ready",
+            req,
+            sendEmail: true,
+          });
+
+          console.log("[owner-reservation-email] route.trigger.start", {
+            source: "orders.reservations.create.order",
+            reservationType: "table",
+            reservationId: Number(result.rows[0].id),
+            restaurantId,
+          });
+          const ownerNotificationResult = await sendTableReservationOwnerNotificationEmail({
+            pool,
+            restaurantId,
+            reservationId: Number(result.rows[0].id),
+            explicitCustomerEmail: normalizedCustomerEmail,
+            triggeredFrom: "orders.reservations.create.order",
+            req,
+          });
+          console.log("[owner-reservation-email] route.trigger.result", {
+            source: "orders.reservations.create.order",
+            reservationType: "table",
+            reservationId: Number(result.rows[0].id),
+            restaurantId,
+            result: ownerNotificationResult,
+          });
+        }
+      );
+
+      return;
     }
 
     // If table_number provided, create a standalone reservation (new order)
@@ -6830,11 +6891,14 @@ router.get("/reservations", async (req, res) => {
         reservation_notes,
         status,
         order_type,
-        total,
-        customer_name,
-        customer_phone,
-        created_at,
-        updated_at
+      total,
+      customer_name,
+      customer_phone,
+      qr_status,
+      qr_url,
+      qr_ready_at,
+      created_at,
+      updated_at
       FROM orders
       WHERE restaurant_id = $1
         AND (
@@ -6897,6 +6961,68 @@ router.get("/reservations", async (req, res) => {
     }
     console.error("❌ Error fetching reservations:", err);
     res.status(500).json({ error: "Failed to fetch reservations" });
+  }
+});
+
+router.get("/reservations/qr/:token", async (req, res) => {
+  const restaurantId = await requireRestaurantId(req, res);
+  if (!restaurantId) return;
+
+  const token = String(req.params.token || "").trim();
+  if (!token) {
+    return res.status(400).json({ error: "QR token is required" });
+  }
+
+  try {
+    await ensureBookingQrSchema(pool);
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        order_number,
+        table_number,
+        reservation_date,
+        reservation_time,
+        reservation_clients,
+        customer_name,
+        customer_phone,
+        status,
+        order_type,
+        qr_status,
+        qr_url,
+        qr_ready_at,
+        updated_at
+      FROM orders
+      WHERE restaurant_id = $1
+        AND qr_token = $2
+      LIMIT 1
+      `,
+      [restaurantId, token]
+    );
+
+    const reservation = result.rows?.[0] || null;
+    if (!reservation) {
+      return res.status(404).json({ error: "QR invalid", code: "qr_invalid" });
+    }
+    if (String(reservation.qr_status || "").toLowerCase() !== "ready") {
+      return res.status(409).json({ error: "QR not ready", code: "qr_not_ready" });
+    }
+
+    const normalizedStatus = String(reservation.status || "").toLowerCase();
+    return res.json({
+      success: true,
+      reservation: {
+        ...reservation,
+        scan_booking_type: "reservation",
+        checkin_order_id: reservation.id,
+        guest_name: reservation.customer_name || "",
+        is_checked_in: normalizedStatus === "checked_in",
+        can_check_in: ["reserved", "confirmed"].includes(normalizedStatus),
+      },
+    });
+  } catch (err) {
+    console.error("❌ Failed to resolve reservation QR:", err);
+    return res.status(500).json({ error: "Failed to resolve reservation QR" });
   }
 });
 
@@ -6999,6 +7125,7 @@ router.get("/reservations/:id", async (req, res) => {
 
   try {
     await ensureReservationGuestCompositionFields();
+    await ensureBookingQrSchema(pool);
 
     const result = await pool.query(
       `SELECT
@@ -7015,6 +7142,9 @@ router.get("/reservations/:id", async (req, res) => {
         total,
         customer_name,
         customer_phone,
+        qr_status,
+        qr_url,
+        qr_ready_at,
         created_at,
         updated_at
       FROM orders

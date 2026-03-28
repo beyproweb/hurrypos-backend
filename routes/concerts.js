@@ -17,10 +17,15 @@ const {
   mapBookingResponse,
 } = require("../utils/concertsService");
 const {
-  sendConcertCustomerConfirmationEmail,
   sendConcertCustomerCancellationEmail,
   sendConcertOwnerReservationNotificationEmail,
 } = require("../utils/customerConfirmationEmail");
+const {
+  ensureBookingQrSchema,
+  markConcertBookingQrPending,
+  queueConcertBookingQrEmailJob,
+  scheduleBackgroundTask,
+} = require("../utils/bookingQrAsync");
 
 router.use(authMiddleware);
 router.use(async (req, res, next) => {
@@ -276,35 +281,154 @@ router.post("/events/:eventId/bookings", async (req, res) => {
         reservation_time: result.data.reservation.reservation_time,
       });
     }
-    console.log("[owner-reservation-email] route.trigger.start", {
-      source: "concerts.bookings.create",
-      reservationType: "concert",
-      bookingId: Number(result.data?.booking?.id),
-      restaurantId,
-    });
-    const ownerNotificationResult = await sendConcertOwnerReservationNotificationEmail({
-      pool,
-      restaurantId,
-      bookingId: Number(result.data?.booking?.id),
-      explicitCustomerEmail: req.body?.customer_email || req.body?.email || "",
-      triggeredFrom: "concerts.bookings.create",
-      req,
-    });
-    console.log("[owner-reservation-email] route.trigger.result", {
-      source: "concerts.bookings.create",
-      reservationType: "concert",
-      bookingId: Number(result.data?.booking?.id),
-      restaurantId,
-      result: ownerNotificationResult,
-    });
+    await markConcertBookingQrPending(pool, restaurantId, Number(result.data?.booking?.id));
 
     res.status(result.status).json({
       success: true,
       ...result.data,
+      booking: result.data?.booking
+        ? {
+            ...result.data.booking,
+            qr_status: result.data.booking.qr_status || "pending",
+          }
+        : result.data?.booking,
+    });
+
+    scheduleBackgroundTask(`concerts.bookings.create:${Number(result.data?.booking?.id)}`, async () => {
+      await queueConcertBookingQrEmailJob({
+        pool,
+        restaurantId,
+        bookingId: Number(result.data?.booking?.id),
+        explicitCustomerEmail: req.body?.customer_email || req.body?.email || "",
+        triggeredFrom: "concerts.bookings.create.qr_ready",
+        req,
+        sendEmail: true,
+      });
+
+      console.log("[owner-reservation-email] route.trigger.start", {
+        source: "concerts.bookings.create",
+        reservationType: "concert",
+        bookingId: Number(result.data?.booking?.id),
+        restaurantId,
+      });
+      const ownerNotificationResult = await sendConcertOwnerReservationNotificationEmail({
+        pool,
+        restaurantId,
+        bookingId: Number(result.data?.booking?.id),
+        explicitCustomerEmail: req.body?.customer_email || req.body?.email || "",
+        triggeredFrom: "concerts.bookings.create",
+        req,
+      });
+      console.log("[owner-reservation-email] route.trigger.result", {
+        source: "concerts.bookings.create",
+        reservationType: "concert",
+        bookingId: Number(result.data?.booking?.id),
+        restaurantId,
+        result: ownerNotificationResult,
+      });
     });
   } catch (err) {
     console.error("❌ Failed to create concert booking:", err);
     res.status(500).json({ error: "Failed to create booking" });
+  }
+});
+
+router.get("/bookings/qr/:token", async (req, res) => {
+  const restaurantId = getRestaurantId(req);
+  const token = String(req.params.token || "").trim();
+  if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+    return res.status(401).json({ error: "Missing restaurant context" });
+  }
+  if (!token) {
+    return res.status(400).json({ error: "QR token is required" });
+  }
+
+  try {
+    await ensureBookingQrSchema(pool);
+    const result = await pool.query(
+      `
+      SELECT
+        cb.id,
+        cb.event_id,
+        cb.reservation_order_id,
+        cb.reserved_table_number,
+        cb.booking_type,
+        cb.payment_status,
+        cb.booking_status,
+        cb.customer_name,
+        cb.customer_phone,
+        cb.quantity,
+        cb.confirmed_at,
+        cb.qr_status,
+        cb.qr_url,
+        cb.qr_ready_at,
+        cb.updated_at,
+        tt.name AS ticket_type_name,
+        ce.event_title,
+        ce.artist_name,
+        ce.event_date,
+        ce.event_time,
+        o.order_number,
+        o.status AS reservation_order_status,
+        o.reservation_date,
+        o.reservation_time
+      FROM concert_bookings cb
+      LEFT JOIN concert_ticket_types tt
+        ON tt.id = cb.ticket_type_id
+      LEFT JOIN concert_events ce
+        ON ce.id = cb.event_id
+       AND ce.restaurant_id = cb.restaurant_id
+      LEFT JOIN orders o
+        ON o.id = cb.reservation_order_id
+       AND o.restaurant_id = cb.restaurant_id
+      WHERE cb.restaurant_id = $1
+        AND cb.qr_token = $2
+      LIMIT 1
+      `,
+      [restaurantId, token]
+    );
+
+    const booking = result.rows?.[0] || null;
+    if (!booking) {
+      return res.status(404).json({ error: "QR invalid", code: "qr_invalid" });
+    }
+    if (String(booking.qr_status || "").toLowerCase() !== "ready") {
+      return res.status(409).json({ error: "QR not ready", code: "qr_not_ready" });
+    }
+
+    const normalizedOrderStatus = String(booking.reservation_order_status || "").toLowerCase();
+    const normalizedPaymentStatus = String(booking.payment_status || "").toLowerCase();
+    const normalizedBookingStatus = String(booking.booking_status || "").toLowerCase();
+    const isCheckedIn = normalizedOrderStatus === "checked_in";
+    const canCheckIn =
+      Number.isFinite(Number(booking.reservation_order_id)) &&
+      Number(booking.reservation_order_id) > 0 &&
+      normalizedPaymentStatus === "confirmed" &&
+      normalizedBookingStatus !== "cancelled" &&
+      !isCheckedIn;
+
+    return res.json({
+      success: true,
+      booking: {
+        ...booking,
+        scan_booking_type:
+          String(booking.booking_type || "").toLowerCase() === "ticket"
+            ? "concert_ticket"
+            : "reservation",
+        guest_name: booking.customer_name || "",
+        is_checked_in: isCheckedIn,
+        can_check_in: canCheckIn,
+        current_status:
+          booking.reservation_order_status ||
+          booking.booking_status ||
+          booking.payment_status ||
+          null,
+        checkin_order_id: booking.reservation_order_id || null,
+      },
+    });
+  } catch (err) {
+    console.error("❌ Failed to resolve concert booking QR:", err);
+    return res.status(500).json({ error: "Failed to resolve booking QR" });
   }
 });
 
@@ -384,12 +508,16 @@ router.patch("/bookings/confirm", async (req, res) => {
     emitConcertBookingPaymentStatusEvents(io, restaurantId, result, "");
 
     if (String(result?.data?.booking?.payment_status || "").toLowerCase() === "confirmed") {
-      await sendConcertCustomerConfirmationEmail({
-        pool,
-        restaurantId,
-        bookingId,
-        triggeredFrom: "concerts.bookings.confirmed",
-        req,
+      await markConcertBookingQrPending(pool, restaurantId, bookingId);
+      scheduleBackgroundTask(`concerts.bookings.confirmed:${bookingId}`, async () => {
+        await queueConcertBookingQrEmailJob({
+          pool,
+          restaurantId,
+          bookingId,
+          triggeredFrom: "concerts.bookings.confirmed",
+          req,
+          sendEmail: true,
+        });
       });
     }
     return res.json({ success: true, ...result.data });
@@ -430,20 +558,26 @@ router.patch("/bookings/:bookingId/payment-status", async (req, res) => {
 
     const normalizedPaymentStatus = String(result?.data?.booking?.payment_status || "").toLowerCase();
     if (normalizedPaymentStatus === "confirmed") {
-      await sendConcertCustomerConfirmationEmail({
-        pool,
-        restaurantId,
-        bookingId,
-        triggeredFrom: "concerts.bookings.payment_status_confirmed",
-        req,
+      await markConcertBookingQrPending(pool, restaurantId, bookingId);
+      scheduleBackgroundTask(`concerts.bookings.payment_status_confirmed:${bookingId}`, async () => {
+        await queueConcertBookingQrEmailJob({
+          pool,
+          restaurantId,
+          bookingId,
+          triggeredFrom: "concerts.bookings.payment_status_confirmed",
+          req,
+          sendEmail: true,
+        });
       });
     } else if (normalizedPaymentStatus === "cancelled") {
-      await sendConcertCustomerCancellationEmail({
-        pool,
-        restaurantId,
-        bookingId,
-        triggeredFrom: "concerts.bookings.payment_status_cancelled",
-        req,
+      scheduleBackgroundTask(`concerts.bookings.payment_status_cancelled:${bookingId}`, async () => {
+        await sendConcertCustomerCancellationEmail({
+          pool,
+          restaurantId,
+          bookingId,
+          triggeredFrom: "concerts.bookings.payment_status_cancelled",
+          req,
+        });
       });
     }
 
