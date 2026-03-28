@@ -7,8 +7,22 @@ const jwt = require("jsonwebtoken");
 module.exports = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
+    const requestPath = req.originalUrl || req.url || "";
+    const isQrImageRequest =
+      /\/api\/orders\/reservations\/qr-image\/[^/?#]+/i.test(requestPath) ||
+      /\/api\/concerts\/bookings\/qr-image\/[^/?#]+/i.test(requestPath);
 
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      if (isQrImageRequest) {
+        res.setHeader("X-QR-Auth", "auth-middleware-hit");
+        console.warn("🚨 [auth] QR image request hit authMiddleware without token", {
+          method: req.method,
+          path: requestPath,
+          host: req.get?.("host") || "",
+          origin: req.get?.("origin") || "",
+          userAgent: req.get?.("user-agent") || "",
+        });
+      }
       console.warn("⚠️ Missing or malformed Authorization header");
       return res.status(401).json({
         status: "error",
@@ -32,6 +46,14 @@ module.exports = (req, res, next) => {
     try {
       decoded = verifyWith(primarySecret || "beypro_secret_2025");
     } catch (err) {
+      if (isQrImageRequest) {
+        res.setHeader("X-QR-Auth", "auth-middleware-verify-failed");
+        console.warn("🚨 [auth] QR image token verification failed in authMiddleware", {
+          method: req.method,
+          path: requestPath,
+          error: err?.message || String(err),
+        });
+      }
       // Allow a legacy secret in non-production to avoid breaking existing sessions after a local secret change.
       if (legacySecret && legacySecret !== primarySecret) {
         decoded = verifyWith(legacySecret);

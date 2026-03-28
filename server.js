@@ -256,6 +256,7 @@ app.get("/manifest.json", (req, res) => {
 });
 app.use("/api/public/concerts", require("./routes/publicConcerts"));
 app.use("/api/public", require("./routes/publicRegistrations"));
+app.use("/api", require("./routes/guestQrPublic"));
 
 const { startKitchenTimersJob } = require("./routes/timerScheduler");
 startKitchenTimersJob();

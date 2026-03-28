@@ -18,6 +18,17 @@ function normalizePublicBaseUrl(value) {
   return raw.replace(/\/+$/, "").replace(/\/api$/i, "");
 }
 
+function getFallbackPublicApiBaseUrl() {
+  return normalizePublicBaseUrl(
+    process.env.PUBLIC_API_BASE_URL ||
+      process.env.PUBLIC_API_BASE ||
+      process.env.API_BASE_URL ||
+      process.env.RENDER_EXTERNAL_URL ||
+      process.env.URL ||
+      "https://hurrypos-backend.onrender.com"
+  );
+}
+
 function resolveRequestOrigin(req) {
   if (!req) return "";
   const forwardedProto = String(req.get?.("x-forwarded-proto") || "")
@@ -33,14 +44,16 @@ function resolveRequestOrigin(req) {
 }
 
 function resolvePublicApiBaseUrl(req) {
-  const envBase = normalizePublicBaseUrl(
-    process.env.PUBLIC_API_BASE_URL ||
-      process.env.PUBLIC_API_BASE ||
-      process.env.API_BASE_URL ||
-      ""
-  );
+  const envBase = getFallbackPublicApiBaseUrl();
   if (envBase) return envBase;
-  return resolveRequestOrigin(req);
+  const requestOrigin = resolveRequestOrigin(req);
+  if (
+    requestOrigin &&
+    !/localhost|127\.0\.0\.1|\[::1\]/i.test(requestOrigin)
+  ) {
+    return requestOrigin;
+  }
+  return getFallbackPublicApiBaseUrl();
 }
 
 async function ensureBookingQrSchema(pool) {

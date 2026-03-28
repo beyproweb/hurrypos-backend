@@ -30,6 +30,7 @@ const {
   shouldServePublicQrImage,
   decodeGuestQrToken,
   buildGuestQrPngBuffer,
+  buildGuestQrScanUrl,
 } = require("../utils/guestQrImage");
 
 router.use((req, res, next) => {
@@ -40,6 +41,9 @@ router.use((req, res, next) => {
   ) {
     return next();
   }
+  if (req.method === "GET" && /^\/bookings\/qr-image\/[^/]+$/i.test(req.path || "")) {
+    return next();
+  }
   return authMiddleware(req, res, next);
 });
 router.use(async (req, res, next) => {
@@ -48,6 +52,9 @@ router.use(async (req, res, next) => {
     shouldServePublicQrImage(req) &&
     /^\/bookings\/qr\/[^/]+$/i.test(req.path || "")
   ) {
+    return next();
+  }
+  if (req.method === "GET" && /^\/bookings\/qr-image\/[^/]+$/i.test(req.path || "")) {
     return next();
   }
   const allowed = await attachAllowedModules(req);
@@ -365,8 +372,10 @@ router.get("/bookings/qr/:token", async (req, res) => {
 
     if (shouldServePublicQrImage(req)) {
       const decoded = decodeGuestQrToken(token, ["concert_booking"]);
-      const restaurantId = Number(decoded?.restaurant_id || 0);
-      if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+      const restaurantId = Number(decoded?.restaurant_id);
+      const bookingId = Number(decoded?.entity_id);
+
+      if (!Number.isFinite(restaurantId) || restaurantId <= 0 || !Number.isFinite(bookingId) || bookingId <= 0) {
         return res.status(401).json({ error: "QR invalid", code: "qr_invalid" });
       }
 
@@ -374,15 +383,17 @@ router.get("/bookings/qr/:token", async (req, res) => {
         `
         SELECT
           id,
+          restaurant_id,
           qr_status,
           qr_url,
           qr_image
         FROM concert_bookings
         WHERE restaurant_id = $1
-          AND qr_token = $2
+          AND id = $2
+          AND qr_token = $3
         LIMIT 1
         `,
-        [restaurantId, token]
+        [restaurantId, bookingId, token]
       );
 
       const booking = imageResult.rows?.[0] || null;
@@ -393,7 +404,18 @@ router.get("/bookings/qr/:token", async (req, res) => {
         return res.status(409).json({ error: "QR not ready", code: "qr_not_ready" });
       }
 
-      const pngBuffer = await buildGuestQrPngBuffer(booking.qr_url, booking.qr_image);
+      const scanUrl = buildGuestQrScanUrl({
+        req,
+        kind: "concert",
+        token,
+        fallbackUrl: booking.qr_url,
+      });
+      let pngBuffer = null;
+      try {
+        pngBuffer = await buildGuestQrPngBuffer(scanUrl, booking.qr_image);
+      } catch (qrErr) {
+        console.error("❌ Failed to render concert QR image:", qrErr);
+      }
       if (!pngBuffer) {
         return res.status(503).json({ error: "QR image unavailable", code: "qr_image_unavailable" });
       }
@@ -490,8 +512,87 @@ router.get("/bookings/qr/:token", async (req, res) => {
       },
     });
   } catch (err) {
+    if (err?.statusCode) {
+      return res.status(err.statusCode).json({
+        error: err.message || "QR invalid",
+        code: err.code || "qr_invalid",
+      });
+    }
     console.error("❌ Failed to resolve concert booking QR:", err);
     return res.status(500).json({ error: "Failed to resolve booking QR" });
+  }
+});
+
+router.get("/bookings/qr-image/:token", async (req, res) => {
+  const token = String(req.params.token || "").trim();
+  if (!token) {
+    return res.status(400).json({ error: "QR token is required" });
+  }
+
+  try {
+    await ensureBookingQrSchema(pool);
+
+    const decoded = decodeGuestQrToken(token, ["concert_booking"]);
+    const restaurantId = Number(decoded?.restaurant_id);
+    const bookingId = Number(decoded?.entity_id);
+
+    if (!Number.isFinite(restaurantId) || restaurantId <= 0 || !Number.isFinite(bookingId) || bookingId <= 0) {
+      return res.status(401).json({ error: "QR invalid", code: "qr_invalid" });
+    }
+
+    const imageResult = await pool.query(
+      `
+      SELECT
+        id,
+        restaurant_id,
+        qr_status,
+        qr_url,
+        qr_image
+      FROM concert_bookings
+      WHERE restaurant_id = $1
+        AND id = $2
+        AND qr_token = $3
+      LIMIT 1
+      `,
+      [restaurantId, bookingId, token]
+    );
+
+    const booking = imageResult.rows?.[0] || null;
+    if (!booking) {
+      return res.status(404).json({ error: "QR invalid", code: "qr_invalid" });
+    }
+    if (String(booking.qr_status || "").toLowerCase() !== "ready") {
+      return res.status(409).json({ error: "QR not ready", code: "qr_not_ready" });
+    }
+
+    const scanUrl = buildGuestQrScanUrl({
+      req,
+      kind: "concert",
+      token,
+      fallbackUrl: booking.qr_url,
+    });
+    let pngBuffer = null;
+    try {
+      pngBuffer = await buildGuestQrPngBuffer(scanUrl, booking.qr_image);
+    } catch (qrErr) {
+      console.error("❌ Failed to render concert QR image:", qrErr);
+    }
+    if (!pngBuffer) {
+      return res.status(503).json({ error: "QR image unavailable", code: "qr_image_unavailable" });
+    }
+
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    return res.send(pngBuffer);
+  } catch (err) {
+    if (err?.statusCode) {
+      return res.status(err.statusCode).json({
+        error: err.message || "QR invalid",
+        code: err.code || "qr_invalid",
+      });
+    }
+    console.error("❌ Failed to render concert QR image route:", err);
+    return res.status(500).json({ error: "Failed to render concert QR image" });
   }
 });
 

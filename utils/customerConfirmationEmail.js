@@ -70,6 +70,17 @@ function normalizePublicBaseUrl(value) {
   return raw.replace(/\/+$/, "").replace(/\/api$/i, "");
 }
 
+function getFallbackPublicApiBaseUrl() {
+  return normalizePublicBaseUrl(
+    process.env.PUBLIC_API_BASE_URL ||
+      process.env.PUBLIC_API_BASE ||
+      process.env.API_BASE_URL ||
+      process.env.RENDER_EXTERNAL_URL ||
+      process.env.URL ||
+      "https://hurrypos-backend.onrender.com"
+  );
+}
+
 function resolveRequestOrigin(req) {
   if (!req) return "";
   const forwardedProto = String(req.get?.("x-forwarded-proto") || "")
@@ -97,26 +108,44 @@ function resolvePublicWebBaseUrl(req) {
 }
 
 function resolvePublicApiBaseUrl(req) {
-  const envBase = normalizePublicBaseUrl(
-    process.env.PUBLIC_API_BASE_URL ||
-      process.env.PUBLIC_API_BASE ||
-      process.env.API_BASE_URL ||
-      ""
-  );
+  const envBase = getFallbackPublicApiBaseUrl();
   if (envBase) return envBase;
-  return resolveRequestOrigin(req);
+  const requestOrigin = resolveRequestOrigin(req);
+  if (
+    requestOrigin &&
+    !/localhost|127\.0\.0\.1|\[::1\]/i.test(requestOrigin)
+  ) {
+    return requestOrigin;
+  }
+  return getFallbackPublicApiBaseUrl();
 }
 
-function buildEmailQrImageUrl(qrUrl) {
+function normalizeExternalQrUrl(qrUrl) {
   const normalized = asText(qrUrl);
   if (!normalized) return "";
   try {
     const url = new URL(normalized);
-    url.searchParams.set("format", "image");
+    if (/localhost|127\.0\.0\.1|\[::1\]/i.test(url.hostname)) {
+      const fallbackBase = getFallbackPublicApiBaseUrl();
+      if (!fallbackBase) return normalized;
+      return new URL(`${url.pathname}${url.search}${url.hash}`, fallbackBase).toString();
+    }
     return url.toString();
   } catch {
-    const separator = normalized.includes("?") ? "&" : "?";
-    return `${normalized}${separator}format=image`;
+    return normalized;
+  }
+}
+
+function buildEmailQrImageUrl(qrUrl) {
+  const normalized = normalizeExternalQrUrl(qrUrl);
+  if (!normalized) return "";
+  try {
+    const url = new URL(normalized);
+    url.pathname = url.pathname.replace(/\/qr\/([^/?#]+)$/i, "/qr-image/$1");
+    url.searchParams.delete("format");
+    return url.toString();
+  } catch {
+    return normalized.replace(/\/qr\/([^/?#]+)(\?.*)?$/i, "/qr-image/$1");
   }
 }
 
@@ -810,7 +839,8 @@ function buildHtmlTemplate({
 }) {
   const t = (key, params) => translateEmail(language, key, params);
   const brandColor = asText(restaurant.brandColor, "#0F766E");
-  const qrImageSrc = buildEmailQrImageUrl(qrUrl) || asText(qrImage, "");
+  const safeQrUrl = normalizeExternalQrUrl(qrUrl);
+  const qrImageSrc = buildEmailQrImageUrl(safeQrUrl) || asText(qrImage, "");
   const logoHtml = restaurant.logoUrl
     ? `<img src="${escapeHtml(restaurant.logoUrl)}" alt="${escapeHtml(
         restaurant.name
@@ -852,7 +882,7 @@ function buildHtmlTemplate({
       </div>`
     : "";
   const qrSectionHtml =
-    qrUrl || qrImageSrc
+    safeQrUrl || qrImageSrc
       ? `<div style="margin-top:20px;padding:18px;border:1px solid #E5E7EB;border-radius:16px;background:#F9FAFB;text-align:center;">
           <div style="font-size:13px;color:#6B7280;letter-spacing:.02em;margin-bottom:10px;">QR Code</div>
           ${
@@ -863,11 +893,11 @@ function buildHtmlTemplate({
               : ""
           }
           ${
-            qrUrl
+            safeQrUrl
               ? `<div style="font-size:13px;line-height:1.6;word-break:break-all;color:#111827;">
-                  <a href="${escapeHtml(qrImageSrc || qrUrl)}" style="color:${escapeHtml(
+                  <a href="${escapeHtml(qrImageSrc || safeQrUrl)}" style="color:${escapeHtml(
                   brandColor
-                )};text-decoration:underline;">${escapeHtml(qrUrl)}</a>
+                )};text-decoration:underline;">Check-in Code</a>
                 </div>`
               : ""
           }

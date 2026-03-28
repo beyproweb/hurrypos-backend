@@ -7,6 +7,43 @@ try {
   QRCodeLib = null;
 }
 
+function normalizePublicBaseUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.replace(/\/+$/, "").replace(/\/api$/i, "");
+}
+
+function resolveRequestOrigin(req) {
+  if (!req) return "";
+  const forwardedProto = String(req.get?.("x-forwarded-proto") || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const host = String(req.get?.("host") || "").trim();
+  if (!host) return "";
+  const isLocalHost =
+    host.includes("localhost") || host.startsWith("127.0.0.1") || host.startsWith("[::1]");
+  const protocol = forwardedProto || (isLocalHost ? "http" : "https");
+  return `${protocol}://${host}`;
+}
+
+function resolvePublicApiBaseUrl(req) {
+  const envBase = normalizePublicBaseUrl(
+    process.env.PUBLIC_API_BASE_URL ||
+      process.env.PUBLIC_API_BASE ||
+      process.env.API_BASE_URL ||
+      process.env.RENDER_EXTERNAL_URL ||
+      process.env.URL ||
+      "https://hurrypos-backend.onrender.com"
+  );
+  if (envBase) return envBase;
+  const requestOrigin = resolveRequestOrigin(req);
+  if (requestOrigin && !/localhost|127\.0\.0\.1|\[::1\]/i.test(requestOrigin)) {
+    return requestOrigin;
+  }
+  return "https://hurrypos-backend.onrender.com";
+}
+
 function shouldServePublicQrImage(req) {
   const format = String(req?.query?.format || req?.query?.render || req?.query?.mode || "")
     .trim()
@@ -77,8 +114,33 @@ async function buildGuestQrPngBuffer(scanUrl, qrImageDataUrl = "") {
   });
 }
 
+function buildGuestQrScanUrl({ req, kind, token, fallbackUrl = "" }) {
+  const tokenValue = String(token || "").trim();
+  if (!tokenValue) return "";
+
+  const direct = String(fallbackUrl || "").trim();
+  if (direct) {
+    try {
+      const parsed = new URL(direct);
+      if (!/localhost|127\.0\.0\.1|\[::1\]/i.test(parsed.hostname)) {
+        return parsed.toString();
+      }
+    } catch {
+      // ignore malformed stored URLs and rebuild canonically
+    }
+  }
+
+  const apiBase = resolvePublicApiBaseUrl(req);
+  const path =
+    kind === "concert"
+      ? `/api/concerts/bookings/qr/${encodeURIComponent(tokenValue)}`
+      : `/api/orders/reservations/qr/${encodeURIComponent(tokenValue)}`;
+  return `${apiBase}${path}`;
+}
+
 module.exports = {
   shouldServePublicQrImage,
   decodeGuestQrToken,
   buildGuestQrPngBuffer,
+  buildGuestQrScanUrl,
 };
