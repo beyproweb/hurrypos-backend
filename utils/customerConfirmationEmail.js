@@ -107,6 +107,19 @@ function resolvePublicApiBaseUrl(req) {
   return resolveRequestOrigin(req);
 }
 
+function buildEmailQrImageUrl(qrUrl) {
+  const normalized = asText(qrUrl);
+  if (!normalized) return "";
+  try {
+    const url = new URL(normalized);
+    url.searchParams.set("format", "image");
+    return url.toString();
+  } catch {
+    const separator = normalized.includes("?") ? "&" : "?";
+    return `${normalized}${separator}format=image`;
+  }
+}
+
 function toAbsoluteAssetUrl(src, req) {
   const value = String(src || "").trim();
   if (!value) return "";
@@ -797,6 +810,7 @@ function buildHtmlTemplate({
 }) {
   const t = (key, params) => translateEmail(language, key, params);
   const brandColor = asText(restaurant.brandColor, "#0F766E");
+  const qrImageSrc = buildEmailQrImageUrl(qrUrl) || asText(qrImage, "");
   const logoHtml = restaurant.logoUrl
     ? `<img src="${escapeHtml(restaurant.logoUrl)}" alt="${escapeHtml(
         restaurant.name
@@ -838,19 +852,23 @@ function buildHtmlTemplate({
       </div>`
     : "";
   const qrSectionHtml =
-    qrUrl || qrImage
+    qrUrl || qrImageSrc
       ? `<div style="margin-top:20px;padding:18px;border:1px solid #E5E7EB;border-radius:16px;background:#F9FAFB;text-align:center;">
           <div style="font-size:13px;color:#6B7280;letter-spacing:.02em;margin-bottom:10px;">QR Code</div>
           ${
-            qrImage
-              ? `<img src="${escapeHtml(qrImage)}" alt="QR Code" style="display:block;width:180px;height:180px;margin:0 auto 12px auto;border-radius:12px;background:#FFFFFF;padding:10px;border:1px solid #E5E7EB;" />`
+            qrImageSrc
+              ? `<img src="${escapeHtml(
+                  qrImageSrc
+                )}" alt="QR Code" width="180" height="180" style="display:block;width:180px;height:180px;margin:0 auto 12px auto;border-radius:12px;background:#FFFFFF;padding:10px;border:1px solid #E5E7EB;" />`
               : ""
           }
           ${
             qrUrl
-              ? `<div style="font-size:13px;line-height:1.6;word-break:break-all;color:#111827;">${escapeHtml(
-                  qrUrl
-                )}</div>`
+              ? `<div style="font-size:13px;line-height:1.6;word-break:break-all;color:#111827;">
+                  <a href="${escapeHtml(qrImageSrc || qrUrl)}" style="color:${escapeHtml(
+                  brandColor
+                )};text-decoration:underline;">${escapeHtml(qrUrl)}</a>
+                </div>`
               : ""
           }
         </div>`

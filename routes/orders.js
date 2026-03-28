@@ -32,6 +32,11 @@ module.exports = function(io) {
     queueOrderReservationQrEmailJob,
   } = require("../utils/bookingQrAsync");
   const {
+    shouldServePublicQrImage,
+    decodeGuestQrToken,
+    buildGuestQrPngBuffer,
+  } = require("../utils/guestQrImage");
+  const {
     CONFIRMATION_TYPES,
     sendOrderCustomerConfirmationEmail,
     sendOrderCustomerDeliveredEmail,
@@ -880,6 +885,14 @@ module.exports = function(io) {
   // - Table QR mode (?mode=table) uses a lightweight table JWT
   // - Everything else falls back to normal staff authMiddleware
   router.use((req, res, next) => {
+    if (
+      req.method === "GET" &&
+      shouldServePublicQrImage(req) &&
+      /^\/reservations\/qr\/[^/]+$/i.test(req.path || "")
+    ) {
+      return next();
+    }
+
     const mode =
       typeof req.query.mode === "string"
         ? req.query.mode.toLowerCase()
@@ -6613,7 +6626,7 @@ router.post("/reservations", async (req, res) => {
             explicitCustomerEmail: normalizedCustomerEmail,
             triggeredFrom: "orders.reservations.create.table.qr_ready",
             req,
-            sendEmail: true,
+            sendEmail: false,
           });
 
           console.log("[owner-reservation-email] route.trigger.start", {
@@ -6817,7 +6830,7 @@ router.post("/reservations", async (req, res) => {
             explicitCustomerEmail: normalizedCustomerEmail,
             triggeredFrom: "orders.reservations.create.order.qr_ready",
             req,
-            sendEmail: true,
+            sendEmail: false,
           });
 
           console.log("[owner-reservation-email] route.trigger.start", {
@@ -6965,9 +6978,6 @@ router.get("/reservations", async (req, res) => {
 });
 
 router.get("/reservations/qr/:token", async (req, res) => {
-  const restaurantId = await requireRestaurantId(req, res);
-  if (!restaurantId) return;
-
   const token = String(req.params.token || "").trim();
   if (!token) {
     return res.status(400).json({ error: "QR token is required" });
@@ -6975,6 +6985,50 @@ router.get("/reservations/qr/:token", async (req, res) => {
 
   try {
     await ensureBookingQrSchema(pool);
+
+    if (shouldServePublicQrImage(req)) {
+      const decoded = decodeGuestQrToken(token, ["order_reservation", "reservation", "order"]);
+      const restaurantId = Number(decoded?.restaurant_id || 0);
+      if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+        return res.status(401).json({ error: "QR invalid", code: "qr_invalid" });
+      }
+
+      const imageResult = await pool.query(
+        `
+        SELECT
+          id,
+          qr_status,
+          qr_url,
+          qr_image
+        FROM orders
+        WHERE restaurant_id = $1
+          AND qr_token = $2
+        LIMIT 1
+        `,
+        [restaurantId, token]
+      );
+
+      const reservation = imageResult.rows?.[0] || null;
+      if (!reservation) {
+        return res.status(404).json({ error: "QR invalid", code: "qr_invalid" });
+      }
+      if (String(reservation.qr_status || "").toLowerCase() !== "ready") {
+        return res.status(409).json({ error: "QR not ready", code: "qr_not_ready" });
+      }
+
+      const pngBuffer = await buildGuestQrPngBuffer(reservation.qr_url, reservation.qr_image);
+      if (!pngBuffer) {
+        return res.status(503).json({ error: "QR image unavailable", code: "qr_image_unavailable" });
+      }
+
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "public, max-age=300");
+      return res.send(pngBuffer);
+    }
+
+    const restaurantId = await requireRestaurantId(req, res);
+    if (!restaurantId) return;
+
     const result = await pool.query(
       `
       SELECT

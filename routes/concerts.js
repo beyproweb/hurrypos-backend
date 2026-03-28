@@ -26,9 +26,30 @@ const {
   queueConcertBookingQrEmailJob,
   scheduleBackgroundTask,
 } = require("../utils/bookingQrAsync");
+const {
+  shouldServePublicQrImage,
+  decodeGuestQrToken,
+  buildGuestQrPngBuffer,
+} = require("../utils/guestQrImage");
 
-router.use(authMiddleware);
+router.use((req, res, next) => {
+  if (
+    req.method === "GET" &&
+    shouldServePublicQrImage(req) &&
+    /^\/bookings\/qr\/[^/]+$/i.test(req.path || "")
+  ) {
+    return next();
+  }
+  return authMiddleware(req, res, next);
+});
 router.use(async (req, res, next) => {
+  if (
+    req.method === "GET" &&
+    shouldServePublicQrImage(req) &&
+    /^\/bookings\/qr\/[^/]+$/i.test(req.path || "")
+  ) {
+    return next();
+  }
   const allowed = await attachAllowedModules(req);
   if (
     Array.isArray(allowed) &&
@@ -334,17 +355,59 @@ router.post("/events/:eventId/bookings", async (req, res) => {
 });
 
 router.get("/bookings/qr/:token", async (req, res) => {
-  const restaurantId = getRestaurantId(req);
   const token = String(req.params.token || "").trim();
-  if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
-    return res.status(401).json({ error: "Missing restaurant context" });
-  }
   if (!token) {
     return res.status(400).json({ error: "QR token is required" });
   }
 
   try {
     await ensureBookingQrSchema(pool);
+
+    if (shouldServePublicQrImage(req)) {
+      const decoded = decodeGuestQrToken(token, ["concert_booking"]);
+      const restaurantId = Number(decoded?.restaurant_id || 0);
+      if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+        return res.status(401).json({ error: "QR invalid", code: "qr_invalid" });
+      }
+
+      const imageResult = await pool.query(
+        `
+        SELECT
+          id,
+          qr_status,
+          qr_url,
+          qr_image
+        FROM concert_bookings
+        WHERE restaurant_id = $1
+          AND qr_token = $2
+        LIMIT 1
+        `,
+        [restaurantId, token]
+      );
+
+      const booking = imageResult.rows?.[0] || null;
+      if (!booking) {
+        return res.status(404).json({ error: "QR invalid", code: "qr_invalid" });
+      }
+      if (String(booking.qr_status || "").toLowerCase() !== "ready") {
+        return res.status(409).json({ error: "QR not ready", code: "qr_not_ready" });
+      }
+
+      const pngBuffer = await buildGuestQrPngBuffer(booking.qr_url, booking.qr_image);
+      if (!pngBuffer) {
+        return res.status(503).json({ error: "QR image unavailable", code: "qr_image_unavailable" });
+      }
+
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "public, max-age=300");
+      return res.send(pngBuffer);
+    }
+
+    const restaurantId = getRestaurantId(req);
+    if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+      return res.status(401).json({ error: "Missing restaurant context" });
+    }
+
     const result = await pool.query(
       `
       SELECT
