@@ -10,6 +10,12 @@ const {
   listAvailableTablesForEvent,
   mapBookingResponse,
 } = require("../utils/concertsService");
+const {
+  buildFloorPlanElementIndex,
+  evaluateTableRestrictions,
+  loadVenueFloorPlanLayout,
+  resolveEffectiveFloorPlanLayout,
+} = require("../utils/floorPlan");
 const { sendConcertOwnerReservationNotificationEmail } = require("../utils/customerConfirmationEmail");
 const {
   markConcertBookingQrPending,
@@ -86,6 +92,9 @@ router.get("/:identifier/events/:eventId/available-tables", async (req, res) => 
     const tables = await listAvailableTablesForEvent(pool, restaurantId, eventId, {
       areaName: req.query.area_name,
       ticketTypeId: req.query.ticket_type_id,
+      guestCount: req.query.guest_count,
+      maleGuestsCount: req.query.male_guests_count,
+      femaleGuestsCount: req.query.female_guests_count,
     });
     if (tables === null) {
       return res.status(404).json({ error: "Event not found" });
@@ -94,6 +103,120 @@ router.get("/:identifier/events/:eventId/available-tables", async (req, res) => 
   } catch (err) {
     console.error("❌ Failed to load available concert tables:", err);
     res.status(500).json({ error: "Failed to load available tables" });
+  }
+});
+
+router.get("/:identifier/events/:eventId/floor-plan", async (req, res) => {
+  const identifier = String(req.params.identifier || "").trim();
+  const eventId = Number(req.params.eventId);
+  if (!identifier) {
+    return res.status(400).json({ error: "Missing identifier" });
+  }
+  if (!Number.isFinite(eventId) || eventId <= 0) {
+    return res.status(400).json({ error: "Invalid event id" });
+  }
+
+  try {
+    await ensureConcertTables(pool);
+    const restaurantId = await resolveRestaurantIdByIdentifier(pool, identifier);
+    if (!restaurantId) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    const event = await getEventById(pool, restaurantId, eventId);
+    if (!event || event.status === "hidden") {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    const [tablesResult, venueLayout, availableTables] = await Promise.all([
+      pool.query(
+        `
+        SELECT number, area, seats, label, COALESCE(locked, FALSE) AS locked
+        FROM tables
+        WHERE restaurant_id = $1
+          AND COALESCE(active, TRUE) = TRUE
+        ORDER BY number ASC
+        `,
+        [restaurantId]
+      ),
+      loadVenueFloorPlanLayout(pool, restaurantId),
+      listAvailableTablesForEvent(pool, restaurantId, eventId, {
+        areaName: req.query.area_name,
+        ticketTypeId: req.query.ticket_type_id,
+        guestCount: req.query.guest_count,
+        maleGuestsCount: req.query.male_guests_count,
+        femaleGuestsCount: req.query.female_guests_count,
+      }),
+    ]);
+
+    const { layout, source } = resolveEffectiveFloorPlanLayout({
+      venueLayout,
+      eventLayout: event.floor_plan_layout,
+      tables: tablesResult.rows,
+    });
+    const layoutIndex = buildFloorPlanElementIndex(layout);
+    const availableSet = new Set(
+      (Array.isArray(availableTables) ? availableTables : [])
+        .map((row) => Number(row?.table_number))
+        .filter((value) => Number.isFinite(value) && value > 0)
+    );
+
+    const tableStates = tablesResult.rows.map((table) => {
+      const tableNumber = Number(table?.number);
+      const element = layoutIndex.get(tableNumber) || null;
+      const restriction = evaluateTableRestrictions({
+        table: {
+          seats: table?.seats,
+          area: table?.area,
+        },
+        element,
+        guestCount: req.query.guest_count,
+        menCount: req.query.male_guests_count,
+        womenCount: req.query.female_guests_count,
+        ticketTypeId: req.query.ticket_type_id,
+        areaName: req.query.area_name || table?.area || "",
+      });
+
+      let status = "available";
+      let reason = "";
+      if (element?.hidden || restriction.reason === "Hidden table") {
+        status = "hidden";
+        reason = restriction.reason;
+      } else if (Boolean(table?.locked)) {
+        status = "blocked";
+        reason = "Table is locked";
+      } else if (!restriction.valid) {
+        status = "blocked";
+        reason = restriction.reason;
+      } else if (availableSet.has(tableNumber)) {
+        status = "available";
+      } else {
+        status = "reserved";
+        reason = "Already reserved";
+      }
+
+      return {
+        table_number: tableNumber,
+        status,
+        reason,
+        capacity: Number(element?.capacity || table?.seats || 0) || 0,
+        zone: String(element?.zone || table?.area || "").trim(),
+        table_type: String(element?.table_type || "regular").trim(),
+        label: String(element?.name || table?.label || "").trim(),
+        seats: Number(table?.seats || 0) || 0,
+      };
+    });
+
+    res.json({
+      success: true,
+      source,
+      event,
+      layout,
+      table_states: tableStates,
+    });
+  } catch (err) {
+    console.error("❌ Failed to load concert floor plan:", err);
+    res.status(500).json({ error: "Failed to load concert floor plan" });
   }
 });
 

@@ -748,6 +748,7 @@ const BRANDING_DEFAULTS = {
   pwa_background_color: "#FFFFFF",
   qrmenu_font_family: "gotham",
   concert_reservation_button_color: "#111827",
+  qr_floor_plan_layout: null,
 };
 
 function parseCustomizationPayload(row) {

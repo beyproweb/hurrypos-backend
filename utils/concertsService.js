@@ -27,6 +27,13 @@ const {
   addMinutesToDateTime,
   parseLocalDateTime,
 } = require("./bookingSlots");
+const {
+  evaluateTableRestrictions,
+  loadVenueFloorPlanLayout,
+  normalizeFloorPlanLayout,
+  resolveEffectiveFloorPlanLayout,
+  buildFloorPlanElementIndex,
+} = require("./floorPlan");
 
 let concertTablesEnsured = false;
 
@@ -348,6 +355,7 @@ function sanitizeEventInput(payload = {}, { isPatch = false } = {}) {
     guest_composition_validation_message: asNullableText(
       payload.guest_composition_validation_message
     ),
+    floor_plan_layout: normalizeFloorPlanLayout(payload.floor_plan_layout || payload.floorPlanLayout),
   };
 
   const areaAllocations = normalizeArray(payload.area_allocations).map((row) => ({
@@ -442,6 +450,10 @@ async function ensureConcertTables(pool) {
   await pool.query(`
     ALTER TABLE concert_events
     ADD COLUMN IF NOT EXISTS guest_composition_validation_message TEXT
+  `);
+  await pool.query(`
+    ALTER TABLE concert_events
+    ADD COLUMN IF NOT EXISTS floor_plan_layout JSONB
   `);
 
   await pool.query(`
@@ -856,6 +868,7 @@ async function buildEventView(client, eventRow, bookingSettings = null) {
       "no_restriction"
     ),
     guest_composition_validation_message: eventRow.guest_composition_validation_message || "",
+    floor_plan_layout: normalizeFloorPlanLayout(eventRow.floor_plan_layout),
     auto_sold_out: soldOutAuto,
     sold_ticket_count: bookedTickets,
     sold_table_count: bookedTables,
@@ -957,11 +970,12 @@ async function createEvent(pool, restaurantId, payload) {
         guest_composition_enabled,
         guest_composition_field_mode,
         guest_composition_restriction_rule,
-        guest_composition_validation_message
+        guest_composition_validation_message,
+        floor_plan_layout
       )
       VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-        'bank_transfer', $11, $12, $13, $14, $15, $16, $17
+        'bank_transfer', $11, $12, $13, $14, $15, $16, $17, $18::jsonb
       )
       RETURNING id
       `,
@@ -983,6 +997,7 @@ async function createEvent(pool, restaurantId, payload) {
         clean.guest_composition_field_mode,
         clean.guest_composition_restriction_rule,
         clean.guest_composition_validation_message,
+        clean.floor_plan_layout ? JSON.stringify(clean.floor_plan_layout) : null,
       ]
     );
     const eventId = inserted.rows[0].id;
@@ -1034,6 +1049,7 @@ async function updateEvent(pool, restaurantId, eventId, payload) {
           guest_composition_field_mode = $16,
           guest_composition_restriction_rule = $17,
           guest_composition_validation_message = $18,
+          floor_plan_layout = $19::jsonb,
           updated_at = NOW()
       WHERE restaurant_id = $1
         AND id = $2
@@ -1057,6 +1073,7 @@ async function updateEvent(pool, restaurantId, eventId, payload) {
         clean.guest_composition_field_mode,
         clean.guest_composition_restriction_rule,
         clean.guest_composition_validation_message,
+        clean.floor_plan_layout ? JSON.stringify(clean.floor_plan_layout) : null,
       ]
     );
 
@@ -1231,17 +1248,25 @@ async function chooseSpecificAvailableTable(
 }
 
 async function listAvailableTablesForEvent(
-  pool,
+  db,
   restaurantId,
   eventId,
-  { areaName = null, ticketTypeId = null } = {}
+  {
+    areaName = null,
+    ticketTypeId = null,
+    guestCount = 0,
+    maleGuestsCount = null,
+    femaleGuestsCount = null,
+  } = {}
 ) {
-  await ensureConcertTables(pool);
-  const client = await pool.connect();
+  await ensureConcertTables(db);
+  const client = typeof db?.connect === "function" ? await db.connect() : db;
+  const shouldRelease = typeof db?.connect === "function";
   try {
     const eventRow = await fetchEventRow(client, restaurantId, eventId);
     if (!eventRow) return null;
     const bookingSettings = await loadBookingSlotSettings(client, restaurantId);
+    const venueLayout = await loadVenueFloorPlanLayout(client, restaurantId);
 
     let resolvedAreaName = normalizeAreaName(areaName);
     const numericTicketTypeId = Number(ticketTypeId);
@@ -1310,15 +1335,43 @@ async function listAvailableTablesForEvent(
         .filter((n) => Number.isFinite(n) && n > 0)
     );
 
+    const { layout } = resolveEffectiveFloorPlanLayout({
+      venueLayout,
+      eventLayout: eventRow.floor_plan_layout,
+      tables: tablesResult.rows.map((row) => ({
+        number: row.number,
+        area: row.area,
+        seats: row.seats,
+      })),
+    });
+    const layoutIndex = buildFloorPlanElementIndex(layout);
+
     return tablesResult.rows
       .filter((row) => !busy.has(Number(row.number)))
       .map((row) => ({
         table_number: Number(row.number),
         area_name: row.area || null,
         seats: asInt(row.seats, 0),
-      }));
+      }))
+      .filter((row) => {
+        const validation = evaluateTableRestrictions({
+          table: {
+            area: row.area_name,
+            seats: row.seats,
+          },
+          element: layoutIndex.get(Number(row.table_number)) || null,
+          guestCount,
+          menCount: maleGuestsCount,
+          womenCount: femaleGuestsCount,
+          ticketTypeId: numericTicketTypeId,
+          areaName: resolvedAreaName || row.area_name || "",
+        });
+        return validation.valid;
+      });
   } finally {
-    client.release();
+    if (shouldRelease) {
+      client.release();
+    }
   }
 }
 
@@ -1640,23 +1693,19 @@ async function createBooking(pool, restaurantId, eventId, rawPayload = {}) {
         rawPayload.requested_table_number || rawPayload.table_number,
         0
       );
+      const availableTables = await listAvailableTablesForEvent(client, restaurantId, eventId, {
+        areaName,
+        ticketTypeId: ticketTypeRow?.id || null,
+        guestCount: guestsCount,
+        maleGuestsCount,
+        femaleGuestsCount,
+      });
       const tableChoice =
         requestedTableNumber > 0
-          ? await chooseSpecificAvailableTable(
-              client,
-              restaurantId,
-              eventSlot,
-              bookingSettings,
-              requestedTableNumber,
-              areaName
-            )
-          : await chooseAvailableTable(
-              client,
-              restaurantId,
-              eventSlot,
-              bookingSettings,
-              areaName
-            );
+          ? availableTables.find(
+              (row) => Number(row?.table_number) === Number(requestedTableNumber)
+            ) || null
+          : availableTables[0] || null;
       if (!tableChoice) {
         await client.query("ROLLBACK");
         return {

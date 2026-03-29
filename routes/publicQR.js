@@ -21,6 +21,12 @@ const {
   parseLocalDateTime,
   addMinutesToDateTime,
 } = require("../utils/bookingSlots");
+const {
+  buildFloorPlanElementIndex,
+  evaluateTableRestrictions,
+  loadVenueFloorPlanLayout,
+  resolveEffectiveFloorPlanLayout,
+} = require("../utils/floorPlan");
 
 const CALL_WAITER_COOLDOWN_MS = 15000;
 const callWaiterRateLimit = new Map();
@@ -36,6 +42,7 @@ const QR_BRANDING_DEFAULTS = {
   pwa_background_color: "#FFFFFF",
   qrmenu_font_family: "gotham",
   concert_reservation_button_color: "#111827",
+  qr_floor_plan_layout: null,
 };
 
 const QR_BOOKING_DEFAULTS = {
@@ -649,6 +656,80 @@ function buildPublicReservationTimeSlots({
       };
     })
     .filter(Boolean);
+}
+
+function buildReservationFloorPlanTableStates({
+  tables = [],
+  layout = null,
+  availableTables = [],
+  unavailableTableNumbers = [],
+  reservedTableNumbers = [],
+  guestCount = 0,
+  reservationMen = null,
+  reservationWomen = null,
+}) {
+  const layoutIndex = buildFloorPlanElementIndex(layout);
+  const availableSet = new Set(
+    (Array.isArray(availableTables) ? availableTables : [])
+      .map((row) => Number(row?.table_number))
+      .filter((value) => Number.isFinite(value) && value > 0)
+  );
+  const unavailableSet = new Set(
+    (Array.isArray(unavailableTableNumbers) ? unavailableTableNumbers : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+  );
+  const reservedSet = new Set(
+    (Array.isArray(reservedTableNumbers) ? reservedTableNumbers : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+  );
+
+  return (Array.isArray(tables) ? tables : []).map((table) => {
+    const tableNumber = Number(table?.table_number ?? table?.number);
+    const element = layoutIndex.get(tableNumber) || null;
+    const restriction = evaluateTableRestrictions({
+      table,
+      element,
+      guestCount,
+      menCount: reservationMen,
+      womenCount: reservationWomen,
+      areaName: table?.area || "",
+    });
+
+    let status = "available";
+    let reason = "";
+
+    if (element?.hidden || restriction.reason === "Hidden table") {
+      status = "hidden";
+      reason = restriction.reason;
+    } else if (Boolean(table?.locked)) {
+      status = "blocked";
+      reason = "Table is locked";
+    } else if (!restriction.valid) {
+      status = "blocked";
+      reason = restriction.reason;
+    } else if (availableSet.has(tableNumber)) {
+      status = "available";
+    } else if (reservedSet.has(tableNumber)) {
+      status = "reserved";
+      reason = "Already reserved";
+    } else if (unavailableSet.has(tableNumber)) {
+      status = "occupied";
+      reason = "Currently occupied";
+    }
+
+    return {
+      table_number: tableNumber,
+      status,
+      reason,
+      capacity: Number(element?.capacity || table?.seats || 0) || 0,
+      zone: String(element?.zone || table?.area || "").trim(),
+      table_type: String(element?.table_type || "regular").trim(),
+      label: String(element?.name || table?.label || "").trim(),
+      seats: Number(table?.seats || 0) || 0,
+    };
+  });
 }
 
 const APPROX_CITY_SPEED_KMH = 28;
@@ -1424,6 +1505,102 @@ router.get("/tables/:identifier", async (req, res) => {
   } catch (err) {
     console.error("❌ Public tables failed:", err);
     res.json([]);
+  }
+});
+
+router.get("/floor-plan/:identifier", async (req, res) => {
+  try {
+    const identifier = String(req.params.identifier || "").trim();
+    if (!identifier) {
+      return res.json({ success: true, layout: null, table_states: [], source: "generated" });
+    }
+
+    const { rows } = await pool.query(
+      `
+      SELECT id
+      FROM restaurants
+      WHERE slug = $1 OR qr_code_id = $1 OR id::text = $1
+      LIMIT 1
+      `,
+      [identifier]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: "Restaurant not found" });
+    }
+
+    const restaurantId = rows[0].id;
+    const requestedDate = String(req.query?.date || "").trim();
+    const requestedTime = normalizeTimeValue(req.query?.time);
+    const guestCount = asPositiveInt(
+      req.query?.guest_count ?? req.query?.guests_count ?? req.query?.guests,
+      0
+    );
+    const reservationMen = req.query?.reservation_men ?? req.query?.men ?? null;
+    const reservationWomen = req.query?.reservation_women ?? req.query?.women ?? null;
+
+    const [{ bookingSettings, tables, reservationRows }, venueLayout] = await Promise.all([
+      loadPublicReservationAvailabilityContext(restaurantId),
+      loadVenueFloorPlanLayout(pool, restaurantId),
+    ]);
+
+    const { layout, source } = resolveEffectiveFloorPlanLayout({
+      venueLayout,
+      tables,
+    });
+
+    let availableTables = [];
+    let unavailableTableNumbers = [];
+    let reservedTableNumbers = [];
+    let selectedSlot = null;
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(requestedDate) && requestedTime) {
+      const requestedSlot = computeReservationSlot({
+        reservationDate: requestedDate,
+        reservationTime: requestedTime,
+        settings: bookingSettings,
+      });
+      if (requestedSlot) {
+        const evaluation = evaluatePublicReservationAvailability({
+          tables,
+          reservationRows,
+          requestedSlot,
+          bookingSettings,
+          guestCount,
+          targetDateYmd: requestedDate,
+        });
+        availableTables = evaluation.availableTables;
+        unavailableTableNumbers = evaluation.unavailableTableNumbers;
+        reservedTableNumbers = evaluation.reservedTableNumbers;
+        selectedSlot = {
+          date: requestedDate,
+          time: String(requestedTime || "").slice(0, 5),
+          slot_start_datetime: requestedSlot.slot_start_datetime,
+          slot_end_datetime: requestedSlot.slot_end_datetime,
+        };
+      }
+    }
+
+    const tableStates = buildReservationFloorPlanTableStates({
+      tables,
+      layout,
+      availableTables,
+      unavailableTableNumbers,
+      reservedTableNumbers,
+      guestCount,
+      reservationMen,
+      reservationWomen,
+    });
+
+    return res.json({
+      success: true,
+      source,
+      layout,
+      selected_slot: selectedSlot,
+      table_states: tableStates,
+    });
+  } catch (err) {
+    console.error("❌ Public floor plan failed:", err);
+    return res.status(500).json({ error: "Failed to load floor plan" });
   }
 });
 

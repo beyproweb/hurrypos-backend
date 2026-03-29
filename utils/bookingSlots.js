@@ -1,3 +1,7 @@
+const moment = require("moment-timezone");
+
+const DEFAULT_TZ = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
+
 const DEFAULT_BOOKING_SLOT_SETTINGS = Object.freeze({
   reservation_default_duration_minutes: 120,
   reservation_buffer_minutes: 0,
@@ -72,22 +76,24 @@ function parseLocalDateTime(value) {
   const raw = asText(value, "");
   if (!raw) return null;
   const normalized = raw.includes("T") ? raw.replace("T", " ") : raw;
-  const candidate = new Date(normalized);
-  if (!Number.isFinite(candidate.getTime())) return null;
-  return candidate;
+  const candidate = moment.tz(normalized, ["YYYY-MM-DD HH:mm:ss", "YYYY-MM-DD HH:mm"], DEFAULT_TZ);
+  if (!candidate.isValid()) return null;
+  return candidate.toDate();
 }
 
 function formatDatePart(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
+  const zoned = moment(date).tz(DEFAULT_TZ);
+  const year = zoned.year();
+  const month = String(zoned.month() + 1).padStart(2, "0");
+  const day = String(zoned.date()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
 function formatTimePart(date) {
-  const hours = String(date.getHours()).padStart(2, "0");
-  const minutes = String(date.getMinutes()).padStart(2, "0");
-  const seconds = String(date.getSeconds()).padStart(2, "0");
+  const zoned = moment(date).tz(DEFAULT_TZ);
+  const hours = String(zoned.hours()).padStart(2, "0");
+  const minutes = String(zoned.minutes()).padStart(2, "0");
+  const seconds = String(zoned.seconds()).padStart(2, "0");
   return `${hours}:${minutes}:${seconds}`;
 }
 
@@ -344,12 +350,10 @@ function isTimeAlignedToStep(timeValue, stepMinutes) {
 function isDateWithinAdvanceLimit(dateValue, maxDaysInAdvance) {
   const ymd = normalizeYmd(dateValue);
   if (!ymd) return false;
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const target = new Date(`${ymd}T00:00:00`);
-  if (!Number.isFinite(target.getTime())) return false;
-  const diffMs = target.getTime() - today.getTime();
-  const diffDays = Math.floor(diffMs / 86400000);
+  const today = moment.tz(DEFAULT_TZ).startOf("day");
+  const target = moment.tz(ymd, "YYYY-MM-DD", DEFAULT_TZ).startOf("day");
+  if (!target.isValid()) return false;
+  const diffDays = target.diff(today, "days");
   return diffDays >= 0 && diffDays <= Math.max(0, asPositiveInt(maxDaysInAdvance, 0));
 }
 
@@ -389,7 +393,7 @@ function isCurrentTimeInsideWindow({
   openDateTime,
   closeDateTime,
   allowAfterClose = false,
-  now = new Date(),
+  now = moment.tz(DEFAULT_TZ).toDate(),
 }) {
   const open = parseLocalDateTime(openDateTime);
   const close = parseLocalDateTime(closeDateTime);
