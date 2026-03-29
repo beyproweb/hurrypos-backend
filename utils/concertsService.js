@@ -1260,8 +1260,12 @@ async function listAvailableTablesForEvent(
   } = {}
 ) {
   await ensureConcertTables(db);
-  const client = typeof db?.connect === "function" ? await db.connect() : db;
-  const shouldRelease = typeof db?.connect === "function";
+  const isPoolLike =
+    typeof db?.connect === "function" &&
+    typeof db?.query === "function" &&
+    typeof db?.release !== "function";
+  const client = isPoolLike ? await db.connect() : db;
+  const shouldRelease = isPoolLike;
   try {
     const eventRow = await fetchEventRow(client, restaurantId, eventId);
     if (!eventRow) return null;
