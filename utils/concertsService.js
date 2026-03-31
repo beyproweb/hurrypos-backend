@@ -95,6 +95,70 @@ function normalizeAreaName(value) {
   return next || null;
 }
 
+function buildNormalizedAreaNameSet(values = []) {
+  const set = new Set();
+  normalizeArray(values).forEach((value) => {
+    const normalized = normalizeAreaName(value);
+    if (normalized) {
+      set.add(normalized.toLowerCase());
+    }
+  });
+  return set;
+}
+
+function parseTablesSettingsPayload(row) {
+  if (!row) return {};
+  if (row.tables && typeof row.tables === "object") {
+    return row.tables;
+  }
+  if (row.value && typeof row.value === "object") {
+    return row.value;
+  }
+  if (typeof row.value === "string") {
+    try {
+      const parsed = JSON.parse(row.value);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+async function listActiveTableAreaNames(client, restaurantId) {
+  const settingsResult = await client.query(
+    `
+    SELECT tables, value
+    FROM settings
+    WHERE restaurant_id = $1 AND key = 'tables'
+    LIMIT 1
+    `,
+    [restaurantId]
+  );
+  const settingsPayload = parseTablesSettingsPayload(settingsResult.rows?.[0]);
+  const configuredAreaNames = Array.isArray(settingsPayload?.areaNames)
+    ? settingsPayload.areaNames.map((value) => normalizeAreaName(value)).filter(Boolean)
+    : [];
+  if (configuredAreaNames.length > 0) {
+    return configuredAreaNames;
+  }
+
+  const result = await client.query(
+    `
+    SELECT DISTINCT area
+    FROM tables
+    WHERE restaurant_id = $1
+      AND COALESCE(active, TRUE) = TRUE
+      AND NULLIF(BTRIM(COALESCE(area, '')), '') IS NOT NULL
+    `,
+    [restaurantId]
+  );
+
+  return result.rows
+    .map((row) => normalizeAreaName(row?.area))
+    .filter(Boolean);
+}
+
 function normalizeGuestCompositionFieldMode(value, fallback = "hidden") {
   const next = asText(value, fallback).toLowerCase();
   return GUEST_COMPOSITION_FIELD_MODES.has(next) ? next : fallback;
@@ -816,6 +880,25 @@ async function buildEventView(client, eventRow, bookingSettings = null) {
   const { bookedTickets, bookedTables } = await getEventBookingCounters(client, restaurantId, eventId);
   const ticketTypes = await getTicketTypesWithAvailability(client, restaurantId, eventId);
   const areaAllocations = await getAreaAllocationsWithAvailability(client, restaurantId, eventId);
+  const activeTableAreaSet = buildNormalizedAreaNameSet(
+    await listActiveTableAreaNames(client, restaurantId)
+  );
+  const sanitizedTicketTypes = ticketTypes.map((row) => {
+    if (!row?.is_table_package) return row;
+    const normalizedArea = normalizeAreaName(row?.area_name);
+    if (!normalizedArea || activeTableAreaSet.has(normalizedArea.toLowerCase())) {
+      return row;
+    }
+    return {
+      ...row,
+      area_name: null,
+    };
+  });
+  const sanitizedAreaAllocations = areaAllocations.filter((row) => {
+    if (normalizeBookingType(row?.allocation_type) !== "table") return true;
+    const normalizedArea = normalizeAreaName(row?.area_name);
+    return !normalizedArea || activeTableAreaSet.has(normalizedArea.toLowerCase());
+  });
   const eventSlot = computeConcertSlot({
     eventDate: eventRow.event_date,
     eventTime: eventRow.event_time,
@@ -828,12 +911,16 @@ async function buildEventView(client, eventRow, bookingSettings = null) {
   const availableTables = Math.max(0, totalTables - bookedTables);
   const soldOutAuto = evaluateSoldOut({
     eventRow,
-    ticketTypes,
-    areaAllocations,
+    ticketTypes: sanitizedTicketTypes,
+    areaAllocations: sanitizedAreaAllocations,
     availableTickets,
     availableTables,
   });
-  const priceRange = computePriceRange({ eventRow, ticketTypes, areaAllocations });
+  const priceRange = computePriceRange({
+    eventRow,
+    ticketTypes: sanitizedTicketTypes,
+    areaAllocations: sanitizedAreaAllocations,
+  });
 
   return {
     id: eventId,
@@ -876,8 +963,8 @@ async function buildEventView(client, eventRow, bookingSettings = null) {
     available_table_count: availableTables,
     price_min: priceRange.min,
     price_max: priceRange.max,
-    ticket_types: ticketTypes,
-    area_allocations: areaAllocations,
+    ticket_types: sanitizedTicketTypes,
+    area_allocations: sanitizedAreaAllocations,
     created_at: eventRow.created_at,
     updated_at: eventRow.updated_at,
   };
@@ -1271,6 +1358,9 @@ async function listAvailableTablesForEvent(
     if (!eventRow) return null;
     const bookingSettings = await loadBookingSlotSettings(client, restaurantId);
     const venueLayout = await loadVenueFloorPlanLayout(client, restaurantId);
+    const activeTableAreaSet = buildNormalizedAreaNameSet(
+      await listActiveTableAreaNames(client, restaurantId)
+    );
 
     let resolvedAreaName = normalizeAreaName(areaName);
     const numericTicketTypeId = Number(ticketTypeId);
@@ -1287,6 +1377,13 @@ async function listAvailableTablesForEvent(
         [restaurantId, eventId, numericTicketTypeId]
       );
       resolvedAreaName = normalizeAreaName(ticketTypeResult.rows?.[0]?.area_name);
+    }
+    if (
+      resolvedAreaName &&
+      activeTableAreaSet.size > 0 &&
+      !activeTableAreaSet.has(resolvedAreaName.toLowerCase())
+    ) {
+      resolvedAreaName = null;
     }
 
     const eventSlot = computeConcertSlot({

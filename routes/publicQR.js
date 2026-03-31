@@ -68,6 +68,84 @@ function parseCustomizationPayload(row) {
   return {};
 }
 
+function parseTablesSettingsPayload(row) {
+  if (!row) return {};
+  if (row.tables && typeof row.tables === "object") {
+    return row.tables;
+  }
+  if (row.value && typeof row.value === "object") {
+    return row.value;
+  }
+  if (typeof row.value === "string") {
+    try {
+      const parsed = JSON.parse(row.value);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function normalizeConfiguredAreaName(value) {
+  return String(value || "").trim();
+}
+
+function buildConfiguredAreaSet(values = []) {
+  return new Set(
+    (Array.isArray(values) ? values : [])
+      .map(normalizeConfiguredAreaName)
+      .filter(Boolean)
+      .map((value) => value.toLowerCase())
+  );
+}
+
+function sanitizeConfiguredTableArea(areaName, configuredAreaNames = []) {
+  const rawAreaName = normalizeConfiguredAreaName(areaName);
+  const normalizedAreaNames = (Array.isArray(configuredAreaNames) ? configuredAreaNames : [])
+    .map(normalizeConfiguredAreaName)
+    .filter(Boolean);
+  const configuredAreaSet = buildConfiguredAreaSet(normalizedAreaNames);
+  const fallbackAreaName =
+    normalizedAreaNames.find((value) => value.toLowerCase() === "main hall") ||
+    normalizedAreaNames[0] ||
+    "Main Hall";
+
+  if (!configuredAreaSet.size) {
+    return rawAreaName || fallbackAreaName;
+  }
+
+  if (!rawAreaName) {
+    return fallbackAreaName;
+  }
+
+  return configuredAreaSet.has(rawAreaName.toLowerCase()) ? rawAreaName : fallbackAreaName;
+}
+
+function sanitizeConfiguredTableRows(rows = [], configuredAreaNames = []) {
+  return (Array.isArray(rows) ? rows : []).map((row) => ({
+    ...row,
+    area: sanitizeConfiguredTableArea(row?.area, configuredAreaNames),
+  }));
+}
+
+async function loadConfiguredTableAreaNames(restaurantId) {
+  const result = await pool.query(
+    `
+    SELECT tables, value
+    FROM settings
+    WHERE restaurant_id = $1 AND key = 'tables'
+    LIMIT 1
+    `,
+    [restaurantId]
+  );
+
+  const payload = parseTablesSettingsPayload(result.rows?.[0]);
+  return Array.isArray(payload?.areaNames)
+    ? payload.areaNames.map(normalizeConfiguredAreaName).filter(Boolean)
+    : [];
+}
+
 function normalizeHexColor(value, fallback = "#4F46E5") {
   const raw = String(value || "").trim();
   const match = raw.match(/^#([0-9a-f]{6}|[0-9a-f]{3})$/i);
@@ -529,7 +607,8 @@ function evaluatePublicReservationAvailability({
 
 async function loadPublicReservationAvailabilityContext(restaurantId) {
   const bookingSettings = await loadBookingSlotSettings(pool, restaurantId);
-  const [{ rows: tables }, { rows: reservationRows }] = await Promise.all([
+  const [configuredAreaNames, { rows: tables }, { rows: reservationRows }] = await Promise.all([
+    loadConfiguredTableAreaNames(restaurantId),
     pool.query(
       `
       SELECT
@@ -572,7 +651,7 @@ async function loadPublicReservationAvailabilityContext(restaurantId) {
 
   return {
     bookingSettings,
-    tables,
+    tables: sanitizeConfiguredTableRows(tables, configuredAreaNames),
     reservationRows,
   };
 }
@@ -1484,6 +1563,7 @@ router.get("/tables/:identifier", async (req, res) => {
 
     if (!rows.length) return res.json([]);
     const restaurantId = rows[0].id;
+    const configuredAreaNames = await loadConfiguredTableAreaNames(restaurantId);
 
     const { rows: tables } = await pool.query(
       `
@@ -1496,12 +1576,13 @@ router.get("/tables/:identifier", async (req, res) => {
              COALESCE(active, TRUE) AS active
       FROM tables
       WHERE restaurant_id = $1
+        AND COALESCE(active, TRUE) = TRUE
       ORDER BY number ASC
       `,
       [restaurantId]
     );
 
-    res.json(tables);
+    res.json(sanitizeConfiguredTableRows(tables, configuredAreaNames));
   } catch (err) {
     console.error("❌ Public tables failed:", err);
     res.json([]);
