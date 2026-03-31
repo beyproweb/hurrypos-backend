@@ -3,6 +3,9 @@ const moment = require("moment-timezone");
 const DEFAULT_TZ = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
 
 const DEFAULT_BOOKING_SLOT_SETTINGS = Object.freeze({
+  reservation_booking_settings_enabled: true,
+  booking_slot_settings_enabled: true,
+  concert_booking_settings_enabled: true,
   reservation_default_duration_minutes: 120,
   reservation_buffer_minutes: 0,
   reservation_max_per_table_per_day: null,
@@ -129,6 +132,18 @@ function getDayNameForYmd(value) {
 
 function normalizeBookingSlotSettings(raw = {}) {
   return {
+    reservation_booking_settings_enabled: asBoolean(
+      raw.reservation_booking_settings_enabled,
+      DEFAULT_BOOKING_SLOT_SETTINGS.reservation_booking_settings_enabled
+    ),
+    booking_slot_settings_enabled: asBoolean(
+      raw.booking_slot_settings_enabled,
+      DEFAULT_BOOKING_SLOT_SETTINGS.booking_slot_settings_enabled
+    ),
+    concert_booking_settings_enabled: asBoolean(
+      raw.concert_booking_settings_enabled,
+      DEFAULT_BOOKING_SLOT_SETTINGS.concert_booking_settings_enabled
+    ),
     reservation_default_duration_minutes: Math.max(
       15,
       asPositiveInt(
@@ -307,6 +322,7 @@ function computeConcertSlot({ eventDate, eventTime, settings }) {
 
 function computeReservationCheckinWindow({ slotStartDateTime, settings }) {
   const slotSettings = normalizeBookingSlotSettings(settings);
+  if (!slotSettings.reservation_booking_settings_enabled) return null;
   const earlyMinutes = slotSettings.reservation_early_checkin_window_minutes;
   const graceMinutes = slotSettings.reservation_late_arrival_grace_minutes;
   const autoCancelMinutes = slotSettings.reservation_auto_cancel_no_show_after_minutes;
@@ -325,6 +341,7 @@ function computeReservationCheckinWindow({ slotStartDateTime, settings }) {
 
 function computeConcertCheckinWindow({ slotStartDateTime, settings }) {
   const slotSettings = normalizeBookingSlotSettings(settings);
+  if (!slotSettings.concert_booking_settings_enabled) return null;
   return {
     entry_open_datetime: addMinutesToDateTime(
       slotStartDateTime,

@@ -503,14 +503,17 @@ router.get("/bookings/qr/:token", async (req, res) => {
       settings: bookingSettings,
     });
     const entryOpenDateTime =
-      booking.entry_open_datetime || computedWindow.entry_open_datetime || null;
+      booking.entry_open_datetime || computedWindow?.entry_open_datetime || null;
     const entryCloseDateTime =
-      booking.entry_close_datetime || computedWindow.entry_close_datetime || null;
+      booking.entry_close_datetime || computedWindow?.entry_close_datetime || null;
     const allowReentry = Boolean(booking.allow_reentry);
-    const withinCheckinWindow = isCurrentTimeInsideWindow({
-      openDateTime: entryOpenDateTime,
-      closeDateTime: entryCloseDateTime,
-    });
+    const withinCheckinWindow =
+      !entryOpenDateTime && !entryCloseDateTime
+        ? true
+        : isCurrentTimeInsideWindow({
+            openDateTime: entryOpenDateTime,
+            closeDateTime: entryCloseDateTime,
+          });
     const canCheckIn =
       Number.isFinite(Number(booking.reservation_order_id)) &&
       Number(booking.reservation_order_id) > 0 &&

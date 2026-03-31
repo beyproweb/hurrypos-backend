@@ -1500,13 +1500,19 @@ async function buildValidatedReservationSlot({
   if (!normalizeYmd(reservationDate) || !normalizeTimeValue(reservationTime)) {
     return { status: 400, error: "Reservation date and time are required" };
   }
-  if (!isDateWithinAdvanceLimit(reservationDate, bookingSettings.booking_max_days_in_advance)) {
+  if (
+    bookingSettings.booking_slot_settings_enabled !== false &&
+    !isDateWithinAdvanceLimit(reservationDate, bookingSettings.booking_max_days_in_advance)
+  ) {
     return {
       status: 400,
       error: `Bookings can only be made up to ${bookingSettings.booking_max_days_in_advance} day(s) in advance.`,
     };
   }
-  if (!isTimeAlignedToStep(reservationTime, bookingSettings.booking_time_interval_minutes)) {
+  if (
+    bookingSettings.booking_slot_settings_enabled !== false &&
+    !isTimeAlignedToStep(reservationTime, bookingSettings.booking_time_interval_minutes)
+  ) {
     return {
       status: 400,
       error: `Reservation time must follow ${bookingSettings.booking_time_interval_minutes}-minute slots.`,
@@ -1659,6 +1665,7 @@ async function validateReservationOrderCheckinWindow(restaurantId, reservationOr
     slotStartDateTime,
     settings: bookingSettings,
   });
+  if (!window) return;
   const insideWindow = isCurrentTimeInsideWindow({
     openDateTime: window.checkin_open_datetime,
     closeDateTime: window.checkin_close_datetime,
@@ -1689,10 +1696,9 @@ async function validateConcertEventFallbackCheckinWindow(restaurantId, reservati
     slotStartDateTime: `${eventDate} ${eventTime}`,
     settings: bookingSettings,
   });
-  const entryOpenDateTime =
-    computedWindow?.checkin_open_datetime || `${eventDate} ${eventTime}`;
-  const entryCloseDateTime =
-    computedWindow?.checkin_close_datetime || `${eventDate} ${eventTime}`;
+  if (!computedWindow) return true;
+  const entryOpenDateTime = computedWindow.checkin_open_datetime || `${eventDate} ${eventTime}`;
+  const entryCloseDateTime = computedWindow.checkin_close_datetime || `${eventDate} ${eventTime}`;
   const insideWindow = isCurrentTimeInsideWindow({
     openDateTime: entryOpenDateTime,
     closeDateTime: entryCloseDateTime,
@@ -1717,14 +1723,15 @@ async function validateConcertBookingCheckinWindow(restaurantId, concertBooking)
     slotStartDateTime,
     settings: bookingSettings,
   });
+  if (!computedWindow) return;
   const entryOpenDateTime =
     concertBooking?.entry_open_datetime != null
       ? String(concertBooking.entry_open_datetime)
-      : computedWindow.entry_open_datetime;
+      : computedWindow?.entry_open_datetime;
   const entryCloseDateTime =
     concertBooking?.entry_close_datetime != null
       ? String(concertBooking.entry_close_datetime)
-      : computedWindow.entry_close_datetime;
+      : computedWindow?.entry_close_datetime;
   const insideWindow = isCurrentTimeInsideWindow({
     openDateTime: entryOpenDateTime,
     closeDateTime: entryCloseDateTime,
