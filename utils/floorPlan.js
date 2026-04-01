@@ -330,7 +330,7 @@ function evaluateTableRestrictions({
 }) {
   const linkedElement = element ? normalizeLayoutElement(element) : null;
   const effectiveCapacity = asPositiveInt(
-    linkedElement?.capacity ?? table?.seats ?? table?.guests,
+    table?.seats ?? table?.guests ?? linkedElement?.capacity,
     0
   );
   const normalizedGuestCount = asPositiveInt(guestCount, 0);

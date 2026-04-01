@@ -510,8 +510,8 @@ function publicReservationSlotsOverlap(requestedSlot, existingSlot) {
 function sortPublicTablesByBestFit(tables, guestCount) {
   const safeGuestCount = asPositiveInt(guestCount, 0);
   return [...tables].sort((left, right) => {
-    const leftSeats = asPositiveInt(left?.seats, 0);
-    const rightSeats = asPositiveInt(right?.seats, 0);
+    const leftSeats = asPositiveInt(left?.seats ?? left?.guests, 0);
+    const rightSeats = asPositiveInt(right?.seats ?? right?.guests, 0);
     if (safeGuestCount > 0) {
       const leftDelta = leftSeats > 0 ? leftSeats - safeGuestCount : Number.MAX_SAFE_INTEGER;
       const rightDelta = rightSeats > 0 ? rightSeats - safeGuestCount : Number.MAX_SAFE_INTEGER;
@@ -562,7 +562,7 @@ function evaluatePublicReservationAvailability({
     const tableNumber = Number(table?.table_number ?? table?.number);
     if (!Number.isFinite(tableNumber) || tableNumber <= 0) continue;
 
-    const seats = asPositiveInt(table?.seats, 0);
+    const seats = asPositiveInt(table?.seats ?? table?.guests, 0);
     const isLocked = Boolean(table?.locked);
     const exceedsGuestCount = guestCount > 0 && seats > 0 && guestCount > seats;
     const exceedsDailyLimit =
@@ -614,6 +614,7 @@ async function loadPublicReservationAvailabilityContext(restaurantId) {
       SELECT
         number AS table_number,
         seats,
+        guests,
         area,
         COALESCE(locked, FALSE) AS locked
       FROM tables
@@ -802,11 +803,11 @@ function buildReservationFloorPlanTableStates({
       table_number: tableNumber,
       status,
       reason,
-      capacity: Number(element?.capacity || table?.seats || 0) || 0,
+      capacity: Number(table?.seats ?? table?.guests ?? element?.capacity ?? 0) || 0,
       zone: String(element?.zone || table?.area || "").trim(),
       table_type: String(element?.table_type || "regular").trim(),
       label: String(element?.name || table?.label || "").trim(),
-      seats: Number(table?.seats || 0) || 0,
+      seats: Number(table?.seats ?? table?.guests ?? 0) || 0,
     };
   });
 }
