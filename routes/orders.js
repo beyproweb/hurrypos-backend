@@ -4503,6 +4503,9 @@ router.post("/:id/close", async (req, res) => {
   const preserveReservationCheckoutBadge =
     req.body?.preserve_reservation_checkout_badge === true ||
     String(req.query?.preserve_reservation_checkout_badge || "").trim() === "1";
+  const allowUnpaidTableClose =
+    req.body?.allow_unpaid_table_close === true ||
+    String(req.query?.allow_unpaid_table_close || "").trim() === "1";
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -4537,6 +4540,11 @@ router.post("/:id/close", async (req, res) => {
     }
 
     const existing = rows[0];
+    const normalizedOrderType = String(existing.order_type || "").trim().toLowerCase();
+    const isDineInTableLikeOrder =
+      ["table", "reservation"].includes(normalizedOrderType) ||
+      Number.isFinite(Number(existing.table_number));
+    const skipDebtHandling = allowUnpaidTableClose && isDineInTableLikeOrder;
     if (existing.status === "closed") {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Order already closed" });
@@ -4650,8 +4658,8 @@ router.post("/:id/close", async (req, res) => {
     );
     const totalNow = toMoney(totalRows?.[0]?.total || 0);
     const recorded = toMoney(existing.debt_recorded_total);
-    const delta = existing.is_paid ? 0 : toMoney(totalNow - recorded);
-    const needsDebtAdjustment = delta !== 0 && !existing.is_paid;
+    const delta = existing.is_paid || skipDebtHandling ? 0 : toMoney(totalNow - recorded);
+    const needsDebtAdjustment = delta !== 0 && !existing.is_paid && !skipDebtHandling;
     
     // External orders (migros/yemeksepeti/etc) are prepaid, skip phone validation
     const isExternalOrder = Boolean(existing.external_source);
@@ -4684,7 +4692,7 @@ router.post("/:id/close", async (req, res) => {
               debt_recorded_total = $4
         WHERE restaurant_id = $1 AND id = $2
         RETURNING *`,
-      [restaurantId, id, totalNow, existing.is_paid ? recorded : totalNow]
+      [restaurantId, id, totalNow, existing.is_paid || skipDebtHandling ? recorded : totalNow]
     );
 
     const order = updated.rows[0];
