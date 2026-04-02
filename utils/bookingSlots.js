@@ -59,8 +59,43 @@ function normalizeYmd(value) {
 
 function normalizeTimeValue(value) {
   const next = asText(value, "");
-  if (!/^\d{2}:\d{2}(:\d{2})?$/.test(next)) return null;
-  return next.length === 5 ? `${next}:00` : next;
+  if (!next) return null;
+  if (/^\d{2}:\d{2}(:\d{2})?$/.test(next)) {
+    return next.length === 5 ? `${next}:00` : next;
+  }
+
+  const meridiemMatch = next.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])$/);
+  if (!meridiemMatch) return null;
+
+  let hours = Number(meridiemMatch[1]);
+  const minutes = Number(meridiemMatch[2]);
+  const seconds = Number(meridiemMatch[3] || "0");
+  const meridiem = String(meridiemMatch[4] || "").toLowerCase();
+  if (
+    !Number.isFinite(hours) ||
+    !Number.isFinite(minutes) ||
+    !Number.isFinite(seconds) ||
+    hours < 1 ||
+    hours > 12 ||
+    minutes < 0 ||
+    minutes > 59 ||
+    seconds < 0 ||
+    seconds > 59
+  ) {
+    return null;
+  }
+
+  if (meridiem === "am") {
+    if (hours === 12) hours = 0;
+  } else if (meridiem === "pm") {
+    if (hours < 12) hours += 12;
+  } else {
+    return null;
+  }
+
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(
+    seconds
+  ).padStart(2, "0")}`;
 }
 
 function toMinuteString(value) {

@@ -1287,6 +1287,12 @@ function parsePositiveInteger(value, fallback = 0) {
   return parsed;
 }
 
+function parseNonNegativeInteger(value, fallback = 0) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
+}
+
 function normalizeExistingReservationSlot(row, bookingSettings) {
   const reservationDate = normalizeYmd(row?.reservation_date);
   const reservationTime = normalizeTimeValue(row?.reservation_time) || "00:00:00";
@@ -1493,15 +1499,18 @@ async function buildValidatedReservationSlot({
   reservationWomen = null,
   requestedTableNumber = null,
   excludeOrderId = null,
+  reservationDurationMinutes = null,
+  reservationBufferMinutes = null,
 }) {
   await ensureBookingSlotSchema(pool);
   const bookingSettings = await loadBookingSlotSettings(pool, restaurantId);
+  const isBookingSlotValidationEnabled = bookingSettings.booking_slot_settings_enabled !== false;
 
   if (!normalizeYmd(reservationDate) || !normalizeTimeValue(reservationTime)) {
     return { status: 400, error: "Reservation date and time are required" };
   }
   if (
-    bookingSettings.booking_slot_settings_enabled !== false &&
+    isBookingSlotValidationEnabled &&
     !isDateWithinAdvanceLimit(reservationDate, bookingSettings.booking_max_days_in_advance)
   ) {
     return {
@@ -1510,7 +1519,7 @@ async function buildValidatedReservationSlot({
     };
   }
   if (
-    bookingSettings.booking_slot_settings_enabled !== false &&
+    isBookingSlotValidationEnabled &&
     !isTimeAlignedToStep(reservationTime, bookingSettings.booking_time_interval_minutes)
   ) {
     return {
@@ -1519,7 +1528,7 @@ async function buildValidatedReservationSlot({
     };
   }
 
-  const requestedSlot = computeReservationSlot({
+  let requestedSlot = computeReservationSlot({
     reservationDate,
     reservationTime,
     settings: bookingSettings,
@@ -1527,18 +1536,76 @@ async function buildValidatedReservationSlot({
   if (!requestedSlot) {
     return { status: 400, error: "Invalid reservation slot" };
   }
+  const explicitDurationMinutes = parsePositiveInteger(reservationDurationMinutes, 0);
+  const hasExplicitBufferMinutes =
+    reservationBufferMinutes !== null &&
+    reservationBufferMinutes !== undefined &&
+    String(reservationBufferMinutes).trim() !== "";
+  const explicitBufferMinutes = hasExplicitBufferMinutes
+    ? parseNonNegativeInteger(reservationBufferMinutes, 0)
+    : null;
+  if (explicitDurationMinutes > 0 || explicitBufferMinutes !== null) {
+    const nextDurationMinutes =
+      explicitDurationMinutes > 0
+        ? explicitDurationMinutes
+        : parsePositiveInteger(requestedSlot?.reservation_duration_minutes, 1);
+    const nextBufferMinutes =
+      explicitBufferMinutes !== null
+        ? explicitBufferMinutes
+        : parseNonNegativeInteger(requestedSlot?.reservation_buffer_minutes, 0);
+    const nextSlotEndDateTime = addMinutesToDateTime(
+      requestedSlot.slot_start_datetime,
+      nextDurationMinutes
+    );
+    if (!nextSlotEndDateTime) {
+      return { status: 400, error: "Invalid reservation slot" };
+    }
+    requestedSlot = {
+      ...requestedSlot,
+      slot_end_datetime: nextSlotEndDateTime,
+      slot_end_with_buffer_datetime:
+        addMinutesToDateTime(nextSlotEndDateTime, nextBufferMinutes) || nextSlotEndDateTime,
+      reservation_duration_minutes: nextDurationMinutes,
+      reservation_buffer_minutes: nextBufferMinutes,
+    };
+  }
 
-  const shopHours = await loadShopHoursForReservationDay(restaurantId, reservationDate);
-  if (
-    !shopHours ||
-    !isReservationSlotInsideOpeningHours({
-      reservationDate,
-      slot: requestedSlot,
-      openTime: shopHours.open_time,
-      closeTime: shopHours.close_time,
-    })
-  ) {
-    return { status: 400, error: "Selected reservation time is outside opening hours" };
+  if (isBookingSlotValidationEnabled) {
+    const shopHours = await loadShopHoursForReservationDay(restaurantId, reservationDate);
+    const reservationDayName = getDayNameForYmd(reservationDate);
+    const reservationDayLabel = reservationDayName
+      ? `${reservationDayName} (${reservationDate})`
+      : reservationDate;
+    if (!shopHours) {
+      return {
+        status: 400,
+        error: `No opening hours configured for ${reservationDayLabel}`,
+      };
+    }
+
+    if (
+      !isReservationSlotInsideOpeningHours({
+        reservationDate,
+        slot: requestedSlot,
+        openTime: shopHours.open_time,
+        closeTime: shopHours.close_time,
+      })
+    ) {
+      const requestedTimeLabel =
+        normalizeTimeValue(reservationTime)?.slice(0, 5) || String(reservationTime || "").trim();
+      const slotStartLabel =
+        String(requestedSlot?.slot_start_datetime || "").slice(11, 16) || requestedTimeLabel;
+      const slotEndLabel =
+        String(requestedSlot?.slot_end_datetime || "").slice(11, 16) || requestedTimeLabel;
+      const openTimeLabel =
+        normalizeTimeValue(shopHours.open_time)?.slice(0, 5) || String(shopHours.open_time || "").trim();
+      const closeTimeLabel =
+        normalizeTimeValue(shopHours.close_time)?.slice(0, 5) || String(shopHours.close_time || "").trim();
+      return {
+        status: 400,
+        error: `Selected reservation slot ${slotStartLabel}-${slotEndLabel} is outside opening hours for ${reservationDayLabel} (${openTimeLabel} - ${closeTimeLabel})`,
+      };
+    }
   }
 
   const availability = await loadReservationAvailabilityForSlot({
@@ -7215,7 +7282,9 @@ router.post("/reservations", async (req, res) => {
            reservation_clients,
            reservation_men,
            reservation_women,
-           reservation_notes
+           reservation_notes,
+           reservation_duration_minutes,
+           reservation_buffer_minutes
          FROM orders
          WHERE restaurant_id = $1 AND id = $2
          LIMIT 1`,
@@ -7297,6 +7366,8 @@ router.post("/reservations", async (req, res) => {
           hasReservationWomenInPayload ? reservation_women : sourceOrder?.reservation_women ?? null,
         requestedTableNumber,
         excludeOrderId: sourceOrderId,
+        reservationDurationMinutes: sourceOrder?.reservation_duration_minutes ?? null,
+        reservationBufferMinutes: sourceOrder?.reservation_buffer_minutes ?? null,
       });
       if (slotContext?.status >= 400) {
         return res.status(slotContext.status).json({ error: slotContext.error });
@@ -7794,7 +7865,16 @@ router.put("/reservations/:id", async (req, res) => {
 
     const existingResult = await pool.query(
       `
-      SELECT id, table_number, reservation_date, reservation_time, reservation_clients, reservation_men, reservation_women
+      SELECT
+        id,
+        table_number,
+        reservation_date,
+        reservation_time,
+        reservation_clients,
+        reservation_men,
+        reservation_women,
+        reservation_duration_minutes,
+        reservation_buffer_minutes
       FROM orders
       WHERE restaurant_id = $1
         AND id = $2
@@ -7824,6 +7904,8 @@ router.put("/reservations/:id", async (req, res) => {
         reservation_women !== undefined ? reservation_women : existingReservation.reservation_women ?? null,
       requestedTableNumber: existingReservation.table_number,
       excludeOrderId: id,
+      reservationDurationMinutes: existingReservation.reservation_duration_minutes ?? null,
+      reservationBufferMinutes: existingReservation.reservation_buffer_minutes ?? null,
     });
     if (slotContext?.status >= 400) {
       return res.status(slotContext.status).json({ error: slotContext.error });
@@ -8344,7 +8426,10 @@ router.post("/:id/reservations", async (req, res) => {
     const dateStr = String(reservation_date).trim();
     const timeStr = String(reservation_time).trim();
     const existingOrderResult = await pool.query(
-      `SELECT id, table_number FROM orders WHERE id = $1 AND restaurant_id = $2 LIMIT 1`,
+      `SELECT id, table_number, reservation_duration_minutes, reservation_buffer_minutes
+       FROM orders
+       WHERE id = $1 AND restaurant_id = $2
+       LIMIT 1`,
       [id, restaurantId]
     );
     if (existingOrderResult.rows.length === 0) {
@@ -8359,6 +8444,8 @@ router.post("/:id/reservations", async (req, res) => {
       reservationWomen: reservation_women ?? null,
       requestedTableNumber: existingOrderResult.rows[0]?.table_number,
       excludeOrderId: id,
+      reservationDurationMinutes: existingOrderResult.rows[0]?.reservation_duration_minutes ?? null,
+      reservationBufferMinutes: existingOrderResult.rows[0]?.reservation_buffer_minutes ?? null,
     });
     if (slotContext?.status >= 400) {
       return res.status(slotContext.status).json({ error: slotContext.error });
@@ -8438,7 +8525,10 @@ router.put("/:id/reservations", async (req, res) => {
     const dateStr = String(reservation_date).trim();
     const timeStr = String(reservation_time).trim();
     const existingOrderResult = await pool.query(
-      `SELECT id, table_number FROM orders WHERE id = $1 AND restaurant_id = $2 LIMIT 1`,
+      `SELECT id, table_number, reservation_duration_minutes, reservation_buffer_minutes
+       FROM orders
+       WHERE id = $1 AND restaurant_id = $2
+       LIMIT 1`,
       [id, restaurantId]
     );
     if (existingOrderResult.rows.length === 0) {
@@ -8453,6 +8543,8 @@ router.put("/:id/reservations", async (req, res) => {
       reservationWomen: reservation_women ?? null,
       requestedTableNumber: existingOrderResult.rows[0]?.table_number,
       excludeOrderId: id,
+      reservationDurationMinutes: existingOrderResult.rows[0]?.reservation_duration_minutes ?? null,
+      reservationBufferMinutes: existingOrderResult.rows[0]?.reservation_buffer_minutes ?? null,
     });
     if (slotContext?.status >= 400) {
       return res.status(slotContext.status).json({ error: slotContext.error });
