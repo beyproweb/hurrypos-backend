@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { sendEmail, sendPushNotification } = require('../utils/notifications');
 const { emitReportsRefresh } = require("../utils/realtime");
+const { isTurkishLanguage, resolveRestaurantEmailLanguage } = require("../utils/emailLanguage");
 const bcrypt = require("bcrypt");
 const authMiddleware = require("../middleware/authMiddleware");
 const jwt = require("jsonwebtoken");
@@ -1131,12 +1132,25 @@ const calculateMinutesDifference = (start, end) => {
 };
 
 // Updated function to create the email template
-const createEmailTemplate = (period, schedules) => {
+const createEmailTemplate = (period, schedules, options = {}) => {
+  const language = String(options.language || "en").toLowerCase();
+  const useTurkish = isTurkishLanguage(language);
   // Define an array to enforce day order
   const dayOrder = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const dayLabelMap = useTurkish
+    ? {
+        Mon: "Pzt",
+        Tue: "Sal",
+        Wed: "Car",
+        Thu: "Per",
+        Fri: "Cum",
+        Sat: "Cmt",
+        Sun: "Paz",
+      }
+    : {};
 
   // Map to store scheduled hours for each day
-  const scheduleMap = new Map(dayOrder.map((day) => [day, 'Free']));
+  const scheduleMap = new Map(dayOrder.map((day) => [day, useTurkish ? "Bos" : "Free"]));
   let totalMinutes = 0;
 
   // Populate scheduleMap and calculate total hours
@@ -1155,7 +1169,7 @@ const createEmailTemplate = (period, schedules) => {
 
       // Append time to the existing day in the map
       const existingTime = scheduleMap.get(day);
-      if (existingTime === 'Free') {
+      if (existingTime === (useTurkish ? "Bos" : "Free")) {
         scheduleMap.set(day, formattedTime);
       } else {
         scheduleMap.set(day, `${existingTime}, ${formattedTime}`);
@@ -1174,7 +1188,9 @@ const createEmailTemplate = (period, schedules) => {
       const time = scheduleMap.get(day);
       return `
         <tr>
-          <td style="padding: 12px; border: 1px solid #ddd; font-weight: bold; font-size: 18px;">${day}</td>
+          <td style="padding: 12px; border: 1px solid #ddd; font-weight: bold; font-size: 18px;">${
+            dayLabelMap[day] || day
+          }</td>
           <td style="padding: 12px; border: 1px solid #ddd; font-size: 18px;">${time}</td>
         </tr>
       `;
@@ -1247,29 +1263,43 @@ const createEmailTemplate = (period, schedules) => {
   <body>
     <div class="container">
       <div class="header">
-        <h2>HurryPOS - ${period.charAt(0).toUpperCase() + period.slice(1)} Shift Schedule</h2>
+        <h2>${
+          useTurkish
+            ? `HurryPOS - ${period.charAt(0).toUpperCase() + period.slice(1)} Vardiya Plani`
+            : `HurryPOS - ${period.charAt(0).toUpperCase() + period.slice(1)} Shift Schedule`
+        }</h2>
       </div>
       <div class="content">
-        <p>Hello,</p>
-        <p>Here is your ${period} shift schedule:</p>
+        <p>${useTurkish ? "Merhaba," : "Hello,"}</p>
+        <p>${
+          useTurkish
+            ? `${period} vardiya planiniz asagidadir:`
+            : `Here is your ${period} shift schedule:`
+        }</p>
         <table>
           <thead>
             <tr>
-              <th>Day</th>
-              <th>Time</th>
+              <th>${useTurkish ? "Gun" : "Day"}</th>
+              <th>${useTurkish ? "Saat" : "Time"}</th>
             </tr>
           </thead>
           <tbody>
             ${scheduleRows}
             <tr>
-              <td colspan="2" class="total-hours">Total Hours: ${formattedTotal}</td>
+              <td colspan="2" class="total-hours">${
+                useTurkish ? "Toplam Saat" : "Total Hours"
+              }: ${formattedTotal}</td>
             </tr>
           </tbody>
         </table>
-        <p style="margin-top: 20px;">Please make sure to be on time.</p>
+        <p style="margin-top: 20px;">${
+          useTurkish
+            ? "Lutfen vardiyaniza zamaninda katilim saglayin."
+            : "Please make sure to be on time."
+        }</p>
       </div>
       <div class="footer">
-        <p>Best Regards,<br>HurryPOS Team</p>
+        <p>${useTurkish ? "Iyi calismalar" : "Best Regards"},<br>HurryPOS Team</p>
       </div>
     </div>
   </body>
@@ -1327,16 +1357,25 @@ router.post('/send-schedule', async (req, res) => {
       emailMap.get(email)[days].push(`${shift_start} - ${shift_end}`);
     });
 
+    const emailLanguage = await resolveRestaurantEmailLanguage(restaurantId, {
+      fallback: "en",
+    });
+    const useTurkish = isTurkishLanguage(emailLanguage);
+
     // 📨 Send email to each staff
     for (const [email, daySchedules] of emailMap) {
       const schedules = Object.keys(daySchedules).map(
         (day) => `${day}: ${daySchedules[day].join(', ')}`
       );
 
-      const emailBody = createEmailTemplate(period, schedules);
-      const subject = `Your ${period} shift schedule`;
+      const emailBody = createEmailTemplate(period, schedules, { language: emailLanguage });
+      const subject = useTurkish
+        ? `${period} vardiya planiniz`
+        : `Your ${period} shift schedule`;
 
-      await sendEmail(email, subject, emailBody, true);
+      await sendEmail(email, subject, emailBody, true, {
+        language: emailLanguage,
+      });
       console.log(`📧 Email sent to: ${email}`);
     }
 
@@ -1921,18 +1960,28 @@ router.post('/:staffId/payments', async (req, res) => {
       const { name, email, role } = staffRes.rows[0];
 
       if (email && !auto) {
-        const subject = `📄 Payroll Receipt - ${name}`;
+        const emailLanguage = await resolveRestaurantEmailLanguage(restaurantId, {
+          fallback: "en",
+        });
+        const useTurkish = isTurkishLanguage(emailLanguage);
+        const subject = useTurkish
+          ? `📄 Maas Bordrosu - ${name}`
+          : `📄 Payroll Receipt - ${name}`;
         const html = `
-          <h2>💼 Payroll Receipt</h2>
-          <p><strong>Name:</strong> ${name}</p>
-          <p><strong>Role:</strong> ${role}</p>
-          <p><strong>Amount Paid:</strong> ${amount.toFixed(2)}</p>
-          <p><strong>Method:</strong> ${payment_method}</p>
-          <p><strong>Date:</strong> ${date || new Date().toISOString().slice(0, 10)}</p>
-          ${note ? `<p><strong>Note:</strong> ${note}</p>` : ""}
-          <p style="margin-top:2em;">Thank you for your dedication!<br><strong>Beypro</strong></p>
+          <h2>${useTurkish ? "💼 Maas Bordrosu" : "💼 Payroll Receipt"}</h2>
+          <p><strong>${useTurkish ? "Ad Soyad" : "Name"}:</strong> ${name}</p>
+          <p><strong>${useTurkish ? "Rol" : "Role"}:</strong> ${role}</p>
+          <p><strong>${useTurkish ? "Odenen Tutar" : "Amount Paid"}:</strong> ${amount.toFixed(2)}</p>
+          <p><strong>${useTurkish ? "Yontem" : "Method"}:</strong> ${payment_method}</p>
+          <p><strong>${useTurkish ? "Tarih" : "Date"}:</strong> ${date || new Date().toISOString().slice(0, 10)}</p>
+          ${note ? `<p><strong>${useTurkish ? "Not" : "Note"}:</strong> ${note}</p>` : ""}
+          <p style="margin-top:2em;">${
+            useTurkish ? "Emeginiz icin tesekkur ederiz!" : "Thank you for your dedication!"
+          }<br><strong>Beypro</strong></p>
         `;
-        await sendEmail(email, subject, html, true);
+        await sendEmail(email, subject, html, true, {
+          language: emailLanguage,
+        });
         console.log(`📧 Payroll email sent to ${email}`);
       } else if (auto) {
         console.log(`ℹ️ Auto payment for staff ${staffId} — email skipped intentionally`);

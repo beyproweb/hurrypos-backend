@@ -5,7 +5,8 @@ module.exports = (io) => {
   const { pool } = require("../db");
   const dayjs = require("dayjs");
   const { sendEmail } = require("../utils/notifications");
-const authMiddleware = require("../middleware/authMiddleware");
+  const authMiddleware = require("../middleware/authMiddleware");
+  const { isTurkishLanguage, resolveRestaurantEmailLanguage } = require("../utils/emailLanguage");
   /*===============================
            Auto supplier orders
   ===============================*/
@@ -274,28 +275,44 @@ router.put("/supplier-carts/:id/confirm", async (req, res) => {
       }
 
       const replyTo = await getRestaurantReplyToEmail(restaurantId);
+      const emailLanguage = await resolveRestaurantEmailLanguage(restaurantId, {
+        fallback: "en",
+      });
+      const useTurkish = isTurkishLanguage(emailLanguage);
       const restaurantContactLine = replyTo
-        ? `<p><strong>Restaurant contact:</strong> <a href="mailto:${replyTo}">${replyTo}</a></p>`
+        ? `<p><strong>${useTurkish ? "Restoran iletisim" : "Restaurant contact"}:</strong> <a href="mailto:${replyTo}">${replyTo}</a></p>`
         : "";
+      const formattedDate = new Date(
+        scheduled_at || cart.scheduled_at || Date.now()
+      ).toLocaleString(useTurkish ? "tr-TR" : "en-US", { hour12: false });
 
       const htmlBody = `
-        <h2>📦 New Supplier Order</h2>
+        <h2>${useTurkish ? "📦 Yeni Tedarikci Siparisi" : "📦 New Supplier Order"}</h2>
         ${restaurantContactLine}
-        <p><strong>Supplier:</strong> ${cart.supplier_name}</p>
-        <p><strong>Scheduled for:</strong> ${new Date(scheduled_at || cart.scheduled_at || Date.now()).toLocaleString("tr-TR", { hour12: false })}</p>
-        <h3>📝 Products:</h3>
+        <p><strong>${useTurkish ? "Tedarikci" : "Supplier"}:</strong> ${cart.supplier_name}</p>
+        <p><strong>${useTurkish ? "Planlanan tarih" : "Scheduled for"}:</strong> ${formattedDate}</p>
+        <h3>${useTurkish ? "📝 Urunler" : "📝 Products"}:</h3>
         <ul>
           ${items.map(item => `<li>${item.product_name} — ${item.quantity} ${item.unit}</li>`).join("")}
         </ul>
-        <p style="margin-top:1.5em;">Best regards,<br><strong>Beypro</strong></p>
+        <p style="margin-top:1.5em;">${
+          useTurkish ? "Iyi calismalar" : "Best regards"
+        },<br><strong>Beypro</strong></p>
       `;
 
-      await sendEmail(cart.email, "📦 Beypro Supplier Order", htmlBody, true, {
+      await sendEmail(
+        cart.email,
+        useTurkish ? "📦 Beypro Tedarikci Siparisi" : "📦 Beypro Supplier Order",
+        htmlBody,
+        true,
+        {
         replyTo: replyTo || undefined,
         fromName: "Beypro Orders",
+        language: emailLanguage,
         provider: process.env.RESEND_API_KEY ? "resend" : undefined,
         throwOnError: true,
-      });
+        }
+      );
 
       // Reset auto-add flags for all items (same as scheduled mailer)
       for (const item of items) {

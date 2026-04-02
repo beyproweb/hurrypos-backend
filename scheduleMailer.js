@@ -5,6 +5,7 @@ const { sendEmail } = require("./utils/notifications");
 const sendNoOrderEmail = require("./utils/sendNoOrderEmail");
 const { loadLocalizationForRestaurant } = require("./utils/localization");
 const { getCurrencyMeta } = require("./utils/currency");
+const { isTurkishLanguage, resolveRestaurantEmailLanguage } = require("./utils/emailLanguage");
 const dayjs = require("dayjs");
 
 const RESEND_PROVIDER = process.env.RESEND_API_KEY ? "resend" : undefined;
@@ -12,6 +13,7 @@ const RESEND_PROVIDER = process.env.RESEND_API_KEY ? "resend" : undefined;
 console.log("⏰ Scheduled mailer started. Waiting for carts...");
 
 const restaurantContactCache = new Map();
+const restaurantLanguageCache = new Map();
 async function getRestaurantContact(restaurantId) {
   const key = String(restaurantId);
   if (restaurantContactCache.has(key)) return restaurantContactCache.get(key);
@@ -65,6 +67,16 @@ async function getRestaurantContact(restaurantId) {
 
   restaurantContactCache.set(key, contact);
   return contact;
+}
+
+async function getRestaurantEmailLanguage(restaurantId) {
+  const key = String(restaurantId || "");
+  if (restaurantLanguageCache.has(key)) {
+    return restaurantLanguageCache.get(key);
+  }
+  const language = await resolveRestaurantEmailLanguage(restaurantId, { fallback: "en" });
+  restaurantLanguageCache.set(key, language);
+  return language;
 }
 
 function computeNextScheduledAt(currentScheduledAt, repeatType) {
@@ -129,6 +141,8 @@ const runScheduledMailer = async () => {
     for (const cart of cartRes.rows) {
       const { restaurant_id } = cart;
       const restaurantContact = await getRestaurantContact(restaurant_id);
+      const emailLanguage = await getRestaurantEmailLanguage(restaurant_id);
+      const useTurkish = isTurkishLanguage(emailLanguage);
       const replyTo = restaurantContact?.email || undefined;
 
       const itemsRes = await pool.query(
@@ -147,6 +161,7 @@ const runScheduledMailer = async () => {
           await sendNoOrderEmail(cart.supplier_name, cart.email, cart.scheduled_at, {
             replyTo,
             restaurantName: restaurantContact?.restaurantName || null,
+            language: emailLanguage,
           });
           console.log(`📭 No-order email sent to: ${cart.email}`);
         } else {
@@ -154,14 +169,18 @@ const runScheduledMailer = async () => {
         }
       } else {
         const restaurantContactLine = replyTo
-          ? `<p><strong>Restaurant contact:</strong> <a href="mailto:${replyTo}">${replyTo}</a></p>`
+          ? `<p><strong>${useTurkish ? "Restoran iletisim" : "Restaurant contact"}:</strong> <a href="mailto:${replyTo}">${replyTo}</a></p>`
           : "";
+        const formattedScheduleDate = new Date(cart.scheduled_at).toLocaleString(
+          useTurkish ? "tr-TR" : "en-US",
+          { hour12: false }
+        );
         const htmlBody = `
-          <h2>📦 New Supplier Order</h2>
+          <h2>${useTurkish ? "📦 Yeni Tedarikci Siparisi" : "📦 New Supplier Order"}</h2>
           ${restaurantContactLine}
-          <p><strong>Supplier:</strong> ${cart.supplier_name}</p>
-          <p><strong>Scheduled for:</strong> ${new Date(cart.scheduled_at).toLocaleString("tr-TR", { hour12: false })}</p>
-          <h3>📝 Products:</h3>
+          <p><strong>${useTurkish ? "Tedarikci" : "Supplier"}:</strong> ${cart.supplier_name}</p>
+          <p><strong>${useTurkish ? "Planlanan tarih" : "Scheduled for"}:</strong> ${formattedScheduleDate}</p>
+          <h3>${useTurkish ? "📝 Urunler" : "📝 Products"}:</h3>
           <ul>
             ${items
               .map(
@@ -170,16 +189,25 @@ const runScheduledMailer = async () => {
               )
               .join("")}
           </ul>
-          <p style="margin-top:1.5em;">Best regards,<br><strong>Beypro</strong></p>
+          <p style="margin-top:1.5em;">${
+            useTurkish ? "Iyi calismalar" : "Best regards"
+          },<br><strong>Beypro</strong></p>
         `;
 
         if (cart.email) {
-          await sendEmail(cart.email, `📦 Beypro Scheduled Order`, htmlBody, true, {
+          await sendEmail(
+            cart.email,
+            useTurkish ? "📦 Beypro Planli Siparis" : "📦 Beypro Scheduled Order",
+            htmlBody,
+            true,
+            {
             replyTo,
             fromName: "Beypro Orders",
+            language: emailLanguage,
             provider: RESEND_PROVIDER,
             throwOnError: true,
-          });
+            }
+          );
           console.log(`✅ Email sent to: ${cart.email}`);
         } else {
           console.warn(`⚠️ Cart ${cart.id} has no supplier email.`);
@@ -304,22 +332,29 @@ const runScheduledPayroll = async () => {
       console.log(`✅ Auto-paid staff ${staff_id} ${symbol}${amount.toFixed(2)}`);
 
       if (email) {
-        const subject = `📄 Payroll Receipt - ${name}`;
+        const emailLanguage = await getRestaurantEmailLanguage(restaurant_id);
+        const useTurkish = isTurkishLanguage(emailLanguage);
+        const subject = useTurkish
+          ? `📄 Maas Bordrosu - ${name}`
+          : `📄 Payroll Receipt - ${name}`;
         const html = `
-          <h2>💼 Payroll Receipt</h2>
-          <p><strong>Name:</strong> ${name}</p>
-          <p><strong>Role:</strong> ${role}</p>
-          <p><strong>Amount Paid:</strong> ${symbol}${amount.toFixed(2)}</p>
-          <p><strong>Method:</strong> cash</p>
-          <p><strong>Date:</strong> ${today}</p>
-          <p><strong>Note:</strong> [AUTO Payroll]</p>
-          <p style="margin-top:2em;">Thank you for your dedication!<br><strong>Beypro</strong></p>
+          <h2>${useTurkish ? "💼 Maas Bordrosu" : "💼 Payroll Receipt"}</h2>
+          <p><strong>${useTurkish ? "Ad Soyad" : "Name"}:</strong> ${name}</p>
+          <p><strong>${useTurkish ? "Rol" : "Role"}:</strong> ${role}</p>
+          <p><strong>${useTurkish ? "Odenen Tutar" : "Amount Paid"}:</strong> ${symbol}${amount.toFixed(2)}</p>
+          <p><strong>${useTurkish ? "Yontem" : "Method"}:</strong> cash</p>
+          <p><strong>${useTurkish ? "Tarih" : "Date"}:</strong> ${today}</p>
+          <p><strong>${useTurkish ? "Not" : "Note"}:</strong> [AUTO Payroll]</p>
+          <p style="margin-top:2em;">${
+            useTurkish ? "Emeginiz icin tesekkur ederiz!" : "Thank you for your dedication!"
+          }<br><strong>Beypro</strong></p>
         `;
 
         const restaurantContact = await getRestaurantContact(restaurant_id);
         await sendEmail(email, subject, html, true, {
           replyTo: restaurantContact?.email || undefined,
           fromName: "Beypro Payroll",
+          language: emailLanguage,
         });
         console.log(`📧 Auto-payroll email sent to ${email}`);
       } else {

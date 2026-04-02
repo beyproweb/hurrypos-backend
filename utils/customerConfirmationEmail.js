@@ -1656,6 +1656,7 @@ async function sendCustomerConfirmationEmail({
       text,
       fromName: restaurantBranding.name,
       replyTo: restaurantBranding.contactEmail || undefined,
+      language,
       provider: RESEND_PROVIDER,
       throwOnError: true,
     });
@@ -2343,6 +2344,7 @@ async function sendOwnerReservationNotificationEmail({
       text,
       fromName: restaurantBranding.name,
       replyTo: restaurantBranding.contactEmail || undefined,
+      language,
       provider: RESEND_PROVIDER,
       throwOnError: true,
     });

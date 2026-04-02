@@ -458,6 +458,16 @@ function parseSendEmailArgs(args) {
   };
 }
 
+function normalizeLanguage(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "en";
+  if (raw === "turkish") return "tr";
+  if (raw === "english") return "en";
+  if (raw === "german") return "de";
+  if (raw === "french") return "fr";
+  return raw.split("-")[0] || "en";
+}
+
 /**
  * Backward-compatible API:
  * - sendEmail(to, subject, body, isHtml?, options?)
@@ -466,6 +476,7 @@ function parseSendEmailArgs(args) {
  */
 const sendEmail = async (...args) => {
   const parsed = parseSendEmailArgs(args);
+  const language = normalizeLanguage(parsed.options.language || "en");
   let strategy = "unknown";
   const recipientsTo = normalizeRecipients(parsed.to);
   const recipientsCc = normalizeRecipients(parsed.options.cc);
@@ -524,6 +535,7 @@ const sendEmail = async (...args) => {
 
     console.log("[email] send attempt", {
       provider: strategy,
+      language,
       to: recipientsTo,
       ccCount: recipientsCc.length,
       bccCount: recipientsBcc.length,
@@ -541,6 +553,7 @@ const sendEmail = async (...args) => {
 
     console.log("[email] send success", {
       provider: strategy,
+      language,
       to: recipientsTo,
       subject: parsed.subject,
       result: {
@@ -551,6 +564,7 @@ const sendEmail = async (...args) => {
     return {
       ok: true,
       provider: strategy,
+      language,
       to: recipientsTo,
       subject: parsed.subject,
       result,
@@ -559,6 +573,7 @@ const sendEmail = async (...args) => {
     const details = summarizeAxiosError(error);
     console.error("[email] send failed", {
       provider: strategy,
+      language,
       to: recipientsTo,
       subject: parsed.subject,
       error: details,
@@ -567,6 +582,7 @@ const sendEmail = async (...args) => {
     return {
       ok: false,
       provider: strategy,
+      language,
       to: recipientsTo,
       subject: parsed.subject,
       error: details,
