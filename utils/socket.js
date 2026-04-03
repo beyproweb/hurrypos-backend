@@ -35,6 +35,8 @@ function initSocket(server) {
       "http://localhost:5173",
       "https://pos.beypro.com",
       "https://www.pos.beypro.com",
+      "https://app.beypro.com",
+      "https://www.app.beypro.com",
       "https://hurrypos-frontend.onrender.com",
       "https://hurrypos-backend.onrender.com:443", // ✅ Legacy Render
       "https://hurrypos-backend.onrender.com",

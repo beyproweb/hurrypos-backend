@@ -69,6 +69,8 @@ const alwaysAllowedDevAppOrigins = [
 const productionOrigins = [
   "https://pos.beypro.com",
   "https://www.pos.beypro.com",
+  "https://app.beypro.com",
+  "https://www.app.beypro.com",
   "https://apollo.beypro.com",
   "https://dev.beypro.com",
   "https://hurrypos-frontend.onrender.com",
