@@ -277,6 +277,11 @@ function toAbsolutePublicAssetUrl(src, req) {
   return `${resolvePublicWebBaseUrl(req)}${normalized}`;
 }
 
+// Backward-compatible alias used across public QR handlers.
+function resolveAbsoluteAssetUrl(req, src) {
+  return toAbsolutePublicAssetUrl(src, req);
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
