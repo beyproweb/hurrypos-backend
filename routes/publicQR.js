@@ -51,6 +51,23 @@ const QR_BOOKING_DEFAULTS = {
 
 function parseCustomizationPayload(row) {
   if (!row) return {};
+  if (row.settings_payload && typeof row.settings_payload === "object") {
+    const payload =
+      row.settings_payload.qr_menu_customization ??
+      row.settings_payload.value ??
+      null;
+    if (payload && typeof payload === "object") {
+      return payload;
+    }
+    if (typeof payload === "string") {
+      try {
+        const parsed = JSON.parse(payload);
+        return parsed && typeof parsed === "object" ? parsed : {};
+      } catch {
+        return {};
+      }
+    }
+  }
   if (row.qr_menu_customization && typeof row.qr_menu_customization === "object") {
     return row.qr_menu_customization;
   }
@@ -1201,19 +1218,15 @@ router.get("/marketplace/restaurants", async (req, res) => {
         r.banner_url,
         r.logo_url,
         r.tagline,
-        r.pos_location,
-        r.pos_location_lat,
-        r.pos_location_lng,
-        r.updated_at,
-        s.qr_menu_customization,
-        s.value
+        to_jsonb(s) AS settings_payload,
+        (to_jsonb(r) ->> 'pos_location') AS pos_location
       FROM restaurants r
       LEFT JOIN settings s
         ON s.restaurant_id = r.id
        AND s.key = 'qr-menu-customization'
       WHERE r.slug IS NOT NULL
         AND btrim(r.slug) <> ''
-      ORDER BY r.updated_at DESC NULLS LAST, r.id DESC
+      ORDER BY r.id DESC
       LIMIT $1
       `,
       [limit]
