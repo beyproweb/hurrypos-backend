@@ -37,6 +37,7 @@ const QR_BRANDING_DEFAULTS = {
   app_icon_512: "",
   apple_touch_icon: "",
   splash_logo: "",
+  marketplace_banner: "",
   app_display_name: "",
   pwa_primary_color: "#4F46E5",
   pwa_background_color: "#FFFFFF",
@@ -455,6 +456,12 @@ function firstNonEmptyString(...values) {
 }
 
 function resolveMarketplaceCoverImage(customization, row) {
+  const marketplaceBanner = firstNonEmptyString(
+    customization?.marketplace_banner,
+    customization?.marketplace_cover_image
+  );
+  if (marketplaceBanner) return marketplaceBanner;
+
   const heroSlides = Array.isArray(customization?.hero_slides) ? customization.hero_slides : [];
   for (const slide of heroSlides) {
     if (typeof slide === "string" && slide.trim()) return slide.trim();
@@ -2455,6 +2462,7 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
       app_icon_512: resolveAvailableAssetPath(mergedCustomization.app_icon_512, ""),
       apple_touch_icon: resolveAvailableAssetPath(mergedCustomization.apple_touch_icon, ""),
       splash_logo: resolveAvailableAssetPath(mergedCustomization.splash_logo, ""),
+      marketplace_banner: resolveAvailableAssetPath(mergedCustomization.marketplace_banner, ""),
     };
 
     res.json({

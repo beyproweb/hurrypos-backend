@@ -69,6 +69,7 @@ const BRANDING_UPLOAD_MIME_TYPES = new Set([
   "image/jpeg",
   "image/jpg",
   "image/svg+xml",
+  "image/webp",
 ]);
 
 const QR_BOOKING_DEFAULTS = {
@@ -83,7 +84,7 @@ const brandingUpload = multer({
   fileFilter: (req, file, cb) => {
     const mime = String(file?.mimetype || "").toLowerCase();
     const ext = String(path.extname(file?.originalname || "") || "").toLowerCase();
-    const extensionAllowed = [".png", ".jpg", ".jpeg", ".svg"].includes(ext);
+    const extensionAllowed = [".png", ".jpg", ".jpeg", ".svg", ".webp"].includes(ext);
     if (BRANDING_UPLOAD_MIME_TYPES.has(mime) || extensionAllowed) {
       return cb(null, true);
     }
@@ -743,6 +744,7 @@ const BRANDING_DEFAULTS = {
   app_icon_512: "",
   apple_touch_icon: "",
   splash_logo: "",
+  marketplace_banner: "",
   app_display_name: "",
   pwa_primary_color: "#4F46E5",
   pwa_background_color: "#FFFFFF",
@@ -1097,6 +1099,7 @@ router.post(
   brandingUpload.fields([
     { name: "app_icon", maxCount: 1 },
     { name: "splash_logo", maxCount: 1 },
+    { name: "marketplace_banner", maxCount: 1 },
   ]),
   async (req, res) => {
     try {
@@ -1104,8 +1107,11 @@ router.post(
       const files = req.files || {};
       const appIconFile = Array.isArray(files.app_icon) ? files.app_icon[0] : null;
       const splashLogoFile = Array.isArray(files.splash_logo) ? files.splash_logo[0] : null;
+      const marketplaceBannerFile = Array.isArray(files.marketplace_banner)
+        ? files.marketplace_banner[0]
+        : null;
 
-      if (!appIconFile && !splashLogoFile) {
+      if (!appIconFile && !splashLogoFile && !marketplaceBannerFile) {
         return res.status(400).json({ error: "No branding file uploaded." });
       }
 
@@ -1176,6 +1182,21 @@ router.post(
           .toFile(path.join(__dirname, "..", "public", splashRelPath));
 
         next.splash_logo = `/${splashRelPath.replace(/\\/g, "/")}`;
+      }
+
+      if (marketplaceBannerFile?.buffer) {
+        const marketplaceBannerRelPath = path.join(relativeDir, "marketplace-banner.jpg");
+
+        await sharp(marketplaceBannerFile.buffer, { density: 300 })
+          .resize(1600, 900, {
+            fit: "cover",
+            position: "centre",
+            withoutEnlargement: true,
+          })
+          .jpeg({ quality: 88, mozjpeg: true })
+          .toFile(path.join(__dirname, "..", "public", marketplaceBannerRelPath));
+
+        next.marketplace_banner = `/${marketplaceBannerRelPath.replace(/\\/g, "/")}`;
       }
 
       next.branding_updated_at = new Date().toISOString();
