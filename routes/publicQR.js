@@ -412,6 +412,93 @@ async function resolveRestaurantForPublic(identifier) {
   return rows[0] || null;
 }
 
+function boolish(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return fallback;
+    if (["1", "true", "yes", "on", "enabled"].includes(normalized)) return true;
+    if (["0", "false", "no", "off", "disabled"].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    const text = String(value || "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function resolveMarketplaceCoverImage(customization, row) {
+  const heroSlides = Array.isArray(customization?.hero_slides) ? customization.hero_slides : [];
+  for (const slide of heroSlides) {
+    if (typeof slide === "string" && slide.trim()) return slide.trim();
+    if (!slide || typeof slide !== "object") continue;
+    const candidate = firstNonEmptyString(slide.src, slide.image, slide.url);
+    if (candidate) return candidate;
+  }
+  return firstNonEmptyString(row?.banner_url, row?.logo_url);
+}
+
+function parseTimeToMinutes(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const parts = raw.split(":");
+  if (parts.length < 2) return null;
+  const hours = Number(parts[0]);
+  const minutes = Number(parts[1]);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return hours * 60 + minutes;
+}
+
+function getCurrentMinuteOfDay(timeZone = process.env.REPORTS_TIMEZONE || "Europe/Istanbul") {
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone,
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date());
+    const hour = Number(parts.find((part) => part.type === "hour")?.value || 0);
+    const minute = Number(parts.find((part) => part.type === "minute")?.value || 0);
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+    return hour * 60 + minute;
+  } catch {
+    return null;
+  }
+}
+
+function isOpenNowFromHours(hoursRow, nowMinuteOfDay) {
+  if (!hoursRow) return true;
+  if (!Number.isFinite(nowMinuteOfDay)) return true;
+  const openMinute = parseTimeToMinutes(hoursRow.open_time);
+  const closeMinute = parseTimeToMinutes(hoursRow.close_time);
+  if (!Number.isFinite(openMinute) || !Number.isFinite(closeMinute)) return true;
+  if (openMinute === closeMinute) return true;
+  if (closeMinute > openMinute) {
+    return nowMinuteOfDay >= openMinute && nowMinuteOfDay < closeMinute;
+  }
+  return nowMinuteOfDay >= openMinute || nowMinuteOfDay < closeMinute;
+}
+
+function resolveMarketplaceVenueType(customization = {}) {
+  const directType = firstNonEmptyString(
+    customization.venue_type,
+    customization.venueType,
+    customization.business_type,
+    customization.businessType
+  );
+  if (directType) return directType;
+
+  if (boolish(customization.delivery_enabled, false)) return "Delivery";
+  if (boolish(customization.reservation_pickup_enabled, false)) return "Reservation";
+  return "Food";
+}
+
 async function readQrMenuCustomization(restaurantId) {
   const result = await pool.query(
     `
@@ -1094,6 +1181,170 @@ router.get("/restaurant-info", async (req, res) => {
   } catch (err) {
     console.error("❌ Public restaurant-info failed:", err);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/marketplace/restaurants", async (req, res) => {
+  try {
+    const requestedLimit = Number.parseInt(String(req.query?.limit ?? "200"), 10);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(requestedLimit, 500))
+      : 200;
+
+    const restaurantsResult = await pool.query(
+      `
+      SELECT
+        r.id,
+        r.slug,
+        r.name,
+        r.description,
+        r.banner_url,
+        r.logo_url,
+        r.tagline,
+        r.pos_location,
+        r.pos_location_lat,
+        r.pos_location_lng,
+        r.updated_at,
+        s.qr_menu_customization,
+        s.value
+      FROM restaurants r
+      LEFT JOIN settings s
+        ON s.restaurant_id = r.id
+       AND s.key = 'qr-menu-customization'
+      WHERE r.slug IS NOT NULL
+        AND btrim(r.slug) <> ''
+      ORDER BY r.updated_at DESC NULLS LAST, r.id DESC
+      LIMIT $1
+      `,
+      [limit]
+    );
+
+    const rows = Array.isArray(restaurantsResult.rows) ? restaurantsResult.rows : [];
+    if (!rows.length) {
+      return res.json({ restaurants: [] });
+    }
+
+    const restaurantIds = rows
+      .map((row) => Number(row.id))
+      .filter((id) => Number.isFinite(id) && id > 0);
+
+    const dayKey = new Intl.DateTimeFormat("en-US", {
+      weekday: "long",
+      timeZone: process.env.REPORTS_TIMEZONE || "Europe/Istanbul",
+    })
+      .format(new Date())
+      .toLowerCase();
+
+    const shopHoursMap = new Map();
+    if (restaurantIds.length > 0) {
+      try {
+        const { rows: shopRows } = await pool.query(
+          `
+          SELECT restaurant_id, open_time, close_time
+          FROM shop_hours
+          WHERE day = $1
+            AND restaurant_id = ANY($2::int[])
+          `,
+          [dayKey, restaurantIds]
+        );
+        for (const row of shopRows || []) {
+          const key = Number(row.restaurant_id);
+          if (Number.isFinite(key)) {
+            shopHoursMap.set(key, row);
+          }
+        }
+      } catch {
+        // keep is_open optimistic when shop_hours is not available
+      }
+    }
+
+    const concertsMap = new Map();
+    if (restaurantIds.length > 0) {
+      try {
+        const { rows: concertRows } = await pool.query(
+          `
+          SELECT restaurant_id, COUNT(*)::int AS event_count
+          FROM concert_events
+          WHERE restaurant_id = ANY($1::int[])
+            AND LOWER(COALESCE(status, 'active')) <> 'hidden'
+            AND event_date >= CURRENT_DATE
+          GROUP BY restaurant_id
+          `,
+          [restaurantIds]
+        );
+        for (const row of concertRows || []) {
+          const key = Number(row.restaurant_id);
+          if (Number.isFinite(key)) {
+            concertsMap.set(key, Number(row.event_count) || 0);
+          }
+        }
+      } catch {
+        // concert tables may not exist in all environments
+      }
+    }
+
+    const nowMinuteOfDay = getCurrentMinuteOfDay();
+    const restaurants = rows
+      .map((row) => {
+        const id = Number(row.id);
+        if (!Number.isFinite(id) || !row.slug) return null;
+
+        const customization = parseCustomizationPayload(row);
+        const logoCandidate = firstNonEmptyString(
+          customization.main_title_logo,
+          customization.app_icon,
+          row.logo_url
+        );
+        const coverCandidate = resolveMarketplaceCoverImage(customization, row);
+        const supportsDelivery = boolish(customization.delivery_enabled, true);
+        const supportsReservation = boolish(customization.reservation_pickup_enabled, true);
+        const supportsQrOrder =
+          boolish(customization.table_order_enabled, true) &&
+          !boolish(customization.disable_all_products, false);
+        const supportsPickup = !boolish(customization.disable_all_products, false);
+        const supportsTickets =
+          boolish(customization.tickets_enabled, false) ||
+          boolish(customization.concerts_enabled, false) ||
+          Number(concertsMap.get(id) || 0) > 0;
+
+        return {
+          id: String(id),
+          slug: String(row.slug || "").trim(),
+          name: firstNonEmptyString(row.name, "Restaurant"),
+          logo: resolveAbsoluteAssetUrl(req, resolveAvailableAssetPath(logoCandidate, row.logo_url || "")),
+          cover_image: resolveAbsoluteAssetUrl(
+            req,
+            resolveAvailableAssetPath(coverCandidate, row.banner_url || "")
+          ),
+          venue_type: resolveMarketplaceVenueType(customization),
+          short_description: firstNonEmptyString(
+            customization.subtitle,
+            customization.tagline,
+            row.tagline,
+            row.description
+          ),
+          is_open: isOpenNowFromHours(shopHoursMap.get(id), nowMinuteOfDay),
+          supports_qr_order: supportsQrOrder,
+          supports_reservation: supportsReservation,
+          supports_tickets: supportsTickets,
+          supports_delivery: supportsDelivery,
+          supports_pickup: supportsPickup,
+          is_featured:
+            boolish(customization.is_featured, false) ||
+            boolish(customization.marketplace_featured, false),
+          location: firstNonEmptyString(row.pos_location),
+          distance_km: null,
+        };
+      })
+      .filter(Boolean);
+
+    return res.json({
+      restaurants,
+      total: restaurants.length,
+    });
+  } catch (err) {
+    console.error("❌ Public marketplace restaurants failed:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
