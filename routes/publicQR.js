@@ -489,6 +489,21 @@ function getCurrentMinuteOfDay(timeZone = process.env.REPORTS_TIMEZONE || "Europ
   }
 }
 
+function getCurrentWeekdayKey(timeZone = process.env.REPORTS_TIMEZONE || "Europe/Istanbul") {
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      weekday: "long",
+      timeZone,
+    })
+      .format(new Date())
+      .toLowerCase();
+  } catch {
+    return new Intl.DateTimeFormat("en-US", { weekday: "long" })
+      .format(new Date())
+      .toLowerCase();
+  }
+}
+
 function isOpenNowFromHours(hoursRow, nowMinuteOfDay) {
   if (!hoursRow) return true;
   if (!Number.isFinite(nowMinuteOfDay)) return true;
@@ -1208,31 +1223,54 @@ router.get("/marketplace/restaurants", async (req, res) => {
       ? Math.max(1, Math.min(requestedLimit, 500))
       : 200;
 
-    const restaurantsResult = await pool.query(
-      `
-      SELECT
-        r.id,
-        r.slug,
-        r.name,
-        r.description,
-        r.banner_url,
-        r.logo_url,
-        r.tagline,
-        to_jsonb(s) AS settings_payload,
-        (to_jsonb(r) ->> 'pos_location') AS pos_location
-      FROM restaurants r
-      LEFT JOIN settings s
-        ON s.restaurant_id = r.id
-       AND s.key = 'qr-menu-customization'
-      WHERE r.slug IS NOT NULL
-        AND btrim(r.slug) <> ''
-      ORDER BY r.id DESC
-      LIMIT $1
-      `,
-      [limit]
-    );
+    let rows = [];
+    try {
+      const restaurantsResult = await pool.query(
+        `
+        SELECT
+          r.id,
+          r.slug,
+          r.name,
+          to_jsonb(r) AS restaurant_payload,
+          to_jsonb(s) AS settings_payload
+        FROM restaurants r
+        LEFT JOIN settings s
+          ON s.restaurant_id = r.id
+         AND s.key = 'qr-menu-customization'
+        WHERE r.slug IS NOT NULL
+          AND btrim(r.slug) <> ''
+        ORDER BY r.id DESC
+        LIMIT $1
+        `,
+        [limit]
+      );
+      rows = Array.isArray(restaurantsResult.rows) ? restaurantsResult.rows : [];
+    } catch (primaryQueryError) {
+      console.warn(
+        "⚠️ Marketplace primary query failed, falling back to minimal query:",
+        primaryQueryError?.message || primaryQueryError
+      );
+      const fallbackResult = await pool.query(
+        `
+        SELECT
+          r.id,
+          r.slug,
+          r.name,
+          to_jsonb(r) AS restaurant_payload
+        FROM restaurants r
+        WHERE r.slug IS NOT NULL
+          AND btrim(r.slug) <> ''
+        ORDER BY r.id DESC
+        LIMIT $1
+        `,
+        [limit]
+      );
+      rows = (Array.isArray(fallbackResult.rows) ? fallbackResult.rows : []).map((row) => ({
+        ...row,
+        settings_payload: null,
+      }));
+    }
 
-    const rows = Array.isArray(restaurantsResult.rows) ? restaurantsResult.rows : [];
     if (!rows.length) {
       return res.json({ restaurants: [] });
     }
@@ -1241,12 +1279,7 @@ router.get("/marketplace/restaurants", async (req, res) => {
       .map((row) => Number(row.id))
       .filter((id) => Number.isFinite(id) && id > 0);
 
-    const dayKey = new Intl.DateTimeFormat("en-US", {
-      weekday: "long",
-      timeZone: process.env.REPORTS_TIMEZONE || "Europe/Istanbul",
-    })
-      .format(new Date())
-      .toLowerCase();
+    const dayKey = getCurrentWeekdayKey();
 
     const shopHoursMap = new Map();
     if (restaurantIds.length > 0) {
@@ -1302,11 +1335,16 @@ router.get("/marketplace/restaurants", async (req, res) => {
         const id = Number(row.id);
         if (!Number.isFinite(id) || !row.slug) return null;
 
+        const restaurantPayload =
+          row.restaurant_payload && typeof row.restaurant_payload === "object"
+            ? row.restaurant_payload
+            : {};
         const customization = parseCustomizationPayload(row);
         const logoCandidate = firstNonEmptyString(
           customization.main_title_logo,
           customization.app_icon,
-          row.logo_url
+          restaurantPayload.logo_url,
+          restaurantPayload.logo
         );
         const coverCandidate = resolveMarketplaceCoverImage(customization, row);
         const supportsDelivery = boolish(customization.delivery_enabled, true);
@@ -1324,17 +1362,31 @@ router.get("/marketplace/restaurants", async (req, res) => {
           id: String(id),
           slug: String(row.slug || "").trim(),
           name: firstNonEmptyString(row.name, "Restaurant"),
-          logo: resolveAbsoluteAssetUrl(req, resolveAvailableAssetPath(logoCandidate, row.logo_url || "")),
+          logo: resolveAbsoluteAssetUrl(
+            req,
+            resolveAvailableAssetPath(
+              logoCandidate,
+              firstNonEmptyString(restaurantPayload.logo_url, restaurantPayload.logo)
+            )
+          ),
           cover_image: resolveAbsoluteAssetUrl(
             req,
-            resolveAvailableAssetPath(coverCandidate, row.banner_url || "")
+            resolveAvailableAssetPath(
+              coverCandidate,
+              firstNonEmptyString(
+                restaurantPayload.banner_url,
+                restaurantPayload.cover_image,
+                restaurantPayload.logo_url,
+                restaurantPayload.logo
+              )
+            )
           ),
           venue_type: resolveMarketplaceVenueType(customization),
           short_description: firstNonEmptyString(
             customization.subtitle,
             customization.tagline,
-            row.tagline,
-            row.description
+            restaurantPayload.tagline,
+            restaurantPayload.description
           ),
           is_open: isOpenNowFromHours(shopHoursMap.get(id), nowMinuteOfDay),
           supports_qr_order: supportsQrOrder,
@@ -1345,7 +1397,10 @@ router.get("/marketplace/restaurants", async (req, res) => {
           is_featured:
             boolish(customization.is_featured, false) ||
             boolish(customization.marketplace_featured, false),
-          location: firstNonEmptyString(row.pos_location),
+          location: firstNonEmptyString(
+            restaurantPayload.pos_location,
+            restaurantPayload.location
+          ),
           distance_km: null,
         };
       })
