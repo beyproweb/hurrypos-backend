@@ -1345,9 +1345,15 @@ router.get("/marketplace/restaurants", async (req, res) => {
             ? row.restaurant_payload
             : {};
         const customization = parseCustomizationPayload(row);
-        const logoCandidate = firstNonEmptyString(
-          customization.main_title_logo,
+        const appIconCandidate = firstNonEmptyString(
           customization.app_icon,
+          customization.app_icon_192,
+          customization.app_icon_512,
+          customization.apple_touch_icon
+        );
+        const logoCandidate = firstNonEmptyString(
+          appIconCandidate,
+          customization.main_title_logo,
           restaurantPayload.logo_url,
           restaurantPayload.logo
         );
@@ -1367,6 +1373,10 @@ router.get("/marketplace/restaurants", async (req, res) => {
           id: String(id),
           slug: String(row.slug || "").trim(),
           name: firstNonEmptyString(row.name, "Restaurant"),
+          app_icon: resolveAbsoluteAssetUrl(
+            req,
+            resolveAvailableAssetPath(appIconCandidate, "")
+          ),
           logo: resolveAbsoluteAssetUrl(
             req,
             resolveAvailableAssetPath(
