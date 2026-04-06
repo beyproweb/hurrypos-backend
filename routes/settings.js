@@ -772,6 +772,60 @@ function parseCustomizationPayload(row) {
   return {};
 }
 
+function normalizeLocationText(value) {
+  return String(value || "").trim();
+}
+
+function extractCityFromLocationText(value) {
+  const text = normalizeLocationText(value);
+  if (!text) return "";
+
+  const slashParts = text.split("/").map((item) => item.trim()).filter(Boolean);
+  if (slashParts.length > 1) {
+    return slashParts[slashParts.length - 1];
+  }
+
+  const commaParts = text.split(",").map((item) => item.trim()).filter(Boolean);
+  if (commaParts.length > 1) {
+    return commaParts[commaParts.length - 1];
+  }
+
+  return text;
+}
+
+function normalizeDeliveryZoneCitiesInput(value) {
+  if (Array.isArray(value)) {
+    return Array.from(
+      new Set(
+        value
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+      )
+    );
+  }
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+  return Array.from(
+    new Set(
+      raw
+        .split(/[,\n]/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function normalizeDeliveryRangeKm(value, fallback = 5) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(0.5, Math.min(parsed, 100));
+}
+
+function normalizeDeliveryCoordinate(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function sanitizeSlugForPath(value, fallback = "restaurant") {
   const raw = String(value || "").trim().toLowerCase();
   const normalized = raw.replace(/[^a-z0-9-_]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
@@ -781,24 +835,36 @@ function sanitizeSlugForPath(value, fallback = "restaurant") {
 async function ensureRestaurantSlugForBranding(restaurantId, fallbackName = "restaurant") {
   await ensureRestaurantCustomDomainColumn();
   const { rows } = await pool.query(
-    "SELECT slug, name, custom_domain FROM restaurants WHERE id = $1 LIMIT 1",
+    "SELECT slug, name, custom_domain, pos_location, pos_location_lat, pos_location_lng FROM restaurants WHERE id = $1 LIMIT 1",
     [restaurantId]
   );
 
   if (!rows.length) {
-    return { slug: null, name: "", custom_domain: "" };
+    return {
+      slug: null,
+      name: "",
+      custom_domain: "",
+      location: "",
+      city: "",
+      pos_location_lat: null,
+      pos_location_lng: null,
+    };
   }
 
   let slug = rows[0].slug;
   const name = rows[0].name || fallbackName;
   const custom_domain = normalizeCustomDomain(rows[0].custom_domain) || "";
+  const location = normalizeLocationText(rows[0].pos_location);
+  const city = extractCityFromLocationText(location);
+  const pos_location_lat = normalizeDeliveryCoordinate(rows[0].pos_location_lat);
+  const pos_location_lng = normalizeDeliveryCoordinate(rows[0].pos_location_lng);
   if (isMissingRestaurantSlug(slug)) {
     const nextSlug = await generateUniqueRestaurantSlug(pool, name || `restaurant-${restaurantId}`);
     await pool.query("UPDATE restaurants SET slug = $1 WHERE id = $2", [nextSlug, restaurantId]);
     slug = nextSlug;
   }
 
-  return { slug, name, custom_domain };
+  return { slug, name, custom_domain, location, city, pos_location_lat, pos_location_lng };
 }
 
 async function findRestaurantSlugConflict(db, slug, restaurantId) {
@@ -867,6 +933,10 @@ router.get("/qr-menu-customization", async (req, res) => {
       name: restaurantName,
       slug: restaurantSlug,
       custom_domain: restaurantCustomDomain,
+      location: restaurantLocation,
+      city: restaurantCity,
+      pos_location_lat: restaurantPosLat,
+      pos_location_lng: restaurantPosLng,
     } = await ensureRestaurantSlugForBranding(restaurantId);
 
     const result = await pool.query(
@@ -930,6 +1000,11 @@ router.get("/qr-menu-customization", async (req, res) => {
       loyalty_reward_text: "Free Menu Item",
       loyalty_color: "#F59E0B",
       delivery_enabled: true,
+      delivery_zone_cities: restaurantCity ? [restaurantCity] : [],
+      delivery_range_km: 5,
+      delivery_origin_location: restaurantLocation || "",
+      delivery_origin_lat: restaurantPosLat,
+      delivery_origin_lng: restaurantPosLng,
       table_order_enabled: true,
       reservation_pickup_enabled: true,
       reservation_guest_composition_enabled: false,
@@ -954,6 +1029,10 @@ router.get("/qr-menu-customization", async (req, res) => {
       restaurant: {
         slug: restaurantSlug || "",
         custom_domain: restaurantCustomDomain || "",
+        location: restaurantLocation || "",
+        city: restaurantCity || "",
+        pos_location_lat: restaurantPosLat,
+        pos_location_lng: restaurantPosLng,
       },
     });
   } catch (err) {
@@ -977,7 +1056,7 @@ router.post("/qr-menu-customization", async (req, res) => {
 
     const restaurantResult = await client.query(
       `
-      SELECT id, name, slug, custom_domain
+      SELECT id, name, slug, custom_domain, pos_location, pos_location_lat, pos_location_lng
       FROM restaurants
       WHERE id = $1
       LIMIT 1
@@ -1055,6 +1134,32 @@ router.post("/qr-menu-customization", async (req, res) => {
     delete sanitizedNewData.slug;
     delete sanitizedNewData.generated_slug;
     delete sanitizedNewData.restaurant_slug;
+    if (Object.prototype.hasOwnProperty.call(sanitizedNewData, "delivery_zone_cities")) {
+      sanitizedNewData.delivery_zone_cities = normalizeDeliveryZoneCitiesInput(
+        sanitizedNewData.delivery_zone_cities
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sanitizedNewData, "delivery_range_km")) {
+      sanitizedNewData.delivery_range_km = normalizeDeliveryRangeKm(
+        sanitizedNewData.delivery_range_km,
+        5
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sanitizedNewData, "delivery_origin_location")) {
+      sanitizedNewData.delivery_origin_location = normalizeLocationText(
+        sanitizedNewData.delivery_origin_location
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sanitizedNewData, "delivery_origin_lat")) {
+      sanitizedNewData.delivery_origin_lat = normalizeDeliveryCoordinate(
+        sanitizedNewData.delivery_origin_lat
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(sanitizedNewData, "delivery_origin_lng")) {
+      sanitizedNewData.delivery_origin_lng = normalizeDeliveryCoordinate(
+        sanitizedNewData.delivery_origin_lng
+      );
+    }
 
     const mergedData = {
       ...existingData,
@@ -1079,6 +1184,10 @@ router.post("/qr-menu-customization", async (req, res) => {
       restaurant: {
         slug: nextSlug || "",
         custom_domain: nextCustomDomain || "",
+        location: normalizeLocationText(restaurant.pos_location),
+        city: extractCityFromLocationText(restaurant.pos_location),
+        pos_location_lat: normalizeDeliveryCoordinate(restaurant.pos_location_lat),
+        pos_location_lng: normalizeDeliveryCoordinate(restaurant.pos_location_lng),
       },
     });
   } catch (err) {

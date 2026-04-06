@@ -950,6 +950,103 @@ function toFiniteCoordinate(value) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function normalizeLocationText(value) {
+  return String(value || "").trim();
+}
+
+function extractCityFromLocationText(value) {
+  const text = normalizeLocationText(value);
+  if (!text) return "";
+
+  const slashParts = text.split("/").map((item) => item.trim()).filter(Boolean);
+  if (slashParts.length > 1) {
+    return slashParts[slashParts.length - 1];
+  }
+
+  const commaParts = text.split(",").map((item) => item.trim()).filter(Boolean);
+  if (commaParts.length > 1) {
+    return commaParts[commaParts.length - 1];
+  }
+
+  return text;
+}
+
+function normalizeAreaToken(value) {
+  const text = normalizeLocationText(value).toLocaleLowerCase("tr-TR");
+  if (!text) return "";
+  return text
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/ı/g, "i")
+    .replace(/ğ/g, "g")
+    .replace(/ş/g, "s")
+    .replace(/ç/g, "c")
+    .replace(/ö/g, "o")
+    .replace(/ü/g, "u")
+    .replace(/[^a-z0-9]+/gi, "")
+    .trim();
+}
+
+function buildAreaTokenSet(value) {
+  const text = normalizeLocationText(value);
+  if (!text) return new Set();
+  const tokenSet = new Set();
+  const segments = text.split(/[\/,;|]+/).map((segment) => segment.trim()).filter(Boolean);
+
+  segments.forEach((segment) => {
+    const normalizedSegment = normalizeAreaToken(segment);
+    if (normalizedSegment) {
+      tokenSet.add(normalizedSegment);
+    }
+
+    const normalizedWords = String(segment)
+      .toLocaleLowerCase("tr-TR")
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/ı/g, "i")
+      .replace(/ğ/g, "g")
+      .replace(/ş/g, "s")
+      .replace(/ç/g, "c")
+      .replace(/ö/g, "o")
+      .replace(/ü/g, "u")
+      .split(/[^a-z0-9]+/gi)
+      .map((word) => word.trim())
+      .filter((word) => word.length >= 2 && !/^\d+$/.test(word));
+
+    normalizedWords.forEach((word) => tokenSet.add(word));
+  });
+
+  return tokenSet;
+}
+
+function normalizeDeliveryZoneCities(value) {
+  if (Array.isArray(value)) {
+    return Array.from(
+      new Set(
+        value
+          .map((item) => normalizeLocationText(item))
+          .filter(Boolean)
+      )
+    );
+  }
+  const raw = normalizeLocationText(value);
+  if (!raw) return [];
+  return Array.from(
+    new Set(
+      raw
+        .split(/[,\n]/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function normalizeDeliveryRangeKm(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.max(0.5, Math.min(parsed, 100));
+}
+
 function getCoordinatePair(lat, lng) {
   const normalizedLat = toFiniteCoordinate(lat);
   const normalizedLng = toFiniteCoordinate(lng);
@@ -1375,6 +1472,13 @@ router.get("/marketplace/restaurants", async (req, res) => {
           boolish(customization.tickets_enabled, false) ||
           boolish(customization.concerts_enabled, false) ||
           Number(concertsMap.get(id) || 0) > 0;
+        const locationText = firstNonEmptyString(
+          restaurantPayload.pos_location,
+          restaurantPayload.location
+        );
+        const city = extractCityFromLocationText(locationText);
+        const deliveryZoneCities = normalizeDeliveryZoneCities(customization.delivery_zone_cities);
+        const deliveryRangeKm = normalizeDeliveryRangeKm(customization.delivery_range_km);
 
         return {
           id: String(id),
@@ -1419,9 +1523,21 @@ router.get("/marketplace/restaurants", async (req, res) => {
           is_featured:
             boolish(customization.is_featured, false) ||
             boolish(customization.marketplace_featured, false),
-          location: firstNonEmptyString(
-            restaurantPayload.pos_location,
-            restaurantPayload.location
+          location: locationText,
+          city,
+          pos_location_lat: toFiniteCoordinate(restaurantPayload.pos_location_lat),
+          pos_location_lng: toFiniteCoordinate(restaurantPayload.pos_location_lng),
+          delivery_zone_cities: deliveryZoneCities,
+          delivery_range_km: deliveryRangeKm,
+          delivery_origin_location: firstNonEmptyString(
+            customization.delivery_origin_location,
+            locationText
+          ),
+          delivery_origin_lat: toFiniteCoordinate(
+            customization.delivery_origin_lat ?? restaurantPayload.pos_location_lat
+          ),
+          delivery_origin_lng: toFiniteCoordinate(
+            customization.delivery_origin_lng ?? restaurantPayload.pos_location_lng
           ),
           distance_km: null,
         };
@@ -1450,10 +1566,19 @@ router.get("/restaurants/nearby", async (req, res) => {
     const radiusKm = Number.isFinite(requestedRadius)
       ? Math.max(0.5, Math.min(requestedRadius, 100))
       : 5;
+    const requestedCity = normalizeLocationText(req.query?.city);
+    const requestedCityToken = normalizeAreaToken(requestedCity);
     const requestedLimit = Number.parseInt(String(req.query?.limit ?? "200"), 10);
     const limit = Number.isFinite(requestedLimit)
       ? Math.max(1, Math.min(requestedLimit, 500))
       : 200;
+    console.info("📍 Nearby request", {
+      lat: originLat,
+      lng: originLng,
+      radius_km: radiusKm,
+      requested_city: requestedCity || null,
+      limit,
+    });
 
     const nearbyResult = await pool.query(
       `
@@ -1499,10 +1624,17 @@ router.get("/restaurants/nearby", async (req, res) => {
 
     const rows = Array.isArray(nearbyResult.rows) ? nearbyResult.rows : [];
     if (!rows.length) {
+      console.info("📍 Nearby result empty after SQL radius filter", {
+        lat: originLat,
+        lng: originLng,
+        radius_km: radiusKm,
+        requested_city: requestedCity || null,
+      });
       return res.json({
         restaurants: [],
         total: 0,
         radius_km: radiusKm,
+        requested_city: requestedCity || null,
       });
     }
 
@@ -1561,10 +1693,19 @@ router.get("/restaurants/nearby", async (req, res) => {
     }
 
     const nowMinuteOfDay = getCurrentMinuteOfDay();
+    const droppedByReason = {
+      delivery_disabled: 0,
+      outside_delivery_range: 0,
+      outside_delivery_city: 0,
+      invalid: 0,
+    };
     const restaurants = rows
       .map((row) => {
         const id = Number(row.id);
-        if (!Number.isFinite(id) || !row.slug) return null;
+        if (!Number.isFinite(id) || !row.slug) {
+          droppedByReason.invalid += 1;
+          return null;
+        }
 
         const restaurantPayload =
           row.restaurant_payload && typeof row.restaurant_payload === "object"
@@ -1595,6 +1736,46 @@ router.get("/restaurants/nearby", async (req, res) => {
           boolish(customization.concerts_enabled, false) ||
           Number(concertsMap.get(id) || 0) > 0;
         const distanceKm = Number(row.distance_km);
+        const locationText = firstNonEmptyString(
+          restaurantPayload.pos_location,
+          restaurantPayload.location
+        );
+        const city = extractCityFromLocationText(locationText);
+        const deliveryZoneCities = normalizeDeliveryZoneCities(customization.delivery_zone_cities);
+        const deliveryZoneTokens = new Set(
+          deliveryZoneCities.map((zoneCity) => normalizeAreaToken(zoneCity)).filter(Boolean)
+        );
+        const restaurantAreaTokens = new Set([
+          ...buildAreaTokenSet(locationText),
+          normalizeAreaToken(city),
+        ]);
+        restaurantAreaTokens.delete("");
+        const deliveryRangeKm = normalizeDeliveryRangeKm(customization.delivery_range_km);
+        const effectiveDeliveryRangeKm = Number.isFinite(deliveryRangeKm) ? deliveryRangeKm : radiusKm;
+        const safeDistanceKm = Number.isFinite(distanceKm) ? Number(distanceKm) : Number.POSITIVE_INFINITY;
+        const withinRestaurantDeliveryRange = safeDistanceKm <= effectiveDeliveryRangeKm;
+        const hasConfiguredZone = deliveryZoneTokens.size > 0;
+        const requestedMatchesConfiguredZone = deliveryZoneTokens.has(requestedCityToken);
+        const requestedMatchesRestaurantArea = restaurantAreaTokens.has(requestedCityToken);
+        const configuredZoneMatchesRestaurantArea =
+          !hasConfiguredZone ||
+          Array.from(deliveryZoneTokens).some((token) => restaurantAreaTokens.has(token));
+        const allowedByCity =
+          !requestedCityToken ||
+          !hasConfiguredZone ||
+          requestedMatchesConfiguredZone ||
+          (requestedMatchesRestaurantArea && configuredZoneMatchesRestaurantArea);
+
+        if (!supportsDelivery || !withinRestaurantDeliveryRange || !allowedByCity) {
+          if (!supportsDelivery) {
+            droppedByReason.delivery_disabled += 1;
+          } else if (!withinRestaurantDeliveryRange) {
+            droppedByReason.outside_delivery_range += 1;
+          } else if (!allowedByCity) {
+            droppedByReason.outside_delivery_city += 1;
+          }
+          return null;
+        }
 
         return {
           id: String(id),
@@ -1639,21 +1820,40 @@ router.get("/restaurants/nearby", async (req, res) => {
           is_featured:
             boolish(customization.is_featured, false) ||
             boolish(customization.marketplace_featured, false),
-          location: firstNonEmptyString(
-            restaurantPayload.pos_location,
-            restaurantPayload.location
-          ),
+          location: locationText,
+          city,
           pos_location_lat: toFiniteCoordinate(restaurantPayload.pos_location_lat),
           pos_location_lng: toFiniteCoordinate(restaurantPayload.pos_location_lng),
+          delivery_zone_cities: deliveryZoneCities,
+          delivery_range_km: effectiveDeliveryRangeKm,
+          delivery_origin_location: firstNonEmptyString(
+            customization.delivery_origin_location,
+            locationText
+          ),
+          delivery_origin_lat: toFiniteCoordinate(
+            customization.delivery_origin_lat ?? restaurantPayload.pos_location_lat
+          ),
+          delivery_origin_lng: toFiniteCoordinate(
+            customization.delivery_origin_lng ?? restaurantPayload.pos_location_lng
+          ),
           distance_km: Number.isFinite(distanceKm) ? Number(distanceKm.toFixed(3)) : null,
         };
       })
       .filter(Boolean);
 
+    console.info("📍 Nearby result summary", {
+      candidate_count: rows.length,
+      returned_count: restaurants.length,
+      dropped_by_reason: droppedByReason,
+      requested_city: requestedCity || null,
+      radius_km: radiusKm,
+    });
+
     return res.json({
       restaurants,
       total: restaurants.length,
       radius_km: radiusKm,
+      requested_city: requestedCity || null,
     });
   } catch (err) {
     console.error("❌ Public nearby restaurants failed:", err);
