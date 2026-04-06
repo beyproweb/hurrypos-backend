@@ -1438,6 +1438,229 @@ router.get("/marketplace/restaurants", async (req, res) => {
   }
 });
 
+router.get("/restaurants/nearby", async (req, res) => {
+  try {
+    const originLat = toFiniteCoordinate(req.query?.lat);
+    const originLng = toFiniteCoordinate(req.query?.lng);
+    if (originLat === null || originLng === null) {
+      return res.status(400).json({ error: "Missing or invalid lat/lng query params" });
+    }
+
+    const requestedRadius = Number.parseFloat(String(req.query?.radius ?? "5"));
+    const radiusKm = Number.isFinite(requestedRadius)
+      ? Math.max(0.5, Math.min(requestedRadius, 100))
+      : 5;
+    const requestedLimit = Number.parseInt(String(req.query?.limit ?? "200"), 10);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(requestedLimit, 500))
+      : 200;
+
+    const nearbyResult = await pool.query(
+      `
+      WITH base AS (
+        SELECT
+          r.id,
+          r.slug,
+          r.name,
+          to_jsonb(r) AS restaurant_payload,
+          to_jsonb(s) AS settings_payload,
+          (
+            6371 * acos(
+              LEAST(
+                1.0,
+                GREATEST(
+                  -1.0,
+                  cos(radians($1::double precision)) *
+                  cos(radians(r.pos_location_lat::double precision)) *
+                  cos(radians(r.pos_location_lng::double precision) - radians($2::double precision)) +
+                  sin(radians($1::double precision)) *
+                  sin(radians(r.pos_location_lat::double precision))
+                )
+              )
+            )
+          ) AS distance_km
+        FROM restaurants r
+        LEFT JOIN settings s
+          ON s.restaurant_id = r.id
+         AND s.key = 'qr-menu-customization'
+        WHERE r.slug IS NOT NULL
+          AND btrim(r.slug) <> ''
+          AND r.pos_location_lat IS NOT NULL
+          AND r.pos_location_lng IS NOT NULL
+      )
+      SELECT *
+      FROM base
+      WHERE distance_km <= $3::double precision
+      ORDER BY distance_km ASC, id DESC
+      LIMIT $4
+      `,
+      [originLat, originLng, radiusKm, limit]
+    );
+
+    const rows = Array.isArray(nearbyResult.rows) ? nearbyResult.rows : [];
+    if (!rows.length) {
+      return res.json({
+        restaurants: [],
+        total: 0,
+        radius_km: radiusKm,
+      });
+    }
+
+    const restaurantIds = rows
+      .map((row) => Number(row.id))
+      .filter((id) => Number.isFinite(id) && id > 0);
+
+    const dayKey = getCurrentWeekdayKey();
+
+    const shopHoursMap = new Map();
+    if (restaurantIds.length > 0) {
+      try {
+        const { rows: shopRows } = await pool.query(
+          `
+          SELECT restaurant_id, open_time, close_time
+          FROM shop_hours
+          WHERE day = $1
+            AND restaurant_id = ANY($2::int[])
+          `,
+          [dayKey, restaurantIds]
+        );
+        for (const row of shopRows || []) {
+          const key = Number(row.restaurant_id);
+          if (Number.isFinite(key)) {
+            shopHoursMap.set(key, row);
+          }
+        }
+      } catch {
+        // keep is_open optimistic when shop_hours is not available
+      }
+    }
+
+    const concertsMap = new Map();
+    if (restaurantIds.length > 0) {
+      try {
+        const { rows: concertRows } = await pool.query(
+          `
+          SELECT restaurant_id, COUNT(*)::int AS event_count
+          FROM concert_events
+          WHERE restaurant_id = ANY($1::int[])
+            AND LOWER(COALESCE(status, 'active')) <> 'hidden'
+            AND event_date >= CURRENT_DATE
+          GROUP BY restaurant_id
+          `,
+          [restaurantIds]
+        );
+        for (const row of concertRows || []) {
+          const key = Number(row.restaurant_id);
+          if (Number.isFinite(key)) {
+            concertsMap.set(key, Number(row.event_count) || 0);
+          }
+        }
+      } catch {
+        // concert tables may not exist in all environments
+      }
+    }
+
+    const nowMinuteOfDay = getCurrentMinuteOfDay();
+    const restaurants = rows
+      .map((row) => {
+        const id = Number(row.id);
+        if (!Number.isFinite(id) || !row.slug) return null;
+
+        const restaurantPayload =
+          row.restaurant_payload && typeof row.restaurant_payload === "object"
+            ? row.restaurant_payload
+            : {};
+        const customization = parseCustomizationPayload(row);
+        const appIconCandidate = firstNonEmptyString(
+          customization.app_icon,
+          customization.app_icon_192,
+          customization.app_icon_512,
+          customization.apple_touch_icon
+        );
+        const logoCandidate = firstNonEmptyString(
+          appIconCandidate,
+          customization.main_title_logo,
+          restaurantPayload.logo_url,
+          restaurantPayload.logo
+        );
+        const coverCandidate = resolveMarketplaceCoverImage(customization, row);
+        const supportsDelivery = boolish(customization.delivery_enabled, true);
+        const supportsReservation = boolish(customization.reservation_pickup_enabled, true);
+        const supportsQrOrder =
+          boolish(customization.table_order_enabled, true) &&
+          !boolish(customization.disable_all_products, false);
+        const supportsPickup = !boolish(customization.disable_all_products, false);
+        const supportsTickets =
+          boolish(customization.tickets_enabled, false) ||
+          boolish(customization.concerts_enabled, false) ||
+          Number(concertsMap.get(id) || 0) > 0;
+        const distanceKm = Number(row.distance_km);
+
+        return {
+          id: String(id),
+          slug: String(row.slug || "").trim(),
+          name: firstNonEmptyString(row.name, "Restaurant"),
+          app_icon: resolveAbsoluteAssetUrl(
+            req,
+            resolveAvailableAssetPath(appIconCandidate, "")
+          ),
+          logo: resolveAbsoluteAssetUrl(
+            req,
+            resolveAvailableAssetPath(
+              logoCandidate,
+              firstNonEmptyString(restaurantPayload.logo_url, restaurantPayload.logo)
+            )
+          ),
+          cover_image: resolveAbsoluteAssetUrl(
+            req,
+            resolveAvailableAssetPath(
+              coverCandidate,
+              firstNonEmptyString(
+                restaurantPayload.banner_url,
+                restaurantPayload.cover_image,
+                restaurantPayload.logo_url,
+                restaurantPayload.logo
+              )
+            )
+          ),
+          venue_type: resolveMarketplaceVenueType(customization),
+          short_description: firstNonEmptyString(
+            customization.subtitle,
+            customization.tagline,
+            restaurantPayload.tagline,
+            restaurantPayload.description
+          ),
+          is_open: isOpenNowFromHours(shopHoursMap.get(id), nowMinuteOfDay),
+          supports_qr_order: supportsQrOrder,
+          supports_reservation: supportsReservation,
+          supports_tickets: supportsTickets,
+          supports_delivery: supportsDelivery,
+          supports_pickup: supportsPickup,
+          is_featured:
+            boolish(customization.is_featured, false) ||
+            boolish(customization.marketplace_featured, false),
+          location: firstNonEmptyString(
+            restaurantPayload.pos_location,
+            restaurantPayload.location
+          ),
+          pos_location_lat: toFiniteCoordinate(restaurantPayload.pos_location_lat),
+          pos_location_lng: toFiniteCoordinate(restaurantPayload.pos_location_lng),
+          distance_km: Number.isFinite(distanceKm) ? Number(distanceKm.toFixed(3)) : null,
+        };
+      })
+      .filter(Boolean);
+
+    return res.json({
+      restaurants,
+      total: restaurants.length,
+      radius_km: radiusKm,
+    });
+  } catch (err) {
+    console.error("❌ Public nearby restaurants failed:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
 router.get("/orders/:orderId/tracking", async (req, res) => {
   try {
     const orderId = Number(req.params.orderId);

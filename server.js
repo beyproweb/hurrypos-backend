@@ -249,6 +249,10 @@ const publicQRRoutes = require("./routes/publicQR");
 app.use("/api/public", publicQRRoutes);
 // Backward-compat aliases for stale frontend builds / caches.
 app.use("/public", publicQRRoutes);
+app.get("/api/restaurants/nearby", (req, res) => {
+  const queryText = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+  return res.redirect(307, `/api/public/restaurants/nearby${queryText}`);
+});
 app.use("/api/public", require("./routes/publicCustomers"));
 app.use("/public", require("./routes/publicCustomers"));
 require("./scheduleMailer");
