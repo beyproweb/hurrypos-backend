@@ -4,6 +4,18 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const { pool } = require("../db");
+const {
+  MARKETPLACE_CUSTOMER_SCOPE,
+  ensureMarketplaceCustomerSchema,
+  ensureRestaurantCustomerForMarketplace,
+  getMarketplaceCustomerById,
+  getRestaurantCustomerProfile,
+  loginMarketplaceCustomer,
+  registerMarketplaceCustomer,
+  signMarketplaceCustomerToken,
+  updateMarketplaceCustomerProfile,
+  verifyCustomerAuthToken,
+} = require("../utils/marketplaceCustomerAuth");
 
 const QR_CUSTOMER_TOKEN_TTL = "30d";
 const QR_CUSTOMER_OAUTH_STATE_TTL = "15m";
@@ -873,6 +885,7 @@ async function exchangeAppleCodeForProfile(code) {
 async function requireQrCustomerSession(req, res, next) {
   try {
     await ensureQrCustomerAuthSchema();
+    await ensureMarketplaceCustomerSchema();
 
     const authHeader = req.headers.authorization || "";
     if (!authHeader.startsWith("Bearer ")) {
@@ -880,23 +893,58 @@ async function requireQrCustomerSession(req, res, next) {
     }
 
     const token = authHeader.slice(7).trim();
-    const decoded = verifyQrCustomerToken(token);
-    if (!decoded?.customer_id || decoded?.scope !== "qr_customer") {
+    const decoded = verifyCustomerAuthToken(token);
+    if (!decoded?.customer_id) {
+      return res.status(401).json({ error: "Invalid customer session" });
+    }
+
+    const scope = String(decoded.scope || "").toLowerCase();
+    if (scope === MARKETPLACE_CUSTOMER_SCOPE) {
+      const marketplaceCustomer = await getMarketplaceCustomerById(decoded.customer_id);
+      if (!marketplaceCustomer?.id) {
+        return res.status(401).json({ error: "Customer session is no longer valid" });
+      }
+
+      const localCustomerId = await ensureRestaurantCustomerForMarketplace({
+        restaurantId: req.restaurantId,
+        marketplaceCustomer,
+      });
+      const customer = await getRestaurantCustomerProfile(req.restaurantId, localCustomerId);
+      if (!customer?.id) {
+        return res.status(401).json({ error: "Customer session is no longer valid" });
+      }
+
+      req.marketplaceCustomer = marketplaceCustomer;
+      req.qrCustomer = customer;
+      req.qrCustomerToken = {
+        ...decoded,
+        customer_id: customer.id,
+        marketplace_customer_id: marketplaceCustomer.id,
+      };
+      return next();
+    }
+
+    if (scope !== "qr_customer") {
       return res.status(401).json({ error: "Invalid customer session" });
     }
 
     if (Number(decoded.restaurant_id) !== Number(req.restaurantId)) {
-      return res.status(403).json({ error: "Customer session does not match this restaurant" });
+      return res
+        .status(403)
+        .json({ error: "Customer session does not match this restaurant" });
     }
 
-    const customer = await getQrCustomerProfileById(req.restaurantId, decoded.customer_id);
+    const customer = await getQrCustomerProfileById(
+      req.restaurantId,
+      decoded.customer_id
+    );
     if (!customer?.id) {
       return res.status(401).json({ error: "Customer session is no longer valid" });
     }
 
     req.qrCustomer = customer;
     req.qrCustomerToken = decoded;
-    next();
+    return next();
   } catch (err) {
     console.error("❌ QR customer session validation failed:", err);
     res.status(401).json({ error: "Invalid or expired customer session" });
@@ -1222,118 +1270,84 @@ router.get("/customer-auth/oauth/:provider/callback", async (req, res) => {
 
 router.post("/customer-auth/register", requirePublicRestaurant, async (req, res) => {
   const restaurantId = req.restaurantId;
-  const name = normalizeText(req.body?.name || req.body?.username);
-  const phone = normalizePhone(req.body?.phone);
-  const email = normalizeEmail(req.body?.email) || null;
-  const address = normalizeText(req.body?.address) || null;
-  const password = normalizeText(req.body?.password);
-  const language =
-    normalizeLanguage(req.body?.language) ||
-    normalizeLanguage(req.get?.("accept-language")) ||
-    null;
-
-  if (!name || !phone || !password) {
-    return res.status(400).json({ error: "Name, phone, and password are required" });
-  }
-
-  await ensureQrCustomerAuthSchema();
-
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock($1, hashtext($2))", [restaurantId, phone]);
+    await ensureMarketplaceCustomerSchema();
 
-    const existingAuth = await loadQrCustomerAuth(restaurantId, phone, client);
-    if (existingAuth?.customer_id) {
-      await client.query("ROLLBACK");
-      return res
-        .status(409)
-        .json({ error: "An account already exists for this phone number. Please log in." });
-    }
-
-    const customerId = await upsertCustomerProfile({
-      runner: client,
-      restaurantId,
-      name,
-      phone,
-      email,
-      address,
+    const language =
+      normalizeLanguage(req.body?.language) ||
+      normalizeLanguage(req.get?.("accept-language")) ||
+      null;
+    const marketplaceCustomer = await registerMarketplaceCustomer({
+      address: req.body?.address,
+      email: req.body?.email,
+      language,
+      name: req.body?.name || req.body?.username,
+      password: req.body?.password,
+      phone: req.body?.phone,
     });
 
-    const passwordHash = await bcrypt.hash(password, 10);
-    await client.query(
-      `
-        INSERT INTO qr_customer_auth
-          (restaurant_id, customer_id, phone, password_hash, language)
-        VALUES ($1, $2, $3, $4, $5)
-      `,
-      [restaurantId, customerId, phone, passwordHash, language]
-    );
-
-    await client.query("COMMIT");
-
-    const customer = await getQrCustomerProfileById(restaurantId, customerId);
-    const token = signQrCustomerToken({
-      customerId,
+    const customerId = await ensureRestaurantCustomerForMarketplace({
       restaurantId,
-      phone,
+      marketplaceCustomer,
+    });
+    const customer = await getRestaurantCustomerProfile(restaurantId, customerId);
+    const token = signMarketplaceCustomerToken({
+      customerId: marketplaceCustomer.id,
+      email: marketplaceCustomer.email,
+      phone: marketplaceCustomer.phone,
     });
 
-    return res.status(201).json({ token, customer });
+    return res.status(201).json({
+      token,
+      customer,
+      marketplace_user: marketplaceCustomer,
+    });
   } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (rollbackErr) {
-      console.error("❌ QR customer register rollback failed:", rollbackErr);
+    const statusCode = Number(err?.statusCode || 0);
+    if (statusCode >= 400 && statusCode < 500) {
+      return res.status(statusCode).json({
+        error: String(err?.message || "Failed to register customer account"),
+      });
     }
     console.error("❌ QR customer register failed:", err);
     return res.status(500).json({ error: "Failed to register customer account" });
-  } finally {
-    client.release();
   }
 });
 
 router.post("/customer-auth/login", requirePublicRestaurant, async (req, res) => {
   const restaurantId = req.restaurantId;
-  const login = normalizeText(req.body?.login || req.body?.phone || req.body?.email);
-  const phone = normalizePhone(login);
-  const email = normalizeEmail(login);
-  const password = normalizeText(req.body?.password);
-
-  if ((!phone && !email) || !password) {
-    return res.status(400).json({ error: "Phone number or email and password are required" });
-  }
-
   try {
-    await ensureQrCustomerAuthSchema();
-
-    const authRecord = phone
-      ? await loadQrCustomerAuth(restaurantId, phone)
-      : await loadQrCustomerAuthByEmail(restaurantId, email);
-    if (!authRecord?.customer_id) {
-      return res
-        .status(404)
-        .json({ error: "No account found for this phone number or email. Please register." });
-    }
-
-    const isValid = await bcrypt.compare(password, authRecord.password_hash || "");
-    if (!isValid) {
-      return res.status(401).json({ error: "Incorrect password." });
-    }
-
-    const customer = await getQrCustomerProfileById(restaurantId, authRecord.customer_id);
-    if (!customer?.id) {
-      return res.status(404).json({ error: "Customer account not found" });
-    }
-
-    const token = signQrCustomerToken({
-      customerId: authRecord.customer_id,
-      restaurantId,
-      phone: authRecord.phone,
+    await ensureMarketplaceCustomerSchema();
+    const marketplaceCustomer = await loginMarketplaceCustomer({
+      email: req.body?.email,
+      login: req.body?.login || req.body?.phone || req.body?.email,
+      password: req.body?.password,
+      phone: req.body?.phone,
     });
 
-    return res.json({ token, customer });
+    const customerId = await ensureRestaurantCustomerForMarketplace({
+      restaurantId,
+      marketplaceCustomer,
+    });
+    const customer = await getRestaurantCustomerProfile(restaurantId, customerId);
+    const token = signMarketplaceCustomerToken({
+      customerId: marketplaceCustomer.id,
+      email: marketplaceCustomer.email,
+      phone: marketplaceCustomer.phone,
+    });
+
+    return res.json({
+      token,
+      customer,
+      marketplace_user: marketplaceCustomer,
+    });
   } catch (err) {
+    const statusCode = Number(err?.statusCode || 0);
+    if (statusCode >= 400 && statusCode < 500) {
+      return res.status(statusCode).json({
+        error: String(err?.message || "Failed to log in"),
+      });
+    }
     console.error("❌ QR customer login failed:", err);
     return res.status(500).json({ error: "Failed to log in" });
   }
@@ -1344,7 +1358,10 @@ router.get(
   requirePublicRestaurant,
   requireQrCustomerSession,
   async (req, res) => {
-    return res.json({ customer: req.qrCustomer });
+    return res.json({
+      customer: req.qrCustomer,
+      marketplace_user: req.marketplaceCustomer || null,
+    });
   }
 );
 
@@ -1376,6 +1393,63 @@ router.patch(
 
     if (!nextName || !nextPhone) {
       return res.status(400).json({ error: "Name and phone are required" });
+    }
+
+    if (req.marketplaceCustomer?.id) {
+      await ensureMarketplaceCustomerSchema();
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const updatedMarketplaceCustomer = await updateMarketplaceCustomerProfile(
+          req.marketplaceCustomer.id,
+          {
+            address: nextAddress,
+            email: nextEmail,
+            language: nextLanguage,
+            name: nextName,
+            phone: nextPhone,
+          },
+          client
+        );
+
+        const localCustomerId = await ensureRestaurantCustomerForMarketplace(
+          {
+            restaurantId,
+            marketplaceCustomer: updatedMarketplaceCustomer,
+          },
+          client
+        );
+
+        await client.query("COMMIT");
+        const customer = await getRestaurantCustomerProfile(
+          restaurantId,
+          localCustomerId
+        );
+
+        return res.json({
+          customer,
+          marketplace_user: updatedMarketplaceCustomer,
+        });
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackErr) {
+          console.error(
+            "❌ Marketplace customer profile rollback failed:",
+            rollbackErr
+          );
+        }
+        const statusCode = Number(err?.statusCode || 0);
+        if (statusCode >= 400 && statusCode < 500) {
+          return res.status(statusCode).json({
+            error: String(err?.message || "Failed to update customer profile"),
+          });
+        }
+        console.error("❌ Marketplace customer profile update failed:", err);
+        return res.status(500).json({ error: "Failed to update customer profile" });
+      } finally {
+        client.release();
+      }
     }
 
     await ensureQrCustomerAuthSchema();

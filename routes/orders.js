@@ -68,6 +68,13 @@ module.exports = function(io) {
     sendDeliveryOwnerOrderNotificationEmail,
   } = require("../utils/customerConfirmationEmail");
   const { attachAllowedModules } = require("../middleware/moduleGuard");
+  const {
+    MARKETPLACE_CUSTOMER_SCOPE,
+    ensureMarketplaceCustomerSchema,
+    ensureRestaurantCustomerForMarketplace,
+    getMarketplaceCustomerById,
+    verifyCustomerAuthToken,
+  } = require("../utils/marketplaceCustomerAuth");
   const DEFAULT_TZ = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
 
   const getAuthHeaderForCallbackUrl = async (url) => {
@@ -371,6 +378,15 @@ module.exports = function(io) {
     const normalized = String(value || "").trim().toLowerCase();
     if (!normalized) return "";
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized) ? normalized : "";
+  };
+
+  const normalizeCustomerPhone = (value) => {
+    let digits = String(value || "").replace(/\D/g, "");
+    if (!digits) return "";
+    if (digits.startsWith("00") && digits.length > 2) digits = digits.slice(2);
+    if (digits.startsWith("90") && digits.length > 10) digits = digits.slice(2);
+    if (digits.startsWith("0") && digits.length > 10) digits = digits.slice(1);
+    return digits;
   };
 
   const isQrMenuRequest = (req) => {
@@ -1005,6 +1021,80 @@ module.exports = function(io) {
         } catch (err) {
           console.error("❌ QR guest order auth failed:", err.message);
           return res.status(500).json({ error: "Internal server error" });
+        }
+      })();
+    }
+
+    // 3b) Public QR POST with marketplace customer token
+    if (
+      req.method !== "GET" &&
+      identifier &&
+      (req.headers.authorization || "").startsWith("Bearer ")
+    ) {
+      return (async () => {
+        try {
+          const token = String(req.headers.authorization || "").slice(7).trim();
+          const decoded = verifyCustomerAuthToken(token);
+          const scope = String(decoded?.scope || "").toLowerCase();
+          if (scope !== MARKETPLACE_CUSTOMER_SCOPE || !decoded?.customer_id) {
+            return authMiddleware(req, res, async () => {
+              const allowed = await attachAllowedModules(req);
+              if (Array.isArray(allowed) && !allowed.includes("pos_core")) {
+                if (allowed.includes("qr_kitchen")) {
+                  return next();
+                }
+                const isAllowed =
+                  req.method === "GET" && /^\/reservations\/[^/]+$/.test(req.path || "");
+                if (!isAllowed) {
+                  return res.status(403).json({ error: "MODULE_NOT_ALLOWED" });
+                }
+              }
+              return next();
+            });
+          }
+
+          const restaurant_id = await lookupRestaurantIdByIdentifier(identifier);
+          if (!restaurant_id) {
+            return res.status(404).json({ error: "Invalid restaurant" });
+          }
+
+          await ensureMarketplaceCustomerSchema();
+          const marketplaceCustomer = await getMarketplaceCustomerById(
+            decoded.customer_id
+          );
+          if (!marketplaceCustomer?.id) {
+            return res
+              .status(401)
+              .json({ error: "Invalid or expired customer session" });
+          }
+
+          req.marketplaceCustomer = marketplaceCustomer;
+          req.user = {
+            id: marketplaceCustomer.id,
+            name: marketplaceCustomer.full_name || marketplaceCustomer.name || "Customer",
+            role: "qr-customer",
+            restaurant_id,
+            auth_source: MARKETPLACE_CUSTOMER_SCOPE,
+            scope: MARKETPLACE_CUSTOMER_SCOPE,
+            allowed_modules: ["qr_kitchen"],
+          };
+          req.allowed_modules = ["qr_kitchen"];
+          return next();
+        } catch (err) {
+          return authMiddleware(req, res, async () => {
+            const allowed = await attachAllowedModules(req);
+            if (Array.isArray(allowed) && !allowed.includes("pos_core")) {
+              if (allowed.includes("qr_kitchen")) {
+                return next();
+              }
+              const isAllowed =
+                req.method === "GET" && /^\/reservations\/[^/]+$/.test(req.path || "");
+              if (!isAllowed) {
+                return res.status(403).json({ error: "MODULE_NOT_ALLOWED" });
+              }
+            }
+            return next();
+          });
         }
       })();
     }
@@ -2123,6 +2213,38 @@ async function ensureTakeawayFields() {
   }
 }
 
+let ordersHasCustomerIdentityColumns = null;
+async function ensureOrderCustomerIdentityColumns() {
+  if (ordersHasCustomerIdentityColumns === true) return true;
+  try {
+    await ensureMarketplaceCustomerSchema();
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS marketplace_customer_id INTEGER REFERENCES marketplace_customers(id) ON DELETE SET NULL`
+    );
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS customer_email TEXT`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS orders_customer_id_idx ON orders (customer_id)`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS orders_marketplace_customer_id_idx ON orders (marketplace_customer_id)`
+    );
+    ordersHasCustomerIdentityColumns = true;
+    return true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure customer identity columns on orders:", err.message);
+    ordersHasCustomerIdentityColumns = false;
+    return false;
+  }
+}
+
 let ordersHasReservationGuestCompositionFields = null;
 async function ensureReservationGuestCompositionFields() {
   if (ordersHasReservationGuestCompositionFields === true) return true;
@@ -2839,7 +2961,26 @@ router.post("/", async (req, res) => {
       payment_method,
       reservation_clients,
     } = req.body;
+    const marketplaceCustomer = req.marketplaceCustomer || null;
     const normalizedCustomerEmail = normalizeCustomerEmail(customer_email);
+    const normalizedMarketplaceEmail = normalizeCustomerEmail(
+      marketplaceCustomer?.email
+    );
+    const effectiveCustomerEmail =
+      normalizedMarketplaceEmail || normalizedCustomerEmail || null;
+    const effectiveCustomerName = String(
+      marketplaceCustomer?.full_name ||
+        marketplaceCustomer?.name ||
+        customer_name ||
+        ""
+    ).trim() || null;
+    const effectiveCustomerPhone =
+      normalizeCustomerPhone(marketplaceCustomer?.phone) ||
+      normalizeCustomerPhone(customer_phone) ||
+      null;
+    const effectiveCustomerAddress = String(
+      marketplaceCustomer?.address || customer_address || ""
+    ).trim() || null;
     const hasReservationClientsInPayload =
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservation_clients") ||
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservationClients");
@@ -2933,6 +3074,7 @@ router.post("/", async (req, res) => {
     console.log("ORDER TYPE from payload:", order_type);
     const includeTakeawayFields = ordersHasTakeawayFields === true;
     const hasCreatedByColumn = await hasOrdersCreatedByColumn();
+    const hasCustomerIdentityColumns = await ensureOrderCustomerIdentityColumns();
     await client.query("BEGIN");
 
     const hasItems = Array.isArray(items) && items.length > 0;
@@ -2951,20 +3093,38 @@ router.post("/", async (req, res) => {
       }
     }
 
+    let linkedCustomerId = null;
+    if (marketplaceCustomer?.id) {
+      linkedCustomerId = await ensureRestaurantCustomerForMarketplace(
+        {
+          restaurantId,
+          marketplaceCustomer,
+        },
+        client
+      );
+    }
+
     // 📍 Geocode customer delivery address if provided
     let deliveryLat = null;
     let deliveryLng = null;
-    if (customer_address && (order_type === 'packet' || order_type === 'phone')) {
+    if (
+      effectiveCustomerAddress &&
+      (order_type === "packet" || order_type === "phone")
+    ) {
       try {
-        console.log(`🌍 Attempting to geocode delivery address: "${customer_address}"`);
+        console.log(
+          `🌍 Attempting to geocode delivery address: "${effectiveCustomerAddress}"`
+        );
         
         const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
         if (GOOGLE_API_KEY) {
           const geocodeUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(
-            customer_address + ', Turkey'
+            `${effectiveCustomerAddress}, Turkey`
           )}&key=${GOOGLE_API_KEY}`;
           
-          console.log(`📡 Google Maps geocoding request for: ${customer_address}`);
+          console.log(
+            `📡 Google Maps geocoding request for: ${effectiveCustomerAddress}`
+          );
           const geocodeResponse = await fetch(geocodeUrl);
           const geocodeData = await geocodeResponse.json();
           
@@ -2973,27 +3133,33 @@ router.post("/", async (req, res) => {
           if (geocodeData.status === 'OK' && geocodeData.results[0]) {
             deliveryLat = geocodeData.results[0].geometry.location.lat;
             deliveryLng = geocodeData.results[0].geometry.location.lng;
-            console.log(`✅ Geocoded via Google Maps: ${customer_address} → (${deliveryLat}, ${deliveryLng})`);
+            console.log(
+              `✅ Geocoded via Google Maps: ${effectiveCustomerAddress} → (${deliveryLat}, ${deliveryLng})`
+            );
           } else {
             console.warn(`⚠️ Google Maps geocoding failed (${geocodeData.status}). Trying Nominatim fallback...`);
             // Try Nominatim with full address
-            const result = await geocodeWithNominatim(customer_address);
+            const result = await geocodeWithNominatim(effectiveCustomerAddress);
             if (result) {
               deliveryLat = result.lat;
               deliveryLng = result.lng;
-              console.log(`✅ Geocoded via Nominatim: ${customer_address} → (${deliveryLat}, ${deliveryLng})`);
+              console.log(
+                `✅ Geocoded via Nominatim: ${effectiveCustomerAddress} → (${deliveryLat}, ${deliveryLng})`
+              );
             }
           }
         } else {
           console.warn('⚠️ GOOGLE_MAPS_API_KEY not set. Trying Nominatim...');
           // Use Nominatim as default
-          const result = await geocodeWithNominatim(customer_address);
+          const result = await geocodeWithNominatim(effectiveCustomerAddress);
           if (result) {
             deliveryLat = result.lat;
             deliveryLng = result.lng;
-            console.log(`✅ Geocoded via Nominatim: ${customer_address} → (${deliveryLat}, ${deliveryLng})`);
+            console.log(
+              `✅ Geocoded via Nominatim: ${effectiveCustomerAddress} → (${deliveryLat}, ${deliveryLng})`
+            );
           } else {
-            console.warn(`⚠️ Nominatim failed for: ${customer_address}`);
+            console.warn(`⚠️ Nominatim failed for: ${effectiveCustomerAddress}`);
           }
         }
       } catch (err) {
@@ -3185,9 +3351,9 @@ router.post("/", async (req, res) => {
       total,
       order_type || null,
       orderOrigin,
-      customer_name || null,
-      customer_phone || null,
-      customer_address || null,
+      effectiveCustomerName,
+      effectiveCustomerPhone,
+      effectiveCustomerAddress,
       payment_method || null,
       pickupLat,
       pickupLng,
@@ -3195,6 +3361,15 @@ router.post("/", async (req, res) => {
       deliveryLng,
       reservationClientsValue,
     ];
+
+    if (hasCustomerIdentityColumns) {
+      insertColumns.push("customer_email", "customer_id", "marketplace_customer_id");
+      insertValues.push(
+        effectiveCustomerEmail,
+        linkedCustomerId || null,
+        marketplaceCustomer?.id || null
+      );
+    }
 
     if (includeTakeawayFields) {
       insertColumns.push("pickup_time", "takeaway_notes");
@@ -3248,9 +3423,10 @@ if (
 }
 
 // ✅ Persist customer contact details from QR checkout (name/phone/email/address).
-if (customer_phone) {
-  const safeCustomerPhone = String(customer_phone || "").trim();
-  const safeCustomerName = String(customer_name || "").trim() || "Customer";
+let persistedCustomerId = linkedCustomerId || null;
+if (!persistedCustomerId && effectiveCustomerPhone) {
+  const safeCustomerPhone = String(effectiveCustomerPhone || "").trim();
+  const safeCustomerName = String(effectiveCustomerName || "").trim() || "Customer";
   const upsertCustomer = await client.query(
     `
     INSERT INTO customers (restaurant_id, name, phone, email)
@@ -3261,21 +3437,39 @@ if (customer_phone) {
       email = COALESCE(NULLIF(EXCLUDED.email, ''), customers.email)
     RETURNING id
     `,
-    [restaurantId, safeCustomerName, safeCustomerPhone, normalizedCustomerEmail || null]
+    [restaurantId, safeCustomerName, safeCustomerPhone, effectiveCustomerEmail || null]
   );
+  persistedCustomerId = Number(upsertCustomer.rows?.[0]?.id || 0) || null;
+}
 
-  const customerId = upsertCustomer.rows?.[0]?.id;
-  if (customerId && customer_address) {
-    await client.query(
-      `
-      INSERT INTO customer_addresses (customer_id, address, is_default, restaurant_id)
-      VALUES ($1, $2, true, $3)
-      ON CONFLICT (customer_id, address)
-      DO UPDATE SET is_default = EXCLUDED.is_default
-      `,
-      [customerId, customer_address, restaurantId]
-    );
-  }
+if (persistedCustomerId && effectiveCustomerAddress) {
+  await client.query(
+    `
+    INSERT INTO customer_addresses (customer_id, address, is_default, restaurant_id)
+    VALUES ($1, $2, true, $3)
+    ON CONFLICT (customer_id, address)
+    DO UPDATE SET is_default = EXCLUDED.is_default
+    `,
+    [persistedCustomerId, effectiveCustomerAddress, restaurantId]
+  );
+}
+
+if (hasCustomerIdentityColumns && (persistedCustomerId || marketplaceCustomer?.id)) {
+  await client.query(
+    `
+    UPDATE orders
+    SET customer_id = COALESCE($1, customer_id),
+        marketplace_customer_id = COALESCE($2, marketplace_customer_id),
+        customer_email = COALESCE($3, customer_email)
+    WHERE id = $4
+    `,
+    [
+      persistedCustomerId || null,
+      marketplaceCustomer?.id || null,
+      effectiveCustomerEmail || null,
+      order.id,
+    ]
+  );
 }
 
     // DEBUG
@@ -3317,7 +3511,7 @@ if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
           restaurantId,
           orderId: Number(order.id),
           confirmationType,
-          explicitCustomerEmail: normalizedCustomerEmail,
+          explicitCustomerEmail: effectiveCustomerEmail,
           triggeredFrom: "orders.create.qr_confirmed",
           req,
         });
@@ -3329,7 +3523,7 @@ if (typeof emitOrderUpdate === "function") emitOrderUpdate(io, restaurantId);
         pool,
         restaurantId,
         orderId: Number(order.id),
-        explicitCustomerEmail: normalizedCustomerEmail,
+        explicitCustomerEmail: effectiveCustomerEmail,
         triggeredFrom: "orders.create.qr_delivery_owner",
         req,
       });

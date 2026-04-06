@@ -4,12 +4,80 @@ const router = express.Router();
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
+const {
+  MARKETPLACE_CUSTOMER_SCOPE,
+  ensureMarketplaceCustomerSchema,
+  getMarketplaceCustomerById,
+  loginMarketplaceCustomer,
+  registerMarketplaceCustomer,
+  signMarketplaceCustomerToken,
+  verifyCustomerAuthToken,
+} = require("../utils/marketplaceCustomerAuth");
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
 
+function shouldUseMarketplaceCustomerScope(payload = {}) {
+  const normalizedScope = String(
+    payload.scope || payload.auth_scope || payload.audience || payload.authSource || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  return (
+    normalizedScope === MARKETPLACE_CUSTOMER_SCOPE ||
+    payload.marketplace === true ||
+    payload.customer_auth === true
+  );
+}
+
+function mapMarketplaceAuthError(error, fallbackMessage) {
+  const statusCode = Number(error?.statusCode || 0);
+  if (statusCode >= 400 && statusCode < 500) {
+    return {
+      statusCode,
+      error: String(error?.message || fallbackMessage),
+    };
+  }
+  return {
+    statusCode: 500,
+    error: fallbackMessage,
+  };
+}
+
 router.post("/login", async (req, res) => {
+  if (shouldUseMarketplaceCustomerScope(req.body || {})) {
+    try {
+      await ensureMarketplaceCustomerSchema();
+      const customer = await loginMarketplaceCustomer({
+        email: req.body?.email,
+        login: req.body?.login || req.body?.phone || req.body?.email,
+        password: req.body?.password,
+        phone: req.body?.phone,
+      });
+      const token = signMarketplaceCustomerToken({
+        customerId: customer.id,
+        email: customer.email,
+        phone: customer.phone,
+      });
+
+      return res.json({
+        success: true,
+        scope: MARKETPLACE_CUSTOMER_SCOPE,
+        token,
+        customer,
+      });
+    } catch (error) {
+      const mapped = mapMarketplaceAuthError(error, "Failed to log in");
+      return res.status(mapped.statusCode).json({
+        success: false,
+        scope: MARKETPLACE_CUSTOMER_SCOPE,
+        error: mapped.error,
+      });
+    }
+  }
+
   const { email, password } = req.body;
   const normalizedEmail = normalizeEmail(email);
 
@@ -339,6 +407,91 @@ router.post("/login", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Internal server error during login",
+    });
+  }
+});
+
+router.post("/register", async (req, res) => {
+  try {
+    await ensureMarketplaceCustomerSchema();
+
+    const customer = await registerMarketplaceCustomer({
+      address: req.body?.address,
+      email: req.body?.email,
+      language: req.body?.language,
+      name: req.body?.name || req.body?.full_name || req.body?.username,
+      password: req.body?.password,
+      phone: req.body?.phone,
+    });
+
+    const token = signMarketplaceCustomerToken({
+      customerId: customer.id,
+      email: customer.email,
+      phone: customer.phone,
+    });
+
+    return res.status(201).json({
+      success: true,
+      scope: MARKETPLACE_CUSTOMER_SCOPE,
+      token,
+      customer,
+    });
+  } catch (error) {
+    const mapped = mapMarketplaceAuthError(error, "Failed to register customer account");
+    return res.status(mapped.statusCode).json({
+      success: false,
+      scope: MARKETPLACE_CUSTOMER_SCOPE,
+      error: mapped.error,
+    });
+  }
+});
+
+router.get("/me", async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || "");
+    if (!authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        scope: MARKETPLACE_CUSTOMER_SCOPE,
+        error: "Customer session required",
+      });
+    }
+
+    await ensureMarketplaceCustomerSchema();
+
+    const token = authHeader.slice(7).trim();
+    const decoded = verifyCustomerAuthToken(token);
+    if (
+      !decoded?.customer_id ||
+      String(decoded.scope || "").toLowerCase() !== MARKETPLACE_CUSTOMER_SCOPE
+    ) {
+      return res.status(401).json({
+        success: false,
+        scope: MARKETPLACE_CUSTOMER_SCOPE,
+        error: "Invalid customer session",
+      });
+    }
+
+    const customer = await getMarketplaceCustomerById(decoded.customer_id);
+    if (!customer?.id) {
+      return res.status(404).json({
+        success: false,
+        scope: MARKETPLACE_CUSTOMER_SCOPE,
+        error: "Customer account not found",
+      });
+    }
+
+    return res.json({
+      success: true,
+      scope: MARKETPLACE_CUSTOMER_SCOPE,
+      customer,
+    });
+  } catch (error) {
+    const mapped = mapMarketplaceAuthError(error, "Failed to resolve customer session");
+    return res.status(mapped.statusCode).json({
+      success: false,
+      scope: MARKETPLACE_CUSTOMER_SCOPE,
+      error: mapped.error,
     });
   }
 });
