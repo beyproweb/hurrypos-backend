@@ -2188,6 +2188,41 @@ async function hasOrdersCreatedByColumn() {
   return ordersHasCreatedByColumn;
 }
 
+let ordersHasOrderOriginColumn = null;
+async function ensureOrdersOrderOriginColumn() {
+  if (ordersHasOrderOriginColumn === true) return true;
+
+  try {
+    await pool.query(
+      `ALTER TABLE orders
+         ADD COLUMN IF NOT EXISTS order_origin TEXT`
+    );
+    ordersHasOrderOriginColumn = true;
+    return true;
+  } catch (err) {
+    console.warn("⚠️ Unable to ensure orders.order_origin column:", err.message);
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `
+      SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'orders'
+          AND column_name = 'order_origin'
+      ) AS exists
+      `
+    );
+    ordersHasOrderOriginColumn = !!rows?.[0]?.exists;
+  } catch (err) {
+    console.warn("⚠️ Unable to detect orders.order_origin column:", err.message);
+    ordersHasOrderOriginColumn = false;
+  }
+
+  return ordersHasOrderOriginColumn;
+}
+
 let ordersHasTakeawayFields = null;
 async function ensureTakeawayFields() {
   if (ordersHasTakeawayFields === true) return true;
@@ -3070,6 +3105,7 @@ router.post("/", async (req, res) => {
     console.log("ORDER TYPE from payload:", order_type);
     const includeTakeawayFields = ordersHasTakeawayFields === true;
     const hasCreatedByColumn = await hasOrdersCreatedByColumn();
+    const hasOrderOriginColumn = await ensureOrdersOrderOriginColumn();
     const hasCustomerIdentityColumns = await ensureOrderCustomerIdentityColumns();
     await client.query("BEGIN");
 
@@ -3329,7 +3365,6 @@ router.post("/", async (req, res) => {
       "status",
       "total",
       "order_type",
-      "order_origin",
       "customer_name",
       "customer_phone",
       "customer_address",
@@ -3346,7 +3381,6 @@ router.post("/", async (req, res) => {
       initialStatus,
       total,
       order_type || null,
-      orderOrigin,
       effectiveCustomerName,
       effectiveCustomerPhone,
       effectiveCustomerAddress,
@@ -3357,6 +3391,11 @@ router.post("/", async (req, res) => {
       deliveryLng,
       reservationClientsValue,
     ];
+
+    if (hasOrderOriginColumn) {
+      insertColumns.splice(5, 0, "order_origin");
+      insertValues.splice(5, 0, orderOrigin);
+    }
 
     if (hasCustomerIdentityColumns) {
       insertColumns.push("customer_email", "customer_id", "marketplace_customer_id");
@@ -5117,9 +5156,13 @@ router.patch("/:id/cancel", async (req, res) => {
 
   if (requestedItems.length > 0) {
     const cancellationColumns = await getOrderItemsCancellationColumns();
+    const hasOrderOriginColumn = await ensureOrdersOrderOriginColumn();
     const cancelPredicate = cancellationColumns.hasCancelledAt
       ? "cancelled_at IS NULL"
       : "COALESCE(kitchen_status, '') <> 'cancelled'";
+    const orderOriginSelect = hasOrderOriginColumn
+      ? "order_origin"
+      : "NULL::TEXT AS order_origin";
 
     let client;
     try {
@@ -5127,7 +5170,7 @@ router.patch("/:id/cancel", async (req, res) => {
       await client.query("BEGIN");
 
       const { rows: orderRows } = await client.query(
-        `SELECT id, total, status, order_type, order_origin
+        `SELECT id, total, status, order_type, ${orderOriginSelect}
          FROM orders
          WHERE restaurant_id = $1 AND id = $2
          FOR UPDATE`,
@@ -5399,13 +5442,17 @@ router.patch("/:id/cancel", async (req, res) => {
   }
 
   try {
+    const hasOrderOriginColumn = await ensureOrdersOrderOriginColumn();
+    const orderOriginReturning = hasOrderOriginColumn
+      ? "order_origin"
+      : "NULL::TEXT AS order_origin";
     const { rows } = await pool.query(
       `UPDATE orders
        SET status = 'cancelled',
              cancellation_reason = NULLIF($1, ''),
              cancelled_at = NOW()
        WHERE restaurant_id = $2 AND id = $3 AND status <> 'cancelled'
-       RETURNING id, table_number, order_type, order_origin`,
+       RETURNING id, table_number, order_type, ${orderOriginReturning}`,
       [reason, restaurantId, orderId]
     );
 
@@ -6717,6 +6764,10 @@ router.patch("/:id/driver-status", async (req, res) => {
 
   try {
     await client.query("BEGIN");
+    const hasOrderOriginColumn = await ensureOrdersOrderOriginColumn();
+    const orderOriginSelect = hasOrderOriginColumn
+      ? "order_origin"
+      : "NULL::TEXT AS order_origin";
 
     const driverCheck = await client.query(
       `SELECT
@@ -6728,7 +6779,7 @@ router.patch("/:id/driver-status", async (req, res) => {
          external_expedition_type,
          customer_address,
          order_type,
-         order_origin
+         ${orderOriginSelect}
        FROM orders WHERE restaurant_id = $1 AND id = $2`,
       [req.user.restaurant_id, id]
     );

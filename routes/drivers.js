@@ -61,8 +61,12 @@ module.exports = function (io) {
       if (driver_status === "delivered") fields.push("delivered_at = NOW()");
 
       // Fetch order details for notification
+      const ordersColumnSet = await getOrdersColumnSet();
+      const orderOriginSelect = ordersColumnSet.has("order_origin")
+        ? "order_origin"
+        : "NULL::TEXT AS order_origin";
       const orderResult = await pool.query(
-        `SELECT id, customer_name, order_type, order_origin FROM orders WHERE restaurant_id = $1 AND id = $2`,
+        `SELECT id, customer_name, order_type, ${orderOriginSelect} FROM orders WHERE restaurant_id = $1 AND id = $2`,
         [restaurantId, id]
       );
       const order = orderResult.rows[0];
