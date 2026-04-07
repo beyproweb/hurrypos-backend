@@ -2175,7 +2175,8 @@ async function hasOrdersCreatedByColumn() {
       SELECT EXISTS (
         SELECT 1
         FROM information_schema.columns
-        WHERE table_name = 'orders'
+        WHERE table_schema = current_schema()
+          AND table_name = 'orders'
           AND column_name = 'created_by'
       ) AS exists
       `
@@ -2209,7 +2210,8 @@ async function ensureOrdersOrderOriginColumn() {
       SELECT EXISTS (
         SELECT 1
         FROM information_schema.columns
-        WHERE table_name = 'orders'
+        WHERE table_schema = current_schema()
+          AND table_name = 'orders'
           AND column_name = 'order_origin'
       ) AS exists
       `
@@ -3105,7 +3107,30 @@ router.post("/", async (req, res) => {
     console.log("ORDER TYPE from payload:", order_type);
     const includeTakeawayFields = ordersHasTakeawayFields === true;
     const hasCreatedByColumn = await hasOrdersCreatedByColumn();
-    const hasOrderOriginColumn = await ensureOrdersOrderOriginColumn();
+    let hasOrderOriginColumn = await ensureOrdersOrderOriginColumn();
+    if (hasOrderOriginColumn) {
+      try {
+        const { rows } = await pool.query(
+          `
+          SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'orders'
+              AND column_name = 'order_origin'
+          ) AS exists
+          `
+        );
+        hasOrderOriginColumn = !!rows?.[0]?.exists;
+        if (!hasOrderOriginColumn) {
+          ordersHasOrderOriginColumn = false;
+        }
+      } catch (err) {
+        hasOrderOriginColumn = false;
+        ordersHasOrderOriginColumn = false;
+        console.warn("⚠️ Unable to re-check orders.order_origin before insert:", err.message);
+      }
+    }
     const hasCustomerIdentityColumns = await ensureOrderCustomerIdentityColumns();
     await client.query("BEGIN");
 

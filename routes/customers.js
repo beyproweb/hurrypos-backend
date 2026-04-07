@@ -26,6 +26,36 @@ function isPhoneConflictError(err) {
   );
 }
 
+async function hasPhoneConflictInRestaurant({
+  restaurantId,
+  customerIdToExclude = null,
+  normalizedPhone,
+}) {
+  const phoneCandidates = buildTrPhoneCandidates(normalizedPhone);
+  if (!phoneCandidates.length) return false;
+
+  const values = [restaurantId, phoneCandidates];
+  let whereExclusion = "";
+  if (customerIdToExclude !== null && customerIdToExclude !== undefined) {
+    values.push(customerIdToExclude);
+    whereExclusion = `AND id <> $3`;
+  }
+
+  const { rows } = await pool.query(
+    `
+      SELECT id
+      FROM customers
+      WHERE restaurant_id = $1
+        AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = ANY($2::text[])
+        ${whereExclusion}
+      LIMIT 1
+    `,
+    values
+  );
+
+  return rows.length > 0;
+}
+
 // ✅ POST /api/customers - Create or return existing (tenant safe)
 router.post("/", async (req, res) => {
   const { name, birthday, email } = req.body;
@@ -122,24 +152,16 @@ router.patch("/:id", async (req, res) => {
   if (!fields.length) return res.status(400).json({ error: "No valid fields" });
 
   if (normalizedPhoneForConflictCheck) {
-    const phoneCandidates = buildTrPhoneCandidates(normalizedPhoneForConflictCheck);
-    if (phoneCandidates.length) {
-      const { rows: conflictingRows } = await pool.query(
-        `SELECT id
-         FROM customers
-         WHERE restaurant_id = $1
-           AND id <> $2
-           AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = ANY($3::text[])
-         LIMIT 1`,
-        [restaurantId, id, phoneCandidates]
-      );
-
-      if (conflictingRows.length) {
-        return res.status(409).json({
-          error: "DUPLICATE_CUSTOMER_PHONE",
-          message: "This phone number is already used by another customer",
-        });
-      }
+    const hasConflict = await hasPhoneConflictInRestaurant({
+      restaurantId,
+      customerIdToExclude: id,
+      normalizedPhone: normalizedPhoneForConflictCheck,
+    });
+    if (hasConflict) {
+      return res.status(409).json({
+        error: "DUPLICATE_CUSTOMER_PHONE",
+        message: "This phone number is already used by another customer",
+      });
     }
   }
 
@@ -155,10 +177,38 @@ router.patch("/:id", async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: "Customer not found" });
     res.json(result.rows[0]);
   } catch (err) {
-    if (isUniqueViolation(err) && isPhoneConflictError(err)) {
+    if (isUniqueViolation(err)) {
+      const normalizedPhone =
+        normalizedPhoneForConflictCheck || normalizeTrPhoneForApi(payload?.phone);
+
+      if (normalizedPhone) {
+        try {
+          const hasConflict = await hasPhoneConflictInRestaurant({
+            restaurantId,
+            customerIdToExclude: id,
+            normalizedPhone,
+          });
+          if (hasConflict) {
+            return res.status(409).json({
+              error: "DUPLICATE_CUSTOMER_PHONE",
+              message: "This phone number is already used by another customer",
+            });
+          }
+        } catch (lookupErr) {
+          console.warn("⚠️ Failed to resolve duplicate customer update by phone:", lookupErr.message);
+        }
+      }
+
+      if (isPhoneConflictError(err)) {
+        return res.status(409).json({
+          error: "DUPLICATE_CUSTOMER_PHONE",
+          message: "This phone number is already used by another customer",
+        });
+      }
+
       return res.status(409).json({
-        error: "DUPLICATE_CUSTOMER_PHONE",
-        message: "This phone number is already used by another customer",
+        error: "CUSTOMER_UPDATE_CONFLICT",
+        message: "Customer update conflicts with an existing record",
       });
     }
 
