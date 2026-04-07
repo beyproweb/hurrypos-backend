@@ -4,6 +4,22 @@ const jwt = require("jsonwebtoken");
  * ✅ Authentication & Tenant Middleware
  * Verifies JWT and attaches req.user = { id, name, role, restaurant_id, ... }
  */
+function buildAuthRequestDebug(req, authHeader) {
+  const headerText = String(authHeader || "");
+  const authScheme = headerText.split(" ")[0] || "";
+  return {
+    method: req.method,
+    path: req.originalUrl || req.url || "",
+    host: req.get?.("host") || "",
+    origin: req.get?.("origin") || "",
+    referer: req.get?.("referer") || "",
+    userAgent: req.get?.("user-agent") || "",
+    hasAuthorizationHeader: Boolean(authHeader),
+    authorizationScheme: authScheme,
+    authorizationHeaderLength: headerText.length,
+  };
+}
+
 module.exports = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -23,7 +39,10 @@ module.exports = (req, res, next) => {
           userAgent: req.get?.("user-agent") || "",
         });
       }
-      console.warn("⚠️ Missing or malformed Authorization header");
+      console.warn(
+        "⚠️ Missing or malformed Authorization header",
+        buildAuthRequestDebug(req, authHeader)
+      );
       return res.status(401).json({
         status: "error",
         message: "Unauthorized: token missing",
