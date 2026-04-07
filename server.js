@@ -33,6 +33,7 @@ app.set("trust proxy", true);
 const { pool } = require('./db');
 const cors = require("cors");
 const { ensureMinimalSchema } = require("./utils/ensureSchema");
+const { normalizeTrPhoneForApi } = require("./utils/phone");
 
 function parseCommaListEnv(value) {
   return String(value || "")
@@ -145,6 +146,41 @@ app.get("/health", (req, res) => res.status(200).send("ok"));
 const bodySizeLimit = process.env.BODY_SIZE_LIMIT || "5mb";
 app.use(express.urlencoded({ extended: true, limit: bodySizeLimit }));
 app.use(express.json({ limit: bodySizeLimit }));
+
+function isPhoneLikeFieldName(key) {
+  const normalized = String(key || "").trim().toLowerCase();
+  return (
+    normalized === "phone" ||
+    normalized.endsWith("_phone") ||
+    normalized.endsWith("phone")
+  );
+}
+
+function normalizePhoneFieldsDeep(payload) {
+  if (!payload || typeof payload !== "object") return;
+
+  if (Array.isArray(payload)) {
+    payload.forEach((entry) => normalizePhoneFieldsDeep(entry));
+    return;
+  }
+
+  Object.entries(payload).forEach(([key, value]) => {
+    if (typeof value === "string" && isPhoneLikeFieldName(key)) {
+      const normalizedPhone = normalizeTrPhoneForApi(value);
+      payload[key] = normalizedPhone || value.trim();
+      return;
+    }
+
+    if (value && typeof value === "object") {
+      normalizePhoneFieldsDeep(value);
+    }
+  });
+}
+
+app.use((req, _res, next) => {
+  normalizePhoneFieldsDeep(req.body);
+  next();
+});
 app.set("io", io);
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -168,6 +204,7 @@ const whatsappWebhook = require("./routes/whatsappWebhook");
 
 app.use("/api/integrations/yemeksepeti", require("./routes/yemeksepeti"));
 app.use("/api/integrations/migros", require("./routes/migros"));
+app.use("/api/integrations/whatsapp", require("./routes/whatsappIntegration"));
 
 // Beypro Bridge binaries (no-cache)
 app.use(

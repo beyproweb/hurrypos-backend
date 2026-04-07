@@ -3,24 +3,33 @@ const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 const { ensureCustomerDebtColumn } = require("../utils/customerDebt");
+const {
+  normalizeTrPhoneForApi,
+  buildTrPhoneCandidates,
+} = require("../utils/phone");
 
 router.use(authMiddleware);
 ensureCustomerDebtColumn();
 
 // ✅ POST /api/customers - Create or return existing (tenant safe)
 router.post("/", async (req, res) => {
-  const { name, phone, birthday, email } = req.body;
+  const { name, birthday, email } = req.body;
   const restaurantId = req.user.restaurant_id;
+  const phone = normalizeTrPhoneForApi(req.body?.phone);
 
   if (!name || !phone) {
     return res.status(400).json({ error: "Name and phone required" });
   }
 
   try {
+    const phoneCandidates = buildTrPhoneCandidates(phone);
     // 1️⃣ Check if customer already exists for this restaurant
     const existing = await pool.query(
-      `SELECT * FROM customers WHERE restaurant_id = $1 AND phone = $2 LIMIT 1`,
-      [restaurantId, phone]
+      `SELECT * FROM customers
+       WHERE restaurant_id = $1
+         AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = ANY($2::text[])
+       LIMIT 1`,
+      [restaurantId, phoneCandidates]
     );
 
     if (existing.rows.length > 0) {
@@ -62,7 +71,12 @@ router.patch("/:id", async (req, res) => {
   for (const [key, value] of Object.entries(payload)) {
     if (["name", "phone", "birthday", "email", "address"].includes(key)) {
       fields.push(`${key} = $${idx++}`);
-      values.push(value);
+      if (key === "phone") {
+        const normalizedPhone = normalizeTrPhoneForApi(value);
+        values.push(normalizedPhone || null);
+      } else {
+        values.push(value);
+      }
     }
   }
   if (!fields.length) return res.status(400).json({ error: "No valid fields" });
@@ -127,9 +141,15 @@ router.get("/", async (req, res) => {
 router.get("/by-phone/:phone", async (req, res) => {
   const restaurantId = req.user.restaurant_id;
   try {
+    const phoneCandidates = buildTrPhoneCandidates(req.params.phone);
+    if (!phoneCandidates.length) return res.json(null);
+
     const { rows } = await pool.query(
-      "SELECT * FROM customers WHERE restaurant_id = $1 AND phone = $2 LIMIT 1",
-      [restaurantId, req.params.phone]
+      `SELECT * FROM customers
+       WHERE restaurant_id = $1
+         AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = ANY($2::text[])
+       LIMIT 1`,
+      [restaurantId, phoneCandidates]
     );
     if (!rows.length) return res.json(null);
     const c = rows[0];

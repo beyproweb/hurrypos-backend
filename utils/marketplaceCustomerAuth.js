@@ -1,6 +1,7 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
+const { normalizeTrPhoneForApi } = require("./phone");
 
 const MARKETPLACE_CUSTOMER_SCOPE = "marketplace_customer";
 const MARKETPLACE_CUSTOMER_TOKEN_TTL =
@@ -17,12 +18,7 @@ function normalizeEmail(value) {
 }
 
 function normalizePhone(value) {
-  let digits = String(value || "").replace(/\D/g, "");
-  if (!digits) return "";
-  if (digits.startsWith("00") && digits.length > 2) digits = digits.slice(2);
-  if (digits.startsWith("90") && digits.length > 10) digits = digits.slice(2);
-  if (digits.startsWith("0") && digits.length > 10) digits = digits.slice(1);
-  return digits;
+  return normalizeTrPhoneForApi(value);
 }
 
 function normalizeLanguage(value) {

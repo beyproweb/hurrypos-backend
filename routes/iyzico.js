@@ -4,6 +4,7 @@ const router = express.Router();
 const Iyzipay = require("iyzipay");
 const { pool } = require("../db");
 const { emitOrderUpdate } = require("../utils/realtime");
+const { normalizeTrPhoneForApi } = require("../utils/phone");
 
 const iyzipay = new Iyzipay({
   apiKey: process.env.IYZI_API_KEY,
@@ -46,6 +47,7 @@ router.post("/payments/iyzico/checkout", async (req, res) => {
 
     const price = itemRows.reduce((s, i) => s + Number(i.quantity) * parseFloat(i.price), 0);
     const basketItems = toBasketItems(itemRows);
+    const normalizedCustomerPhone = normalizeTrPhoneForApi(order.customer_phone);
 
     const reqBody = {
       locale: Iyzipay.LOCALE.TR,
@@ -58,10 +60,10 @@ router.post("/payments/iyzico/checkout", async (req, res) => {
       callbackUrl: `${process.env.PUBLIC_API_BASE}/api/payments/iyzico/callback`,
       // Buyer
       buyer: {
-        id: order.customer_phone || `guest-${order_id}`,
+        id: normalizedCustomerPhone || `guest-${order_id}`,
         name: order.customer_name || "Musteri",
         surname: "-",
-        gsmNumber: order.customer_phone ? `+90${order.customer_phone}` : undefined,
+        gsmNumber: normalizedCustomerPhone ? `+${normalizedCustomerPhone}` : undefined,
         email: order.customer_email || "guest@example.com",
         identityNumber: "11111111110",
         registrationAddress: order.customer_address || "Address",

@@ -5,6 +5,7 @@ const router = express.Router();
 const authMiddleware = require("../middleware/authMiddleware");
 const { sendCloudMessage } = require("../utils/whatsappCloud");
 const { sendEmail } = require("../utils/notifications");
+const { normalizeTrPhoneForApi } = require("../utils/phone");
 /* =========================================================
    In-memory fallbacks so the UI still works if DB writes fail
    ========================================================= */
@@ -1356,7 +1357,17 @@ router.post("/whatsapp", authMiddleware, async (req, res) => {
     let failureCount = 0;
 
     for (const phone of phones) {
-      const normalized = phone.replace(/\D/g, "");
+      const normalized = normalizeTrPhoneForApi(phone);
+      if (!normalized) {
+        failureCount += 1;
+        results.push({
+          phone: String(phone || ""),
+          status: "failed",
+          error: "Invalid phone format",
+        });
+        continue;
+      }
+
       try {
         const r = await sendCloudMessage(normalized, marketingBody);
         results.push({ phone: normalized, status: r.status || "ok" });

@@ -16,6 +16,10 @@ const {
   updateMarketplaceCustomerProfile,
   verifyCustomerAuthToken,
 } = require("../utils/marketplaceCustomerAuth");
+const {
+  normalizeTrPhoneForApi,
+  buildTrPhoneCandidates,
+} = require("../utils/phone");
 
 const QR_CUSTOMER_TOKEN_TTL = "30d";
 const QR_CUSTOMER_OAUTH_STATE_TTL = "15m";
@@ -107,22 +111,11 @@ function normalizeEmail(value) {
 }
 
 function normalizePhone(value) {
-  let digits = String(value || "").replace(/\D/g, "");
-  if (!digits) return "";
-  if (digits.startsWith("00") && digits.length > 2) digits = digits.slice(2);
-  if (digits.startsWith("90") && digits.length > 10) digits = digits.slice(2);
-  if (digits.startsWith("0") && digits.length > 10) digits = digits.slice(1);
-  return digits;
+  return normalizeTrPhoneForApi(value);
 }
 
 function buildPhoneCandidates(value) {
-  const normalized = normalizePhone(value);
-  if (!normalized) return [];
-  const variants = new Set([normalized]);
-  variants.add(`0${normalized}`);
-  variants.add(`90${normalized}`);
-  variants.add(`0090${normalized}`);
-  return Array.from(variants);
+  return buildTrPhoneCandidates(value);
 }
 
 function normalizeLanguage(value) {
@@ -415,14 +408,18 @@ async function findCustomerByPhoneIdentity(restaurantId, phone, runner = pool) {
 }
 
 async function getCustomerByPhone(restaurantId, phone) {
+  const candidates = buildPhoneCandidates(phone);
+  if (!candidates.length) return null;
+
   const { rows } = await pool.query(
     `
       SELECT id, restaurant_id, name, phone, address, birthday, email
       FROM customers
-      WHERE restaurant_id = $1 AND phone = $2
+      WHERE restaurant_id = $1
+        AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = ANY($2::text[])
       LIMIT 1
     `,
-    [restaurantId, String(phone || "").trim()]
+    [restaurantId, candidates]
   );
 
   const customer = rows[0] || null;
@@ -964,7 +961,7 @@ router.get("/customers/by-phone/:phone", requirePublicRestaurant, async (req, re
 router.post("/customers", requirePublicRestaurant, async (req, res) => {
   const restaurantId = req.restaurantId;
   const name = String(req.body?.name || "").trim();
-  const phone = String(req.body?.phone || "").trim();
+  const phone = normalizePhone(req.body?.phone);
   const email = String(req.body?.email || "").trim().toLowerCase() || null;
   const address = String(req.body?.address || "").trim() || null;
 
@@ -1022,7 +1019,12 @@ router.patch("/customers/:id", requirePublicRestaurant, async (req, res) => {
   for (const [key, value] of Object.entries(payload)) {
     if (["name", "phone", "birthday", "email", "address"].includes(key)) {
       fields.push(`${key} = $${idx++}`);
-      values.push(value === "" ? null : value);
+      if (key === "phone") {
+        const normalized = normalizePhone(value);
+        values.push(normalized || null);
+      } else {
+        values.push(value === "" ? null : value);
+      }
     }
   }
 

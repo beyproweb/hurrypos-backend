@@ -75,6 +75,7 @@ module.exports = function(io) {
     getMarketplaceCustomerById,
     verifyCustomerAuthToken,
   } = require("../utils/marketplaceCustomerAuth");
+  const { normalizeTrPhoneForApi, buildTrPhoneCandidates } = require("../utils/phone");
   const DEFAULT_TZ = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
 
   const getAuthHeaderForCallbackUrl = async (url) => {
@@ -381,12 +382,7 @@ module.exports = function(io) {
   };
 
   const normalizeCustomerPhone = (value) => {
-    let digits = String(value || "").replace(/\D/g, "");
-    if (!digits) return "";
-    if (digits.startsWith("00") && digits.length > 2) digits = digits.slice(2);
-    if (digits.startsWith("90") && digits.length > 10) digits = digits.slice(2);
-    if (digits.startsWith("0") && digits.length > 10) digits = digits.slice(1);
-    return digits;
+    return normalizeTrPhoneForApi(value);
   };
 
   const isQrMenuRequest = (req) => {
@@ -4340,8 +4336,9 @@ router.get("/driver-report", async (req, res) => {
 router.get("/debt/find", async (req, res) => {
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
-  const phone = (req.query.phone || req.query.customer_phone || "").trim();
-  if (!phone) {
+  const phone = normalizeCustomerPhone(req.query.phone || req.query.customer_phone || "");
+  const phoneCandidates = buildTrPhoneCandidates(phone);
+  if (!phoneCandidates.length) {
     return res.status(400).json({ error: "customer_phone is required" });
   }
 
@@ -4356,16 +4353,16 @@ router.get("/debt/find", async (req, res) => {
           created_at,
           updated_at,
           customer_name,
-          customer_phone,
+         customer_phone,
           COALESCE(debt_recorded_total, 0) AS debt_recorded_total
          FROM orders
         WHERE restaurant_id = $1
-          AND customer_phone = $2
+          AND regexp_replace(COALESCE(customer_phone, ''), '\\D', '', 'g') = ANY($2::text[])
           AND status = 'closed'
           AND COALESCE(is_paid, false) = false
           AND COALESCE(debt_recorded_total, 0) > 0
         ORDER BY updated_at DESC NULLS LAST, id DESC`,
-      [restaurantId, phone]
+      [restaurantId, phoneCandidates]
     );
     if (!rows.length) return res.json({ orders: [], total_debt: 0 });
     const normalized = rows.map((row) => ({
@@ -4926,7 +4923,7 @@ router.post("/:id/close", async (req, res) => {
     const isExternalOrder = Boolean(existing.external_source);
 
     if (needsDebtAdjustment && !isExternalOrder) {
-      const phoneOk = (existing.customer_phone || "").trim();
+      const phoneOk = normalizeCustomerPhone(existing.customer_phone);
       if (!phoneOk) {
         await client.query("ROLLBACK");
         return res.status(400).json({
@@ -5460,7 +5457,7 @@ router.post("/:id/add-debt", async (req, res) => {
 
     const payload = req.body || {};
     const inputName = (payload.customer_name || "").trim();
-    const inputPhone = (payload.customer_phone || "").trim();
+    const inputPhone = normalizeCustomerPhone(payload.customer_phone);
 
     const { rows } = await client.query(
       `SELECT
@@ -5490,7 +5487,7 @@ router.post("/:id/add-debt", async (req, res) => {
     }
 
     let customerName = (existing.customer_name || "").trim();
-    let customerPhone = (existing.customer_phone || "").trim();
+    let customerPhone = normalizeCustomerPhone(existing.customer_phone);
 
     if (!customerName && inputName) customerName = inputName;
     if (!customerPhone && inputPhone) customerPhone = inputPhone;
@@ -7461,7 +7458,7 @@ router.post("/reservations", async (req, res) => {
         ? Number(table_number)
         : null;
       const safeCustomerName = (customer_name || "").trim() || null;
-      const safeCustomerPhone = (customer_phone || "").trim() || null;
+      const safeCustomerPhone = normalizeCustomerPhone(customer_phone) || null;
       const sourceOrderResult = await pool.query(
         `SELECT
            id,
@@ -7696,7 +7693,7 @@ router.post("/reservations", async (req, res) => {
     }
 
     const safeCustomerName = (customer_name || "").trim() || null;
-    const safeCustomerPhone = (customer_phone || "").trim() || null;
+    const safeCustomerPhone = normalizeCustomerPhone(customer_phone) || null;
     const slotContext = await buildValidatedReservationSlot({
       restaurantId,
       reservationDate: reservation_date,
