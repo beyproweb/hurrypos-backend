@@ -117,6 +117,35 @@ async function getMarketplaceCustomerById(customerId, runner = pool) {
   return toPublicMarketplaceCustomer(rows[0] || null);
 }
 
+async function getMarketplaceCustomerByEmail(email, runner = pool) {
+  await ensureMarketplaceCustomerSchema();
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  const { rows } = await runner.query(
+    `
+      SELECT
+        id,
+        full_name,
+        phone,
+        email,
+        address,
+        language,
+        created_at,
+        updated_at
+      FROM marketplace_customers
+      WHERE LOWER(TRIM(COALESCE(email, ''))) = $1
+      ORDER BY id ASC
+      LIMIT 1
+    `,
+    [normalizedEmail]
+  );
+
+  return toPublicMarketplaceCustomer(rows[0] || null);
+}
+
 async function findMarketplaceCustomerForLogin(login, runner = pool) {
   await ensureMarketplaceCustomerSchema();
 
@@ -500,6 +529,7 @@ module.exports = {
   signMarketplaceCustomerToken,
   verifyCustomerAuthToken,
   getMarketplaceCustomerById,
+  getMarketplaceCustomerByEmail,
   loginMarketplaceCustomer,
   registerMarketplaceCustomer,
   updateMarketplaceCustomerProfile,

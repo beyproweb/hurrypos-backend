@@ -8,6 +8,7 @@ const {
   MARKETPLACE_CUSTOMER_SCOPE,
   ensureMarketplaceCustomerSchema,
   ensureRestaurantCustomerForMarketplace,
+  getMarketplaceCustomerByEmail,
   getMarketplaceCustomerById,
   getRestaurantCustomerProfile,
   loginMarketplaceCustomer,
@@ -20,6 +21,7 @@ const {
   normalizeTrPhoneForApi,
   buildTrPhoneCandidates,
 } = require("../utils/phone");
+const { sendEmail } = require("../utils/notifications");
 
 const QR_CUSTOMER_TOKEN_TTL = "30d";
 const QR_CUSTOMER_OAUTH_STATE_TTL = "15m";
@@ -32,9 +34,34 @@ const QR_CUSTOMER_OAUTH_ALLOWED_RETURN_HOSTS = (
   .split(",")
   .map((host) => host.trim().toLowerCase())
   .filter(Boolean);
+const QR_CUSTOMER_EMAIL_OTP_LENGTH = Number(process.env.QR_CUSTOMER_EMAIL_OTP_LENGTH || 6);
+const QR_CUSTOMER_EMAIL_OTP_TTL_SECONDS = Math.max(
+  60,
+  Number(process.env.QR_CUSTOMER_EMAIL_OTP_TTL_SECONDS || 600)
+);
+const QR_CUSTOMER_EMAIL_OTP_COOLDOWN_SECONDS = Math.max(
+  15,
+  Number(process.env.QR_CUSTOMER_EMAIL_OTP_COOLDOWN_SECONDS || 45)
+);
+const QR_CUSTOMER_EMAIL_OTP_MAX_SENDS_PER_WINDOW = Math.max(
+  1,
+  Number(process.env.QR_CUSTOMER_EMAIL_OTP_MAX_SENDS_PER_WINDOW || 5)
+);
+const QR_CUSTOMER_EMAIL_OTP_WINDOW_SECONDS = Math.max(
+  60,
+  Number(process.env.QR_CUSTOMER_EMAIL_OTP_WINDOW_SECONDS || 900)
+);
+const QR_CUSTOMER_EMAIL_OTP_MAX_VERIFY_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.QR_CUSTOMER_EMAIL_OTP_MAX_VERIFY_ATTEMPTS || 5)
+);
+const QR_CUSTOMER_EMAIL_OTP_SECRET = String(
+  process.env.QR_CUSTOMER_EMAIL_OTP_SECRET || process.env.JWT_SECRET || ""
+).trim();
 
 let qrCustomerAuthSchemaPromise = null;
 let qrCustomerOauthSchemaPromise = null;
+let qrCustomerEmailOtpSchemaPromise = null;
 
 async function ensureQrCustomerAuthSchema() {
   if (!qrCustomerAuthSchemaPromise) {
@@ -102,6 +129,47 @@ async function ensureQrCustomerOauthSchema() {
   return qrCustomerOauthSchemaPromise;
 }
 
+async function ensureQrCustomerEmailOtpSchema() {
+  if (!qrCustomerEmailOtpSchemaPromise) {
+    qrCustomerEmailOtpSchemaPromise = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS qr_customer_email_otps (
+          id SERIAL PRIMARY KEY,
+          restaurant_id INTEGER NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+          marketplace_customer_id INTEGER REFERENCES marketplace_customers(id) ON DELETE CASCADE,
+          email TEXT NOT NULL,
+          code_hash TEXT NOT NULL,
+          code_salt TEXT NOT NULL,
+          purpose TEXT NOT NULL DEFAULT 'login',
+          expires_at TIMESTAMPTZ NOT NULL,
+          consumed_at TIMESTAMPTZ,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL DEFAULT 5,
+          resend_count INTEGER NOT NULL DEFAULT 0,
+          request_ip TEXT,
+          user_agent TEXT,
+          last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS qr_customer_email_otps_lookup_idx
+        ON qr_customer_email_otps (restaurant_id, email, purpose, created_at DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS qr_customer_email_otps_active_idx
+        ON qr_customer_email_otps (restaurant_id, email, consumed_at, expires_at)
+      `);
+    })().catch((err) => {
+      qrCustomerEmailOtpSchemaPromise = null;
+      throw err;
+    });
+  }
+
+  return qrCustomerEmailOtpSchemaPromise;
+}
+
 function normalizeText(value) {
   return String(value || "").trim();
 }
@@ -121,6 +189,71 @@ function buildPhoneCandidates(value) {
 function normalizeLanguage(value) {
   const raw = normalizeText(value).split(",")[0];
   return raw ? raw.slice(0, 32) : null;
+}
+
+function normalizeOtpCode(value) {
+  return normalizeText(value).replace(/\s+/g, "");
+}
+
+function generateEmailOtpCode() {
+  const size = Math.min(8, Math.max(4, QR_CUSTOMER_EMAIL_OTP_LENGTH));
+  const min = 10 ** (size - 1);
+  const max = 10 ** size;
+  const random = crypto.randomInt(min, max);
+  return String(random);
+}
+
+function generateEmailOtpSalt() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function hashEmailOtpCode(code, salt) {
+  const normalizedCode = normalizeOtpCode(code);
+  const normalizedSalt = normalizeText(salt);
+  const secret = QR_CUSTOMER_EMAIL_OTP_SECRET || getJwtSigningSecret();
+  return crypto
+    .createHash("sha256")
+    .update(`${normalizedSalt}:${normalizedCode}:${secret}`)
+    .digest("hex");
+}
+
+function timingSafeEqualHex(left, right) {
+  const leftBuffer = Buffer.from(normalizeText(left), "hex");
+  const rightBuffer = Buffer.from(normalizeText(right), "hex");
+  if (!leftBuffer.length || leftBuffer.length !== rightBuffer.length) return false;
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function getRequesterIp(req) {
+  const forwarded = normalizeText(req.headers?.["x-forwarded-for"]);
+  if (forwarded) {
+    const first = forwarded.split(",")[0];
+    if (first) return first.trim();
+  }
+  return normalizeText(req.ip || req.connection?.remoteAddress || "");
+}
+
+function maskEmailAddress(value) {
+  const normalizedEmail = normalizeEmail(value);
+  if (!normalizedEmail.includes("@")) return normalizedEmail;
+  const [localPart, domainPart] = normalizedEmail.split("@");
+  if (!localPart) return `***@${domainPart}`;
+  const visible = localPart.slice(0, 2);
+  const hiddenLength = Math.max(1, localPart.length - visible.length);
+  return `${visible}${"*".repeat(hiddenLength)}@${domainPart}`;
+}
+
+function buildEmailOtpMessage({ code, expiresInMinutes = 10 }) {
+  const subject = "Your Beypro login code";
+  const text = [
+    "Your Beypro verification code is:",
+    "",
+    code,
+    "",
+    `This code expires in ${expiresInMinutes} minutes.`,
+    "If you did not request this code, you can ignore this email.",
+  ].join("\n");
+  return { subject, text };
 }
 
 function normalizeOAuthProvider(value) {
@@ -175,10 +308,64 @@ function parseApplePrivateKey(rawValue) {
   return value.includes("\\n") ? value.replace(/\\n/g, "\n") : value;
 }
 
-function resolveGoogleOAuthConfig() {
-  const clientId = normalizeText(process.env.GOOGLE_OAUTH_CLIENT_ID);
-  const clientSecret = normalizeText(process.env.GOOGLE_OAUTH_CLIENT_SECRET);
-  const redirectUri = normalizeText(process.env.GOOGLE_OAUTH_REDIRECT_URI);
+function getRequestOrigin(req) {
+  const forwardedProto = normalizeText(req?.get?.("x-forwarded-proto"))
+    .split(",")[0]
+    ?.trim();
+  const forwardedHost = normalizeText(req?.get?.("x-forwarded-host"))
+    .split(",")[0]
+    ?.trim();
+  const host = forwardedHost || normalizeText(req?.get?.("host"));
+  let protocol = forwardedProto || normalizeText(req?.protocol) || "https";
+
+  if (protocol !== "http" && protocol !== "https") {
+    protocol =
+      host.includes("localhost") || host.includes("127.0.0.1") ? "http" : "https";
+  }
+
+  if (!host) {
+    return protocol === "http" ? "http://localhost:5000" : "https://beypro.com";
+  }
+  return `${protocol}://${host}`;
+}
+
+function resolveGoogleOAuthConfig(req) {
+  const clientId = normalizeText(
+    process.env.GOOGLE_QR_OAUTH_CLIENT_ID || process.env.GOOGLE_OAUTH_CLIENT_ID
+  );
+  const clientSecret = normalizeText(
+    process.env.GOOGLE_QR_OAUTH_CLIENT_SECRET || process.env.GOOGLE_OAUTH_CLIENT_SECRET
+  );
+
+  const requestOrigin = getRequestOrigin(req);
+  let requestHost = "";
+  try {
+    requestHost = new URL(requestOrigin).hostname || "";
+  } catch {
+    requestHost = "";
+  }
+
+  const isLocalRequestHost =
+    requestHost === "localhost" || requestHost === "127.0.0.1";
+  const defaultRedirectUri = isLocalRequestHost
+    ? "http://localhost:5000/api/public/customer-auth/oauth/google/callback"
+    : "https://beypro.com/api/public/customer-auth/oauth/google/callback";
+
+  const envRedirectUri = normalizeText(
+    process.env.GOOGLE_QR_OAUTH_REDIRECT_URI || process.env.GOOGLE_OAUTH_REDIRECT_URI
+  );
+  let redirectUri = envRedirectUri || defaultRedirectUri;
+
+  try {
+    const parsed = new URL(redirectUri);
+    const callbackPath = "/api/public/customer-auth/oauth/google/callback";
+    if (parsed.pathname !== callbackPath) {
+      redirectUri = defaultRedirectUri;
+    }
+  } catch {
+    redirectUri = defaultRedirectUri;
+  }
+
   if (!clientId || !clientSecret || !redirectUri) return null;
   return { clientId, clientSecret, redirectUri };
 }
@@ -599,6 +786,72 @@ async function getCustomerByEmail(restaurantId, email, runner = pool) {
   return { ...customer, addresses };
 }
 
+async function countRecentEmailOtpRequests(
+  restaurantId,
+  email,
+  windowSeconds = QR_CUSTOMER_EMAIL_OTP_WINDOW_SECONDS,
+  runner = pool
+) {
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) return 0;
+
+  const { rows } = await runner.query(
+    `
+      SELECT COUNT(*)::int AS total
+      FROM qr_customer_email_otps
+      WHERE restaurant_id = $1
+        AND email = $2
+        AND purpose = 'login'
+        AND created_at >= NOW() - make_interval(secs => $3)
+    `,
+    [restaurantId, normalizedEmail, windowSeconds]
+  );
+
+  return Number(rows[0]?.total || 0);
+}
+
+async function getLatestEmailOtpRecord(restaurantId, email, runner = pool) {
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) return null;
+
+  const { rows } = await runner.query(
+    `
+      SELECT
+        id,
+        restaurant_id,
+        marketplace_customer_id,
+        email,
+        code_hash,
+        code_salt,
+        purpose,
+        expires_at,
+        consumed_at,
+        attempt_count,
+        max_attempts,
+        resend_count,
+        last_sent_at,
+        created_at
+      FROM qr_customer_email_otps
+      WHERE restaurant_id = $1
+        AND email = $2
+        AND purpose = 'login'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `,
+    [restaurantId, normalizedEmail]
+  );
+
+  return rows[0] || null;
+}
+
+function calculateOtpRetryAfterSeconds(latestOtp) {
+  if (!latestOtp?.last_sent_at) return 0;
+  const lastSentMs = Date.parse(latestOtp.last_sent_at);
+  if (!Number.isFinite(lastSentMs)) return 0;
+  const elapsedSeconds = Math.floor((Date.now() - lastSentMs) / 1000);
+  return Math.max(0, QR_CUSTOMER_EMAIL_OTP_COOLDOWN_SECONDS - elapsedSeconds);
+}
+
 async function loadQrCustomerOauthAccount(restaurantId, provider, providerUserId, runner = pool) {
   const normalizedProvider = normalizeOAuthProvider(provider);
   const normalizedProviderUserId = normalizeText(providerUserId);
@@ -795,8 +1048,8 @@ async function resolveOrCreateQrCustomerForOauth(
   throw new Error("Failed to resolve customer for OAuth login");
 }
 
-async function exchangeGoogleCodeForProfile(code) {
-  const config = resolveGoogleOAuthConfig();
+async function exchangeGoogleCodeForProfile(code, req) {
+  const config = resolveGoogleOAuthConfig(req);
   if (!config) {
     throw new Error("Google OAuth is not configured");
   }
@@ -1086,7 +1339,7 @@ router.get(
       });
 
       if (provider === "google") {
-        const config = resolveGoogleOAuthConfig();
+        const config = resolveGoogleOAuthConfig(req);
         if (!config) {
           return res.redirect(
             302,
@@ -1199,7 +1452,7 @@ router.get("/customer-auth/oauth/:provider/callback", async (req, res) => {
 
     const profile =
       provider === "google"
-        ? await exchangeGoogleCodeForProfile(authorizationCode)
+        ? await exchangeGoogleCodeForProfile(authorizationCode, req)
         : await exchangeAppleCodeForProfile(authorizationCode);
 
     const profileProviderUserId = normalizeText(profile?.providerUserId);
@@ -1269,6 +1522,311 @@ router.get("/customer-auth/oauth/:provider/callback", async (req, res) => {
     );
   }
 });
+
+router.post(
+  "/customer-auth/email-otp/request",
+  requirePublicRestaurant,
+  async (req, res) => {
+    const restaurantId = req.restaurantId;
+    const email = normalizeEmail(req.body?.email);
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "A valid email address is required." });
+    }
+
+    try {
+      await ensureMarketplaceCustomerSchema();
+      await ensureQrCustomerEmailOtpSchema();
+
+      const marketplaceCustomer = await getMarketplaceCustomerByEmail(email);
+
+      // Avoid account enumeration while still allowing a successful path
+      // for registered users.
+      if (!marketplaceCustomer?.id) {
+        return res.json({
+          success: true,
+          sent: false,
+          message: "If this email is registered, a verification code has been sent.",
+          retry_after_seconds: QR_CUSTOMER_EMAIL_OTP_COOLDOWN_SECONDS,
+          expires_in_seconds: QR_CUSTOMER_EMAIL_OTP_TTL_SECONDS,
+        });
+      }
+
+      const latestOtp = await getLatestEmailOtpRecord(restaurantId, email);
+      const retryAfterSeconds = calculateOtpRetryAfterSeconds(latestOtp);
+      const isLatestOtpActive =
+        latestOtp &&
+        !latestOtp.consumed_at &&
+        Date.parse(latestOtp.expires_at || 0) > Date.now();
+
+      if (isLatestOtpActive && retryAfterSeconds > 0) {
+        return res.status(429).json({
+          error: "Please wait before requesting another code.",
+          retry_after_seconds: retryAfterSeconds,
+        });
+      }
+
+      if (
+        isLatestOtpActive &&
+        Number(latestOtp?.resend_count || 0) + 1 >=
+          QR_CUSTOMER_EMAIL_OTP_MAX_SENDS_PER_WINDOW
+      ) {
+        return res.status(429).json({
+          error: "Too many verification requests. Please try again later.",
+          retry_after_seconds: QR_CUSTOMER_EMAIL_OTP_WINDOW_SECONDS,
+        });
+      }
+
+      const recentSendCount = await countRecentEmailOtpRequests(restaurantId, email);
+      if (recentSendCount >= QR_CUSTOMER_EMAIL_OTP_MAX_SENDS_PER_WINDOW) {
+        return res.status(429).json({
+          error: "Too many verification requests. Please try again later.",
+          retry_after_seconds: QR_CUSTOMER_EMAIL_OTP_WINDOW_SECONDS,
+        });
+      }
+
+      const code = generateEmailOtpCode();
+      const salt = generateEmailOtpSalt();
+      const codeHash = hashEmailOtpCode(code, salt);
+      const expiresAt = new Date(Date.now() + QR_CUSTOMER_EMAIL_OTP_TTL_SECONDS * 1000);
+      const requesterIp = getRequesterIp(req);
+      const userAgent = normalizeText(req.get("user-agent"));
+
+      let persistedOtpId = null;
+      if (isLatestOtpActive) {
+        const updated = await pool.query(
+          `
+            UPDATE qr_customer_email_otps
+            SET code_hash = $1,
+                code_salt = $2,
+                expires_at = $3,
+                attempt_count = 0,
+                max_attempts = $4,
+                resend_count = COALESCE(resend_count, 0) + 1,
+                request_ip = $5,
+                user_agent = $6,
+                last_sent_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $7
+            RETURNING id
+          `,
+          [
+            codeHash,
+            salt,
+            expiresAt,
+            QR_CUSTOMER_EMAIL_OTP_MAX_VERIFY_ATTEMPTS,
+            requesterIp || null,
+            userAgent || null,
+            latestOtp.id,
+          ]
+        );
+        persistedOtpId = Number(updated.rows[0]?.id || 0) || null;
+      } else {
+        const inserted = await pool.query(
+          `
+            INSERT INTO qr_customer_email_otps
+              (
+                restaurant_id,
+                marketplace_customer_id,
+                email,
+                code_hash,
+                code_salt,
+                purpose,
+                expires_at,
+                max_attempts,
+                resend_count,
+                request_ip,
+                user_agent,
+                last_sent_at
+              )
+            VALUES ($1, $2, $3, $4, $5, 'login', $6, $7, 0, $8, $9, NOW())
+            RETURNING id
+          `,
+          [
+            restaurantId,
+            marketplaceCustomer.id,
+            email,
+            codeHash,
+            salt,
+            expiresAt,
+            QR_CUSTOMER_EMAIL_OTP_MAX_VERIFY_ATTEMPTS,
+            requesterIp || null,
+            userAgent || null,
+          ]
+        );
+        persistedOtpId = Number(inserted.rows[0]?.id || 0) || null;
+      }
+
+      const { subject, text } = buildEmailOtpMessage({
+        code,
+        expiresInMinutes: Math.ceil(QR_CUSTOMER_EMAIL_OTP_TTL_SECONDS / 60),
+      });
+      try {
+        await sendEmail(email, subject, text, false, {
+          language: normalizeLanguage(req.get("accept-language")) || "en",
+        });
+      } catch (mailErr) {
+        if (persistedOtpId) {
+          await pool.query(
+            `
+              UPDATE qr_customer_email_otps
+              SET consumed_at = NOW(),
+                  updated_at = NOW()
+              WHERE id = $1
+            `,
+            [persistedOtpId]
+          );
+        }
+        throw mailErr;
+      }
+
+      return res.json({
+        success: true,
+        sent: true,
+        message: `Verification code sent to ${maskEmailAddress(email)}.`,
+        retry_after_seconds: QR_CUSTOMER_EMAIL_OTP_COOLDOWN_SECONDS,
+        expires_in_seconds: QR_CUSTOMER_EMAIL_OTP_TTL_SECONDS,
+      });
+    } catch (err) {
+      console.error("❌ QR customer OTP request failed:", err);
+      return res.status(500).json({ error: "Failed to send verification code." });
+    }
+  }
+);
+
+router.post(
+  "/customer-auth/email-otp/verify",
+  requirePublicRestaurant,
+  async (req, res) => {
+    const restaurantId = req.restaurantId;
+    const email = normalizeEmail(req.body?.email);
+    const code = normalizeOtpCode(req.body?.code);
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !code) {
+      return res.status(400).json({ error: "Email and verification code are required." });
+    }
+
+    try {
+      await ensureMarketplaceCustomerSchema();
+      await ensureQrCustomerEmailOtpSchema();
+
+      const marketplaceCustomer = await getMarketplaceCustomerByEmail(email);
+      if (!marketplaceCustomer?.id) {
+        return res.status(401).json({ error: "Invalid or expired verification code." });
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        const latestOtp = await getLatestEmailOtpRecord(restaurantId, email, client);
+        if (!latestOtp || latestOtp.consumed_at) {
+          await client.query("ROLLBACK");
+          return res.status(401).json({ error: "Invalid or expired verification code." });
+        }
+
+        const expired = Date.parse(latestOtp.expires_at || 0) <= Date.now();
+        if (expired) {
+          await client.query(
+            `
+              UPDATE qr_customer_email_otps
+              SET consumed_at = NOW(),
+                  updated_at = NOW()
+              WHERE id = $1
+            `,
+            [latestOtp.id]
+          );
+          await client.query("COMMIT");
+          return res.status(400).json({ error: "Verification code has expired." });
+        }
+
+        const attemptCount = Number(latestOtp.attempt_count || 0);
+        const maxAttempts = Number(latestOtp.max_attempts || QR_CUSTOMER_EMAIL_OTP_MAX_VERIFY_ATTEMPTS);
+        if (attemptCount >= maxAttempts) {
+          await client.query(
+            `
+              UPDATE qr_customer_email_otps
+              SET consumed_at = COALESCE(consumed_at, NOW()),
+                  updated_at = NOW()
+              WHERE id = $1
+            `,
+            [latestOtp.id]
+          );
+          await client.query("COMMIT");
+          return res.status(429).json({
+            error: "Too many invalid attempts. Request a new code.",
+          });
+        }
+
+        const candidateHash = hashEmailOtpCode(code, latestOtp.code_salt);
+        const isValid = timingSafeEqualHex(candidateHash, latestOtp.code_hash);
+        if (!isValid) {
+          const nextAttempts = attemptCount + 1;
+          const exhausted = nextAttempts >= maxAttempts;
+          await client.query(
+            `
+              UPDATE qr_customer_email_otps
+              SET attempt_count = $1,
+                  consumed_at = CASE WHEN $2 THEN NOW() ELSE consumed_at END,
+                  updated_at = NOW()
+              WHERE id = $3
+            `,
+            [nextAttempts, exhausted, latestOtp.id]
+          );
+          await client.query("COMMIT");
+          return res.status(exhausted ? 429 : 401).json({
+            error: exhausted
+              ? "Too many invalid attempts. Request a new code."
+              : "Invalid verification code.",
+          });
+        }
+
+        await client.query(
+          `
+            UPDATE qr_customer_email_otps
+            SET consumed_at = NOW(),
+                attempt_count = $1,
+                updated_at = NOW()
+            WHERE id = $2
+          `,
+          [attemptCount + 1, latestOtp.id]
+        );
+
+        await client.query("COMMIT");
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackErr) {
+          console.error("❌ QR customer OTP verify rollback failed:", rollbackErr);
+        }
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      const customerId = await ensureRestaurantCustomerForMarketplace({
+        restaurantId,
+        marketplaceCustomer,
+      });
+      const customer = await getRestaurantCustomerProfile(restaurantId, customerId);
+      const token = signMarketplaceCustomerToken({
+        customerId: marketplaceCustomer.id,
+        email: marketplaceCustomer.email,
+        phone: marketplaceCustomer.phone,
+      });
+
+      return res.json({
+        success: true,
+        token,
+        customer,
+        marketplace_user: marketplaceCustomer,
+      });
+    } catch (err) {
+      console.error("❌ QR customer OTP verify failed:", err);
+      return res.status(500).json({ error: "Failed to verify code." });
+    }
+  }
+);
 
 router.post("/customer-auth/register", requirePublicRestaurant, async (req, res) => {
   const restaurantId = req.restaurantId;
