@@ -26,6 +26,7 @@ const standaloneQrAllowed = new Set([
   "/qr-menu-customization",
   "/qr-menu-delivery",
   "/qr-menu-branding-assets",
+  "/tables",
 ]);
 const standaloneStaffAllowed = new Set([
   "/users",
