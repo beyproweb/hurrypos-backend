@@ -231,6 +231,13 @@ function isVerifiedMarketplacePhone(marketplaceCustomer, phoneNumber) {
   return Boolean(normalizedPhone && accountPhone && normalizedPhone === accountPhone);
 }
 
+function isMarketplaceSessionPhoneMatch(marketplaceCustomer, phoneNumber) {
+  if (!marketplaceCustomer?.id) return false;
+  const normalizedPhone = normalizePhone(phoneNumber);
+  const accountPhone = normalizePhone(marketplaceCustomer.phone);
+  return Boolean(normalizedPhone && accountPhone && normalizedPhone === accountPhone);
+}
+
 function normalizePhoneVerificationToken(value) {
   return normalizeText(value);
 }
@@ -316,6 +323,15 @@ function assertCheckoutPhoneVerification({
       ok: true,
       normalizedPhone,
       verifiedBy: "marketplace_account",
+      decodedToken: null,
+    };
+  }
+
+  if (isMarketplaceSessionPhoneMatch(marketplaceCustomer, normalizedPhone)) {
+    return {
+      ok: true,
+      normalizedPhone,
+      verifiedBy: "marketplace_session_phone_match",
       decodedToken: null,
     };
   }
@@ -463,6 +479,7 @@ module.exports = {
   getLatestPhoneOtpRecord,
   countRecentPhoneOtpRequests,
   isVerifiedMarketplacePhone,
+  isMarketplaceSessionPhoneMatch,
   signPhoneVerificationTrustToken,
   verifyPhoneVerificationTrustToken,
   assertCheckoutPhoneVerification,

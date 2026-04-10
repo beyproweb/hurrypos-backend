@@ -43,6 +43,7 @@ const {
   markMarketplaceCustomerPhoneVerified,
   maskPhoneNumber,
   isVerifiedMarketplacePhone,
+  isMarketplaceSessionPhoneMatch,
 } = require("../utils/customerPhoneVerification");
 const { sendPhoneOtpSms } = require("../utils/phoneOtpProvider");
 const { sendEmail } = require("../utils/notifications");
@@ -1996,12 +1997,17 @@ router.post(
       await ensureMarketplaceCustomerSchema();
 
       const marketplaceCustomer = await resolveOptionalMarketplaceSession(req);
-      if (isVerifiedMarketplacePhone(marketplaceCustomer, phone)) {
+      const accountVerified = isVerifiedMarketplacePhone(marketplaceCustomer, phone);
+      const accountPhoneMatch = isMarketplaceSessionPhoneMatch(
+        marketplaceCustomer,
+        phone
+      );
+      if (accountVerified || accountPhoneMatch) {
         const trustedToken = signPhoneVerificationTrustToken({
           restaurantId,
           marketplaceCustomerId: marketplaceCustomer?.id || null,
           phoneNumber: phone,
-          trustLevel: "account_verified",
+          trustLevel: accountVerified ? "account_verified" : "account_session",
         });
         return res.json({
           success: true,
@@ -2521,16 +2527,24 @@ router.get(
       }
 
       const accountVerified = isVerifiedMarketplacePhone(marketplaceCustomer, phone);
-      let verified = accountVerified;
-      let source = accountVerified ? "marketplace_account" : "none";
+      const accountPhoneMatch = isMarketplaceSessionPhoneMatch(
+        marketplaceCustomer,
+        phone
+      );
+      let verified = accountVerified || accountPhoneMatch;
+      let source = accountVerified
+        ? "marketplace_account"
+        : accountPhoneMatch
+        ? "marketplace_session"
+        : "none";
       let trustedToken = "";
 
-      if (accountVerified) {
+      if (accountVerified || accountPhoneMatch) {
         trustedToken = signPhoneVerificationTrustToken({
           restaurantId,
           marketplaceCustomerId: marketplaceCustomer?.id || null,
           phoneNumber: phone,
-          trustLevel: "account_verified",
+          trustLevel: accountVerified ? "account_verified" : "account_session",
         });
       } else {
         const incomingToken = extractPhoneVerificationTokenFromRequest(req);
