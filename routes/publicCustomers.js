@@ -21,6 +21,30 @@ const {
   normalizeTrPhoneForApi,
   buildTrPhoneCandidates,
 } = require("../utils/phone");
+const {
+  QR_CUSTOMER_PHONE_OTP_TTL_SECONDS,
+  QR_CUSTOMER_PHONE_OTP_COOLDOWN_SECONDS,
+  QR_CUSTOMER_PHONE_OTP_MAX_SENDS_PER_WINDOW,
+  QR_CUSTOMER_PHONE_OTP_WINDOW_SECONDS,
+  QR_CUSTOMER_PHONE_OTP_MAX_VERIFY_ATTEMPTS,
+  ensureQrCustomerPhoneOtpSchema,
+  normalizePhoneVerificationToken,
+  normalizePhoneForVerification,
+  normalizePhoneOtpCode,
+  generatePhoneOtpCode,
+  generatePhoneOtpSalt,
+  hashPhoneOtpCode,
+  timingSafeEqualPhoneOtpHash,
+  calculatePhoneOtpRetryAfterSeconds,
+  getLatestPhoneOtpRecord,
+  countRecentPhoneOtpRequests,
+  signPhoneVerificationTrustToken,
+  verifyPhoneVerificationTrustToken,
+  markMarketplaceCustomerPhoneVerified,
+  maskPhoneNumber,
+  isVerifiedMarketplacePhone,
+} = require("../utils/customerPhoneVerification");
+const { sendPhoneOtpSms } = require("../utils/phoneOtpProvider");
 const { sendEmail } = require("../utils/notifications");
 
 const QR_CUSTOMER_TOKEN_TTL = "30d";
@@ -58,6 +82,22 @@ const QR_CUSTOMER_EMAIL_OTP_MAX_VERIFY_ATTEMPTS = Math.max(
 const QR_CUSTOMER_EMAIL_OTP_SECRET = String(
   process.env.QR_CUSTOMER_EMAIL_OTP_SECRET || process.env.JWT_SECRET || ""
 ).trim();
+const QR_CUSTOMER_PHONE_OTP_EMAIL_FALLBACK_ENABLED = String(
+  process.env.QR_CUSTOMER_PHONE_OTP_EMAIL_FALLBACK_ENABLED || "true"
+)
+  .trim()
+  .toLowerCase() !== "false";
+const QR_CUSTOMER_PHONE_OTP_FORCE_EMAIL_FALLBACK = String(
+  process.env.QR_CUSTOMER_PHONE_OTP_FORCE_EMAIL_FALLBACK || ""
+)
+  .trim()
+  .toLowerCase() === "true";
+const QR_CUSTOMER_PHONE_OTP_PREFER_EMAIL_FALLBACK = String(
+  process.env.QR_CUSTOMER_PHONE_OTP_PREFER_EMAIL_FALLBACK ||
+    (process.env.NODE_ENV === "production" ? "false" : "true")
+)
+  .trim()
+  .toLowerCase() === "true";
 
 let qrCustomerAuthSchemaPromise = null;
 let qrCustomerOauthSchemaPromise = null;
@@ -250,6 +290,30 @@ function buildEmailOtpMessage({ code, expiresInMinutes = 10 }) {
     "",
     code,
     "",
+    `This code expires in ${expiresInMinutes} minutes.`,
+    "If you did not request this code, you can ignore this email.",
+  ].join("\n");
+  return { subject, text };
+}
+
+function isValidEmail(value) {
+  const normalized = normalizeEmail(value);
+  return Boolean(normalized) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
+}
+
+function buildPhoneOtpFallbackEmailMessage({
+  code,
+  phone,
+  expiresInMinutes = 5,
+}) {
+  const subject = "Your Beypro phone verification code";
+  const maskedPhone = maskPhoneNumber(phone);
+  const text = [
+    "Your Beypro phone verification code is:",
+    "",
+    code,
+    "",
+    `Phone: ${maskedPhone || phone}`,
     `This code expires in ${expiresInMinutes} minutes.`,
     "If you did not request this code, you can ignore this email.",
   ].join("\n");
@@ -577,7 +641,7 @@ async function findCustomerByPhoneIdentity(restaurantId, phone, runner = pool) {
 
   const { rows } = await runner.query(
     `
-      SELECT id, restaurant_id, name, phone, address, birthday, email
+      SELECT id, restaurant_id, name, phone, address, birthday, email, phone_verified, phone_verified_at
       FROM customers
       WHERE restaurant_id = $1
         AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = ANY($2::text[])
@@ -600,7 +664,7 @@ async function getCustomerByPhone(restaurantId, phone) {
 
   const { rows } = await pool.query(
     `
-      SELECT id, restaurant_id, name, phone, address, birthday, email
+      SELECT id, restaurant_id, name, phone, address, birthday, email, phone_verified, phone_verified_at
       FROM customers
       WHERE restaurant_id = $1
         AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = ANY($2::text[])
@@ -619,7 +683,7 @@ async function getCustomerByPhone(restaurantId, phone) {
 async function getCustomerById(restaurantId, customerId) {
   const { rows } = await pool.query(
     `
-      SELECT id, restaurant_id, name, phone, address, birthday, email
+      SELECT id, restaurant_id, name, phone, address, birthday, email, phone_verified, phone_verified_at
       FROM customers
       WHERE restaurant_id = $1 AND id = $2
       LIMIT 1
@@ -645,6 +709,8 @@ async function getQrCustomerProfileById(restaurantId, customerId, runner = pool)
         c.address,
         c.birthday,
         c.email,
+        c.phone_verified,
+        c.phone_verified_at,
         qca.language
       FROM customers c
       LEFT JOIN qr_customer_auth qca
@@ -769,7 +835,7 @@ async function getCustomerByEmail(restaurantId, email, runner = pool) {
 
   const { rows } = await runner.query(
     `
-      SELECT id, restaurant_id, name, phone, address, birthday, email
+      SELECT id, restaurant_id, name, phone, address, birthday, email, phone_verified, phone_verified_at
       FROM customers
       WHERE restaurant_id = $1
         AND LOWER(TRIM(COALESCE(email, ''))) = $2
@@ -1199,6 +1265,93 @@ async function requireQrCustomerSession(req, res, next) {
     console.error("❌ QR customer session validation failed:", err);
     res.status(401).json({ error: "Invalid or expired customer session" });
   }
+}
+
+function getBearerToken(req) {
+  const authHeader = normalizeText(req.headers?.authorization);
+  if (!authHeader.toLowerCase().startsWith("bearer ")) return "";
+  return normalizeText(authHeader.slice(7));
+}
+
+async function resolveOptionalMarketplaceSession(req) {
+  try {
+    await ensureMarketplaceCustomerSchema();
+    const token = getBearerToken(req);
+    if (!token) return null;
+    const decoded = verifyCustomerAuthToken(token);
+    const scope = String(decoded?.scope || "").toLowerCase();
+    if (scope !== MARKETPLACE_CUSTOMER_SCOPE || !decoded?.customer_id) {
+      return null;
+    }
+    const marketplaceCustomer = await getMarketplaceCustomerById(decoded.customer_id);
+    return marketplaceCustomer?.id ? marketplaceCustomer : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveOptionalQrCustomerSession(req) {
+  try {
+    const token = getBearerToken(req);
+    if (!token) return null;
+    const decoded = verifyCustomerAuthToken(token);
+    const scope = String(decoded?.scope || "").toLowerCase();
+    const customerId = Number(decoded?.customer_id || 0);
+    const tokenRestaurantId = Number(decoded?.restaurant_id || 0);
+    if (scope !== "qr_customer" || !Number.isFinite(customerId) || customerId <= 0) {
+      return null;
+    }
+    if (
+      !Number.isFinite(tokenRestaurantId) ||
+      tokenRestaurantId <= 0 ||
+      tokenRestaurantId !== Number(req.restaurantId)
+    ) {
+      return null;
+    }
+    const customer = await getQrCustomerProfileById(req.restaurantId, customerId);
+    return customer?.id ? customer : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveOptionalPhoneOtpFallbackEmail(req) {
+  try {
+    const token = getBearerToken(req);
+    if (!token) return "";
+    const decoded = verifyCustomerAuthToken(token);
+    const scope = String(decoded?.scope || "").toLowerCase();
+
+    if (scope === MARKETPLACE_CUSTOMER_SCOPE && decoded?.customer_id) {
+      await ensureMarketplaceCustomerSchema();
+      const marketplaceCustomer = await getMarketplaceCustomerById(decoded.customer_id);
+      return normalizeEmail(marketplaceCustomer?.email || "");
+    }
+
+    if (
+      scope === "qr_customer" &&
+      decoded?.customer_id &&
+      Number(decoded?.restaurant_id) === Number(req.restaurantId)
+    ) {
+      const customer = await getQrCustomerProfileById(req.restaurantId, decoded.customer_id);
+      return normalizeEmail(customer?.email || "");
+    }
+  } catch {
+    // Ignore malformed or missing auth session for fallback resolution.
+  }
+
+  return "";
+}
+
+function extractPhoneVerificationTokenFromRequest(req) {
+  return normalizePhoneVerificationToken(
+    req.body?.phone_verification_token ||
+      req.body?.phoneVerificationToken ||
+      req.query?.phone_verification_token ||
+      req.query?.phoneVerificationToken ||
+      req.headers?.["x-phone-verification-token"] ||
+      ""
+  );
 }
 
 router.get("/customers/by-phone/:phone", requirePublicRestaurant, async (req, res) => {
@@ -1828,6 +1981,721 @@ router.post(
   }
 );
 
+router.post(
+  "/customer-auth/phone-otp/send",
+  requirePublicRestaurant,
+  async (req, res) => {
+    const restaurantId = req.restaurantId;
+    const phone = normalizePhoneForVerification(req.body?.phone || req.body?.customer_phone);
+    if (!/^90\d{10}$/.test(phone)) {
+      return res.status(400).json({ error: "A valid phone number is required." });
+    }
+
+    try {
+      await ensureQrCustomerPhoneOtpSchema();
+      await ensureMarketplaceCustomerSchema();
+
+      const marketplaceCustomer = await resolveOptionalMarketplaceSession(req);
+      if (isVerifiedMarketplacePhone(marketplaceCustomer, phone)) {
+        const trustedToken = signPhoneVerificationTrustToken({
+          restaurantId,
+          marketplaceCustomerId: marketplaceCustomer?.id || null,
+          phoneNumber: phone,
+          trustLevel: "account_verified",
+        });
+        return res.json({
+          success: true,
+          sent: false,
+          already_verified: true,
+          phone,
+          phone_masked: maskPhoneNumber(phone),
+          phone_verification_token: trustedToken,
+          retry_after_seconds: 0,
+          expires_in_seconds: QR_CUSTOMER_PHONE_OTP_TTL_SECONDS,
+        });
+      }
+
+      const latestOtp = await getLatestPhoneOtpRecord(restaurantId, phone);
+      const retryAfterSeconds = calculatePhoneOtpRetryAfterSeconds(latestOtp);
+      const isLatestOtpActive =
+        latestOtp &&
+        !latestOtp.consumed_at &&
+        Date.parse(latestOtp.expires_at || 0) > Date.now();
+
+      if (isLatestOtpActive && retryAfterSeconds > 0) {
+        return res.status(429).json({
+          error: "Please wait before requesting another code.",
+          retry_after_seconds: retryAfterSeconds,
+        });
+      }
+
+      if (
+        isLatestOtpActive &&
+        Number(latestOtp?.resend_count || 0) + 1 >=
+          QR_CUSTOMER_PHONE_OTP_MAX_SENDS_PER_WINDOW
+      ) {
+        return res.status(429).json({
+          error: "Too many verification requests. Please try again later.",
+          retry_after_seconds: QR_CUSTOMER_PHONE_OTP_WINDOW_SECONDS,
+        });
+      }
+
+      const recentSendCount = await countRecentPhoneOtpRequests({
+        restaurantId,
+        phone,
+        requestIp: getRequesterIp(req),
+        marketplaceCustomerId: marketplaceCustomer?.id || null,
+      });
+      if (recentSendCount >= QR_CUSTOMER_PHONE_OTP_MAX_SENDS_PER_WINDOW) {
+        return res.status(429).json({
+          error: "Too many verification requests. Please try again later.",
+          retry_after_seconds: QR_CUSTOMER_PHONE_OTP_WINDOW_SECONDS,
+        });
+      }
+
+      const code = generatePhoneOtpCode();
+      const salt = generatePhoneOtpSalt();
+      const codeHash = hashPhoneOtpCode(code, salt);
+      const expiresAt = new Date(Date.now() + QR_CUSTOMER_PHONE_OTP_TTL_SECONDS * 1000);
+      const requesterIp = getRequesterIp(req);
+      const userAgent = normalizeText(req.get("user-agent"));
+      const requestLanguage = normalizeLanguage(req.get("accept-language")) || "en";
+
+      let persistedOtpId = null;
+      if (isLatestOtpActive) {
+        const updated = await pool.query(
+          `
+            UPDATE qr_customer_phone_otps
+            SET phone_number = $1,
+                normalized_phone = $2,
+                code_hash = $3,
+                code_salt = $4,
+                expires_at = $5,
+                attempt_count = 0,
+                max_attempts = $6,
+                resend_count = COALESCE(resend_count, 0) + 1,
+                marketplace_customer_id = COALESCE($7, marketplace_customer_id),
+                request_ip = $8,
+                user_agent = $9,
+                last_sent_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $10
+            RETURNING id
+          `,
+          [
+            phone,
+            phone,
+            codeHash,
+            salt,
+            expiresAt,
+            QR_CUSTOMER_PHONE_OTP_MAX_VERIFY_ATTEMPTS,
+            marketplaceCustomer?.id || null,
+            requesterIp || null,
+            userAgent || null,
+            latestOtp.id,
+          ]
+        );
+        persistedOtpId = Number(updated.rows?.[0]?.id || 0) || null;
+      } else {
+        const inserted = await pool.query(
+          `
+            INSERT INTO qr_customer_phone_otps
+              (
+                restaurant_id,
+                marketplace_customer_id,
+                phone_number,
+                normalized_phone,
+                code_hash,
+                code_salt,
+                purpose,
+                expires_at,
+                max_attempts,
+                resend_count,
+                request_ip,
+                user_agent,
+                last_sent_at
+              )
+            VALUES ($1, $2, $3, $4, $5, $6, 'checkout_contact', $7, $8, 0, $9, $10, NOW())
+            RETURNING id
+          `,
+          [
+            restaurantId,
+            marketplaceCustomer?.id || null,
+            phone,
+            phone,
+            codeHash,
+            salt,
+            expiresAt,
+            QR_CUSTOMER_PHONE_OTP_MAX_VERIFY_ATTEMPTS,
+            requesterIp || null,
+            userAgent || null,
+          ]
+        );
+        persistedOtpId = Number(inserted.rows?.[0]?.id || 0) || null;
+      }
+
+      const invalidatePersistedOtp = async () => {
+        if (!persistedOtpId) return;
+        await pool.query(
+          `
+            UPDATE qr_customer_phone_otps
+            SET consumed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+          `,
+          [persistedOtpId]
+        );
+      };
+
+      let smsResult = null;
+      let deliveryChannel = "sms";
+      let fallbackEmail = "";
+      let fallbackEmailMasked = "";
+      let smsSendError = null;
+      let skipSmsAndUseEmailFallback = false;
+
+      if (QR_CUSTOMER_PHONE_OTP_EMAIL_FALLBACK_ENABLED) {
+        fallbackEmail = await resolveOptionalPhoneOtpFallbackEmail(req);
+        if (isValidEmail(fallbackEmail)) {
+          skipSmsAndUseEmailFallback =
+            QR_CUSTOMER_PHONE_OTP_FORCE_EMAIL_FALLBACK ||
+            QR_CUSTOMER_PHONE_OTP_PREFER_EMAIL_FALLBACK;
+        }
+      }
+
+      if (!skipSmsAndUseEmailFallback && !QR_CUSTOMER_PHONE_OTP_FORCE_EMAIL_FALLBACK) {
+        try {
+          smsResult = await sendPhoneOtpSms({
+            phoneNumber: phone,
+            code,
+            ttlSeconds: QR_CUSTOMER_PHONE_OTP_TTL_SECONDS,
+          });
+        } catch (smsErr) {
+          smsSendError = smsErr;
+        }
+      }
+
+      if (!smsResult?.accepted) {
+        if (!QR_CUSTOMER_PHONE_OTP_EMAIL_FALLBACK_ENABLED) {
+          await invalidatePersistedOtp();
+          if (smsSendError) throw smsSendError;
+          throw new Error("SMS provider is unavailable.");
+        }
+
+        if (!isValidEmail(fallbackEmail)) {
+          await invalidatePersistedOtp();
+          if (smsSendError) throw smsSendError;
+          return res.status(503).json({
+            error:
+              "SMS service is unavailable. Please login with an email account to receive OTP via email fallback.",
+          });
+        }
+
+        const { subject, text } = buildPhoneOtpFallbackEmailMessage({
+          code,
+          phone,
+          expiresInMinutes: Math.ceil(QR_CUSTOMER_PHONE_OTP_TTL_SECONDS / 60),
+        });
+
+        try {
+          await sendEmail(fallbackEmail, subject, text, false, {
+            language: requestLanguage,
+          });
+        } catch (mailErr) {
+          await invalidatePersistedOtp();
+          throw mailErr;
+        }
+
+        deliveryChannel = "email_fallback";
+        fallbackEmailMasked = maskEmailAddress(fallbackEmail);
+      }
+
+      const responsePayload = {
+        success: true,
+        sent: true,
+        phone,
+        phone_masked: maskPhoneNumber(phone),
+        delivery_channel: deliveryChannel,
+        retry_after_seconds: QR_CUSTOMER_PHONE_OTP_COOLDOWN_SECONDS,
+        expires_in_seconds: QR_CUSTOMER_PHONE_OTP_TTL_SECONDS,
+      };
+      if (deliveryChannel === "email_fallback") {
+        responsePayload.message = `Verification code sent to ${fallbackEmailMasked}.`;
+        responsePayload.fallback_email_masked = fallbackEmailMasked;
+      }
+      if (process.env.NODE_ENV !== "production" && smsResult?.provider === "mock") {
+        responsePayload.mock_code = String(smsResult?.mock_code || code);
+      }
+      return res.json(responsePayload);
+    } catch (err) {
+      const statusCode = Number(err?.statusCode || 0);
+      if (statusCode >= 400 && statusCode < 500) {
+        return res.status(statusCode).json({
+          error: String(err?.message || "Failed to send verification code."),
+        });
+      }
+      console.error("❌ QR customer phone OTP request failed:", err);
+      return res.status(500).json({ error: "Failed to send verification code." });
+    }
+  }
+);
+
+router.post(
+  "/customer-auth/phone-otp/verify",
+  requirePublicRestaurant,
+  async (req, res) => {
+    const restaurantId = req.restaurantId;
+    const phone = normalizePhoneForVerification(req.body?.phone || req.body?.customer_phone);
+    const code = normalizePhoneOtpCode(req.body?.code);
+
+    if (!/^90\d{10}$/.test(phone) || !code) {
+      return res.status(400).json({ error: "Phone and verification code are required." });
+    }
+
+    try {
+      await ensureMarketplaceCustomerSchema();
+      await ensureQrCustomerPhoneOtpSchema();
+      await ensureQrCustomerAuthSchema();
+
+      const marketplaceCustomer = await resolveOptionalMarketplaceSession(req);
+      const qrSessionCustomer = marketplaceCustomer
+        ? null
+        : await resolveOptionalQrCustomerSession(req);
+      const client = await pool.connect();
+      let localCustomerId = null;
+      let updatedMarketplaceCustomer = marketplaceCustomer || null;
+      let updatedQrCustomer = qrSessionCustomer || null;
+
+      try {
+        await client.query("BEGIN");
+
+        const latestOtp = await getLatestPhoneOtpRecord(restaurantId, phone, client);
+        if (!latestOtp || latestOtp.consumed_at) {
+          await client.query("ROLLBACK");
+          return res.status(401).json({ error: "Invalid or expired verification code." });
+        }
+
+        const expired = Date.parse(latestOtp.expires_at || 0) <= Date.now();
+        if (expired) {
+          await client.query(
+            `
+              UPDATE qr_customer_phone_otps
+              SET consumed_at = NOW(),
+                  updated_at = NOW()
+              WHERE id = $1
+            `,
+            [latestOtp.id]
+          );
+          await client.query("COMMIT");
+          return res.status(400).json({ error: "Verification code has expired." });
+        }
+
+        const attemptCount = Number(latestOtp.attempt_count || 0);
+        const maxAttempts = Number(
+          latestOtp.max_attempts || QR_CUSTOMER_PHONE_OTP_MAX_VERIFY_ATTEMPTS
+        );
+        if (attemptCount >= maxAttempts) {
+          await client.query(
+            `
+              UPDATE qr_customer_phone_otps
+              SET consumed_at = COALESCE(consumed_at, NOW()),
+                  updated_at = NOW()
+              WHERE id = $1
+            `,
+            [latestOtp.id]
+          );
+          await client.query("COMMIT");
+          return res.status(429).json({
+            error: "Too many invalid attempts. Request a new code.",
+          });
+        }
+
+        const candidateHash = hashPhoneOtpCode(code, latestOtp.code_salt);
+        const isValid = timingSafeEqualPhoneOtpHash(candidateHash, latestOtp.code_hash);
+        if (!isValid) {
+          const nextAttempts = attemptCount + 1;
+          const exhausted = nextAttempts >= maxAttempts;
+          await client.query(
+            `
+              UPDATE qr_customer_phone_otps
+              SET attempt_count = $1,
+                  consumed_at = CASE WHEN $2 THEN NOW() ELSE consumed_at END,
+                  updated_at = NOW()
+              WHERE id = $3
+            `,
+            [nextAttempts, exhausted, latestOtp.id]
+          );
+          await client.query("COMMIT");
+          return res.status(exhausted ? 429 : 401).json({
+            error: exhausted
+              ? "Too many invalid attempts. Request a new code."
+              : "Invalid verification code.",
+          });
+        }
+
+        await client.query(
+          `
+            UPDATE qr_customer_phone_otps
+            SET consumed_at = NOW(),
+                attempt_count = $1,
+                updated_at = NOW()
+            WHERE id = $2
+          `,
+          [attemptCount + 1, latestOtp.id]
+        );
+
+        if (marketplaceCustomer?.id) {
+          await markMarketplaceCustomerPhoneVerified(
+            {
+              marketplaceCustomerId: marketplaceCustomer.id,
+              phoneNumber: phone,
+            },
+            client
+          );
+          updatedMarketplaceCustomer = await getMarketplaceCustomerById(
+            marketplaceCustomer.id,
+            client
+          );
+          if (updatedMarketplaceCustomer?.id) {
+            localCustomerId = await ensureRestaurantCustomerForMarketplace(
+              {
+                restaurantId,
+                marketplaceCustomer: updatedMarketplaceCustomer,
+              },
+              client
+            );
+          }
+        } else if (qrSessionCustomer?.id) {
+          const existingPhoneCustomer = await findCustomerByPhoneIdentity(
+            restaurantId,
+            phone,
+            client
+          );
+          if (
+            existingPhoneCustomer?.id &&
+            Number(existingPhoneCustomer.id) !== Number(qrSessionCustomer.id)
+          ) {
+            const conflictError = new Error(
+              "This phone number is already linked to another account."
+            );
+            conflictError.statusCode = 409;
+            conflictError.code = "phone_already_in_use";
+            throw conflictError;
+          }
+
+          const authPhoneOwner = await client.query(
+            `
+              SELECT customer_id
+              FROM qr_customer_auth
+              WHERE restaurant_id = $1
+                AND phone = $2
+              LIMIT 1
+            `,
+            [restaurantId, phone]
+          );
+          const authOwnerCustomerId = Number(authPhoneOwner.rows?.[0]?.customer_id || 0);
+          if (
+            Number.isFinite(authOwnerCustomerId) &&
+            authOwnerCustomerId > 0 &&
+            authOwnerCustomerId !== Number(qrSessionCustomer.id)
+          ) {
+            const conflictError = new Error(
+              "This phone number is already linked to another account."
+            );
+            conflictError.statusCode = 409;
+            conflictError.code = "phone_already_in_use";
+            throw conflictError;
+          }
+
+          await client.query(
+            `
+              UPDATE customers
+              SET
+                phone = $1,
+                phone_verified = TRUE,
+                phone_verified_at = NOW()
+              WHERE restaurant_id = $2 AND id = $3
+            `,
+            [phone, restaurantId, qrSessionCustomer.id]
+          );
+          await client.query(
+            `
+              UPDATE qr_customer_auth
+              SET
+                phone = $1,
+                updated_at = NOW()
+              WHERE restaurant_id = $2 AND customer_id = $3
+            `,
+            [phone, restaurantId, qrSessionCustomer.id]
+          );
+          updatedQrCustomer = await getQrCustomerProfileById(
+            restaurantId,
+            qrSessionCustomer.id,
+            client
+          );
+        }
+
+        await client.query("COMMIT");
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackErr) {
+          console.error("❌ QR customer phone OTP verify rollback failed:", rollbackErr);
+        }
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      const phoneVerificationToken = signPhoneVerificationTrustToken({
+        restaurantId,
+        marketplaceCustomerId: updatedMarketplaceCustomer?.id || null,
+        phoneNumber: phone,
+        trustLevel: "otp_verified",
+      });
+
+      if (updatedMarketplaceCustomer?.id) {
+        const customer = await getRestaurantCustomerProfile(restaurantId, localCustomerId);
+        const token = signMarketplaceCustomerToken({
+          customerId: updatedMarketplaceCustomer.id,
+          email: updatedMarketplaceCustomer.email,
+          phone: updatedMarketplaceCustomer.phone,
+        });
+        return res.json({
+          success: true,
+          verified: true,
+          phone,
+          phone_verification_token: phoneVerificationToken,
+          token,
+          customer,
+          marketplace_user: updatedMarketplaceCustomer,
+        });
+      }
+
+      if (updatedQrCustomer?.id) {
+        return res.json({
+          success: true,
+          verified: true,
+          phone,
+          phone_verification_token: phoneVerificationToken,
+          customer: updatedQrCustomer,
+        });
+      }
+
+      return res.json({
+        success: true,
+        verified: true,
+        phone,
+        phone_verification_token: phoneVerificationToken,
+      });
+    } catch (err) {
+      const statusCode = Number(err?.statusCode || 0);
+      if (statusCode >= 400 && statusCode < 500) {
+        const responsePayload = {
+          error: String(err?.message || "Failed to verify code."),
+        };
+        if (err?.code) responsePayload.code = String(err.code);
+        return res.status(statusCode).json(responsePayload);
+      }
+      console.error("❌ QR customer phone OTP verify failed:", err);
+      return res.status(500).json({ error: "Failed to verify code." });
+    }
+  }
+);
+
+router.get(
+  "/customer-auth/phone-verification-status",
+  requirePublicRestaurant,
+  async (req, res) => {
+    const restaurantId = req.restaurantId;
+    let phone = normalizePhoneForVerification(req.query?.phone || req.body?.phone);
+
+    try {
+      await ensureMarketplaceCustomerSchema();
+      const marketplaceCustomer = await resolveOptionalMarketplaceSession(req);
+      if (!phone && marketplaceCustomer?.phone) {
+        phone = normalizePhoneForVerification(marketplaceCustomer.phone);
+      }
+      if (!/^90\d{10}$/.test(phone)) {
+        return res.status(400).json({ error: "A valid phone number is required." });
+      }
+
+      const accountVerified = isVerifiedMarketplacePhone(marketplaceCustomer, phone);
+      let verified = accountVerified;
+      let source = accountVerified ? "marketplace_account" : "none";
+      let trustedToken = "";
+
+      if (accountVerified) {
+        trustedToken = signPhoneVerificationTrustToken({
+          restaurantId,
+          marketplaceCustomerId: marketplaceCustomer?.id || null,
+          phoneNumber: phone,
+          trustLevel: "account_verified",
+        });
+      } else {
+        const incomingToken = extractPhoneVerificationTokenFromRequest(req);
+        if (incomingToken) {
+          try {
+            const decoded = verifyPhoneVerificationTrustToken(incomingToken);
+            const tokenPhone = normalizePhoneForVerification(decoded?.phone);
+            const tokenRestaurantId = Number(decoded?.restaurant_id || 0);
+            const tokenMarketplaceCustomerId = Number(decoded?.marketplace_customer_id || 0);
+            const restaurantMatches =
+              !Number.isFinite(tokenRestaurantId) ||
+              tokenRestaurantId <= 0 ||
+              tokenRestaurantId === Number(restaurantId);
+            const accountMatches =
+              !marketplaceCustomer?.id ||
+              (Number.isFinite(tokenMarketplaceCustomerId) &&
+                tokenMarketplaceCustomerId > 0 &&
+                tokenMarketplaceCustomerId === Number(marketplaceCustomer.id));
+            if (restaurantMatches && accountMatches && tokenPhone === phone) {
+              verified = true;
+              source = "otp_token";
+              trustedToken = incomingToken;
+            }
+          } catch {
+            // Ignore invalid token and return non-verified status.
+          }
+        }
+      }
+
+      return res.json({
+        success: true,
+        phone,
+        verified,
+        source,
+        phone_verification_token: trustedToken || null,
+        marketplace_phone_verified: marketplaceCustomer?.phone_verified === true,
+        marketplace_phone_verified_at: marketplaceCustomer?.phone_verified_at || null,
+      });
+    } catch (err) {
+      console.error("❌ QR customer phone verification status failed:", err);
+      return res.status(500).json({ error: "Failed to load phone verification status." });
+    }
+  }
+);
+
+router.patch(
+  "/customer-auth/phone-number",
+  requirePublicRestaurant,
+  requireQrCustomerSession,
+  async (req, res) => {
+    const restaurantId = req.restaurantId;
+    const currentCustomer = req.qrCustomer;
+    const nextPhone = normalizePhoneForVerification(req.body?.phone || req.body?.customer_phone);
+    if (!/^90\d{10}$/.test(nextPhone)) {
+      return res.status(400).json({ error: "A valid phone number is required." });
+    }
+
+    if (req.marketplaceCustomer?.id) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const updatedMarketplaceCustomer = await updateMarketplaceCustomerProfile(
+          req.marketplaceCustomer.id,
+          {
+            name: req.marketplaceCustomer.full_name || req.marketplaceCustomer.name,
+            phone: nextPhone,
+            email: req.marketplaceCustomer.email || null,
+            address: req.marketplaceCustomer.address || null,
+            language: req.marketplaceCustomer.language || null,
+          },
+          client
+        );
+        const localCustomerId = await ensureRestaurantCustomerForMarketplace(
+          {
+            restaurantId,
+            marketplaceCustomer: updatedMarketplaceCustomer,
+          },
+          client
+        );
+        await client.query("COMMIT");
+
+        const customer = await getRestaurantCustomerProfile(restaurantId, localCustomerId);
+        const token = signMarketplaceCustomerToken({
+          customerId: updatedMarketplaceCustomer.id,
+          email: updatedMarketplaceCustomer.email,
+          phone: updatedMarketplaceCustomer.phone,
+        });
+        return res.json({
+          success: true,
+          phone_verification_required: updatedMarketplaceCustomer?.phone_verified !== true,
+          token,
+          customer,
+          marketplace_user: updatedMarketplaceCustomer,
+        });
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackErr) {
+          console.error("❌ QR customer phone update rollback failed:", rollbackErr);
+        }
+        const statusCode = Number(err?.statusCode || 0);
+        if (statusCode >= 400 && statusCode < 500) {
+          return res.status(statusCode).json({
+            error: String(err?.message || "Failed to update phone number"),
+          });
+        }
+        console.error("❌ QR customer phone update failed:", err);
+        return res.status(500).json({ error: "Failed to update phone number" });
+      } finally {
+        client.release();
+      }
+    }
+
+    if (!currentCustomer?.id) {
+      return res.status(401).json({ error: "Customer session required" });
+    }
+
+    try {
+      await ensureQrCustomerAuthSchema();
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          `
+            UPDATE customers
+            SET phone = $1,
+                phone_verified = FALSE,
+                phone_verified_at = NULL
+            WHERE restaurant_id = $2 AND id = $3
+          `,
+          [nextPhone, restaurantId, currentCustomer.id]
+        );
+        await client.query(
+          `
+            UPDATE qr_customer_auth
+            SET phone = $1,
+                updated_at = NOW()
+            WHERE restaurant_id = $2 AND customer_id = $3
+          `,
+          [nextPhone, restaurantId, currentCustomer.id]
+        );
+        await client.query("COMMIT");
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackErr) {
+          console.error("❌ QR customer local phone update rollback failed:", rollbackErr);
+        }
+        throw err;
+      } finally {
+        client.release();
+      }
+      const customer = await getQrCustomerProfileById(restaurantId, currentCustomer.id);
+      return res.json({
+        success: true,
+        phone_verification_required: true,
+        customer,
+      });
+    } catch (err) {
+      console.error("❌ QR customer local phone update failed:", err);
+      return res.status(500).json({ error: "Failed to update phone number" });
+    }
+  }
+);
+
 router.post("/customer-auth/register", requirePublicRestaurant, async (req, res) => {
   const restaurantId = req.restaurantId;
   try {
@@ -1946,6 +2814,8 @@ router.patch(
       req.body?.language === undefined
         ? normalizeLanguage(currentCustomer?.language)
         : normalizeLanguage(req.body?.language);
+    const previousPhone = normalizePhone(currentCustomer?.phone);
+    const phoneChanged = Boolean(nextPhone && previousPhone && nextPhone !== previousPhone);
 
     if (!currentCustomer?.id) {
       return res.status(401).json({ error: "Customer session required" });
@@ -2052,10 +2922,20 @@ router.patch(
           SET name = $1,
               phone = $2,
               email = $3,
-              address = $4
+              address = $4,
+              phone_verified = CASE WHEN $7 THEN FALSE ELSE phone_verified END,
+              phone_verified_at = CASE WHEN $7 THEN NULL ELSE phone_verified_at END
           WHERE restaurant_id = $5 AND id = $6
         `,
-        [nextName, nextPhone, nextEmail, nextAddress, restaurantId, currentCustomer.id]
+        [
+          nextName,
+          nextPhone,
+          nextEmail,
+          nextAddress,
+          restaurantId,
+          currentCustomer.id,
+          phoneChanged,
+        ]
       );
 
       await client.query(

@@ -64,6 +64,26 @@ async function ensureMarketplaceCustomerSchema() {
         ON marketplace_customers ((LOWER(TRIM(COALESCE(email, '')))))
         WHERE COALESCE(email, '') <> ''
       `);
+
+      await pool.query(`
+        ALTER TABLE marketplace_customers
+        ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN NOT NULL DEFAULT FALSE
+      `);
+
+      await pool.query(`
+        ALTER TABLE marketplace_customers
+        ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMPTZ
+      `);
+
+      await pool.query(`
+        ALTER TABLE customers
+        ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN NOT NULL DEFAULT FALSE
+      `);
+
+      await pool.query(`
+        ALTER TABLE customers
+        ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMPTZ
+      `);
     })().catch((error) => {
       marketplaceCustomerSchemaPromise = null;
       throw error;
@@ -83,6 +103,8 @@ function toPublicMarketplaceCustomer(row) {
     phone: normalizePhone(row.phone),
     email: normalizeEmail(row.email) || "",
     address: normalizeText(row.address),
+    phone_verified: row.phone_verified === true,
+    phone_verified_at: row.phone_verified_at || null,
     language: normalizeLanguage(row.language),
     created_at: row.created_at || null,
     updated_at: row.updated_at || null,
@@ -104,6 +126,8 @@ async function getMarketplaceCustomerById(customerId, runner = pool) {
         phone,
         email,
         address,
+        phone_verified,
+        phone_verified_at,
         language,
         created_at,
         updated_at
@@ -132,6 +156,8 @@ async function getMarketplaceCustomerByEmail(email, runner = pool) {
         phone,
         email,
         address,
+        phone_verified,
+        phone_verified_at,
         language,
         created_at,
         updated_at
@@ -166,6 +192,8 @@ async function findMarketplaceCustomerForLogin(login, runner = pool) {
         email,
         address,
         password_hash,
+        phone_verified,
+        phone_verified_at,
         language,
         created_at,
         updated_at
@@ -237,6 +265,8 @@ async function registerMarketplaceCustomer(payload = {}, runner = pool) {
         phone,
         email,
         address,
+        phone_verified,
+        phone_verified_at,
         language,
         created_at,
         updated_at
@@ -283,6 +313,8 @@ async function updateMarketplaceCustomerProfile(customerId, payload = {}, runner
 
   const fullName = normalizeText(payload.name || payload.full_name || payload.username || existing.full_name);
   const phone = normalizePhone(payload.phone || existing.phone);
+  const previousPhone = normalizePhone(existing.phone);
+  const phoneChanged = phone !== previousPhone;
   const email =
     payload.email === undefined
       ? normalizeEmail(existing.email) || null
@@ -326,6 +358,8 @@ async function updateMarketplaceCustomerProfile(customerId, payload = {}, runner
           email = $3,
           address = $4,
           language = $5,
+          phone_verified = CASE WHEN $7 THEN FALSE ELSE phone_verified END,
+          phone_verified_at = CASE WHEN $7 THEN NULL ELSE phone_verified_at END,
           updated_at = NOW()
       WHERE id = $6
       RETURNING
@@ -334,11 +368,13 @@ async function updateMarketplaceCustomerProfile(customerId, payload = {}, runner
         phone,
         email,
         address,
+        phone_verified,
+        phone_verified_at,
         language,
         created_at,
         updated_at
     `,
-    [fullName, phone, email, address, language, existing.id]
+    [fullName, phone, email, address, language, existing.id, phoneChanged]
   );
 
   return toPublicMarketplaceCustomer(rows[0] || null);
@@ -401,6 +437,7 @@ async function getRestaurantCustomerProfile(restaurantId, customerId, runner = p
   const { rows } = await runner.query(
     `
       SELECT id, restaurant_id, name, phone, address, birthday, email
+      , phone_verified, phone_verified_at
       FROM customers
       WHERE restaurant_id = $1 AND id = $2
       LIMIT 1
@@ -447,6 +484,8 @@ async function ensureRestaurantCustomerForMarketplace(
   const customerPhone = normalizePhone(customer.phone);
   const customerEmail = normalizeEmail(customer.email) || null;
   const customerAddress = normalizeText(customer.address) || null;
+  const customerPhoneVerified = customer.phone_verified === true;
+  const customerPhoneVerifiedAt = customer.phone_verified_at || null;
 
   if (!customerPhone) {
     throw createHttpError(400, "Marketplace customer phone is required");
@@ -476,19 +515,46 @@ async function ensureRestaurantCustomerForMarketplace(
         SET name = $1,
             phone = $2,
             email = $3,
-            address = COALESCE($4, address)
-        WHERE restaurant_id = $5 AND id = $6
+            address = COALESCE($4, address),
+            phone_verified = $5,
+            phone_verified_at = $6
+        WHERE restaurant_id = $7 AND id = $8
       `,
-      [customerName, customerPhone, customerEmail, customerAddress, parsedRestaurantId, localCustomerId]
+      [
+        customerName,
+        customerPhone,
+        customerEmail,
+        customerAddress,
+        customerPhoneVerified,
+        customerPhoneVerifiedAt,
+        parsedRestaurantId,
+        localCustomerId,
+      ]
     );
   } else {
     const inserted = await runner.query(
       `
-        INSERT INTO customers (restaurant_id, name, phone, email, address)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO customers (
+          restaurant_id,
+          name,
+          phone,
+          email,
+          address,
+          phone_verified,
+          phone_verified_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id
       `,
-      [parsedRestaurantId, customerName, customerPhone, customerEmail, customerAddress]
+      [
+        parsedRestaurantId,
+        customerName,
+        customerPhone,
+        customerEmail,
+        customerAddress,
+        customerPhoneVerified,
+        customerPhoneVerifiedAt,
+      ]
     );
     localCustomerId = Number(inserted.rows?.[0]?.id || 0);
   }

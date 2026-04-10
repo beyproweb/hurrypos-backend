@@ -770,7 +770,16 @@ async function loadPublicReservationAvailabilityContext(restaurantId) {
       FROM orders
       WHERE restaurant_id = $1
         AND table_number IS NOT NULL
-        AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled', 'deleted', 'void')
+        AND LOWER(COALESCE(status, '')) NOT IN (
+          'checked_out',
+          'closed',
+          'completed',
+          'cancelled',
+          'canceled',
+          'deleted',
+          'void',
+          'archived'
+        )
         AND (
           slot_start_datetime IS NOT NULL
           OR reservation_date IS NOT NULL
@@ -2356,6 +2365,10 @@ router.get("/tables/:identifier", async (req, res) => {
 
 router.get("/floor-plan/:identifier", async (req, res) => {
   try {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("Surrogate-Control", "no-store");
     const identifier = String(req.params.identifier || "").trim();
     if (!identifier) {
       return res.json({ success: true, layout: null, table_states: [], source: "generated" });
@@ -2453,6 +2466,10 @@ router.get("/floor-plan/:identifier", async (req, res) => {
 // 🔹 Public unavailable table numbers (occupied or reserved)
 router.get("/unavailable-tables/:identifier", async (req, res) => {
   try {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("Surrogate-Control", "no-store");
     const identifier = (req.params.identifier || "").trim();
     if (!identifier) return res.json({ table_numbers: [], reserved_table_numbers: [] });
     const requestedDateRaw = String(req.query?.date || "").trim();
@@ -2602,11 +2619,21 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
              status,
              order_type,
              reservation_date,
-             reservation_time
+             reservation_time,
+             slot_start_datetime
       FROM orders
       WHERE restaurant_id = $1
         AND table_number IS NOT NULL
-        AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
+        AND LOWER(COALESCE(status, '')) NOT IN (
+          'checked_out',
+          'closed',
+          'completed',
+          'cancelled',
+          'canceled',
+          'deleted',
+          'void',
+          'archived'
+        )
       ORDER BY table_number ASC
       `,
       [restaurantId]
@@ -2632,6 +2659,7 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
                cb.booking_type,
                cb.payment_status,
                cb.booking_status,
+               cb.slot_start_datetime,
                cb.updated_at,
                cb.created_at,
                cb.id,
@@ -2651,16 +2679,35 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
              booking_type,
              payment_status,
              booking_status,
+             slot_start_datetime,
              reservation_order_status,
              reservation_date,
              reservation_time
       FROM latest_concert_booking_per_table
       WHERE LOWER(COALESCE(booking_type, '')) = 'table'
         AND LOWER(COALESCE(payment_status, '')) IN ('pending_bank_transfer', 'confirmed')
-        AND LOWER(COALESCE(booking_status, '')) <> 'cancelled'
+        AND LOWER(COALESCE(booking_status, '')) NOT IN (
+          'checked_out',
+          'closed',
+          'completed',
+          'cancelled',
+          'canceled',
+          'deleted',
+          'void',
+          'archived'
+        )
         AND (
           reservation_order_status IS NULL
-          OR LOWER(COALESCE(reservation_order_status, '')) NOT IN ('closed', 'completed', 'cancelled', 'canceled')
+          OR LOWER(COALESCE(reservation_order_status, '')) NOT IN (
+            'checked_out',
+            'closed',
+            'completed',
+            'cancelled',
+            'canceled',
+            'deleted',
+            'void',
+            'archived'
+          )
         )
       ORDER BY table_number ASC
       `,
@@ -2673,6 +2720,7 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
       return (
         status === "reserved" ||
         orderType === "reservation" ||
+        row?.slot_start_datetime != null ||
         row?.reservation_date != null ||
         row?.reservation_time != null
       );
@@ -2680,7 +2728,10 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
 
     const targetDateYmd = requestedDateYmd || currentLocalYmd();
     const isScheduledForToday = (row) => {
-      const bookingDate = normalizeYmd(row?.reservation_date);
+      const bookingDate = normalizeYmd(
+        row?.reservation_date ??
+          row?.slot_start_datetime
+      );
       if (!bookingDate) return true;
       return bookingDate === targetDateYmd;
     };

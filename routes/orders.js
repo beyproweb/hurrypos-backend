@@ -75,6 +75,10 @@ module.exports = function(io) {
     getMarketplaceCustomerById,
     verifyCustomerAuthToken,
   } = require("../utils/marketplaceCustomerAuth");
+  const {
+    assertCheckoutPhoneVerification,
+    normalizePhoneVerificationToken,
+  } = require("../utils/customerPhoneVerification");
   const { normalizeTrPhoneForApi, buildTrPhoneCandidates } = require("../utils/phone");
   const DEFAULT_TZ = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
 
@@ -409,6 +413,13 @@ module.exports = function(io) {
     if (normalizedOrderType === "takeaway") return "qr_menu_pickup";
     if (["table", "reservation"].includes(normalizedOrderType)) return "qr_menu_table";
     return "qr_menu";
+  };
+
+  const requiresVerifiedPhoneForOrderType = (orderType) => {
+    const normalizedOrderType = String(orderType || "").trim().toLowerCase();
+    return ["packet", "phone", "takeaway", "delivery", "online"].includes(
+      normalizedOrderType
+    );
   };
 
   const isQrDeliveryOrder = (order = {}) =>
@@ -3007,13 +3018,19 @@ router.post("/", async (req, res) => {
         customer_name ||
         ""
     ).trim() || null;
-    const effectiveCustomerPhone =
-      normalizeCustomerPhone(marketplaceCustomer?.phone) ||
-      normalizeCustomerPhone(customer_phone) ||
-      null;
+    const requestedCustomerPhone = normalizeCustomerPhone(customer_phone) || null;
+    const marketplaceCustomerPhone =
+      normalizeCustomerPhone(marketplaceCustomer?.phone) || null;
+    const effectiveCustomerPhone = requestedCustomerPhone || marketplaceCustomerPhone || null;
     const effectiveCustomerAddress = String(
       marketplaceCustomer?.address || customer_address || ""
     ).trim() || null;
+    const phoneVerificationToken = normalizePhoneVerificationToken(
+      req.body?.phone_verification_token ||
+        req.body?.phoneVerificationToken ||
+        req.headers?.["x-phone-verification-token"] ||
+        ""
+    );
     const hasReservationClientsInPayload =
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservation_clients") ||
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservationClients");
@@ -3033,6 +3050,32 @@ router.post("/", async (req, res) => {
           return res.status(400).json({ error: "Invalid reservation_clients" });
         }
         reservationClientsValue = Math.trunc(parsedReservationClients);
+      }
+    }
+
+    if (requiresVerifiedPhoneForOrderType(order_type)) {
+      if (!effectiveCustomerPhone) {
+        return res.status(400).json({
+          error: "Valid phone number is required for this checkout flow.",
+          code: "invalid_phone",
+        });
+      }
+
+      const phoneVerificationResult = assertCheckoutPhoneVerification({
+        restaurantId,
+        phoneNumber: effectiveCustomerPhone,
+        marketplaceCustomer,
+        phoneVerificationToken,
+      });
+      if (!phoneVerificationResult?.ok) {
+        return res.status(Number(phoneVerificationResult?.statusCode || 403)).json({
+          error:
+            String(phoneVerificationResult?.message || "").trim() ||
+            "Phone verification is required before checkout.",
+          code:
+            String(phoneVerificationResult?.code || "").trim() ||
+            "phone_verification_required",
+        });
       }
     }
 

@@ -22,6 +22,42 @@ const {
   queueConcertBookingQrEmailJob,
   scheduleBackgroundTask,
 } = require("../utils/bookingQrAsync");
+const {
+  MARKETPLACE_CUSTOMER_SCOPE,
+  ensureMarketplaceCustomerSchema,
+  getMarketplaceCustomerById,
+  verifyCustomerAuthToken,
+} = require("../utils/marketplaceCustomerAuth");
+const {
+  assertCheckoutPhoneVerification,
+  normalizePhoneForVerification,
+  normalizePhoneVerificationToken,
+} = require("../utils/customerPhoneVerification");
+
+function normalizeText(value) {
+  return String(value || "").trim();
+}
+
+function getBearerToken(req) {
+  const authHeader = normalizeText(req.headers?.authorization);
+  if (!authHeader.toLowerCase().startsWith("bearer ")) return "";
+  return normalizeText(authHeader.slice(7));
+}
+
+async function resolveOptionalMarketplaceSession(req) {
+  try {
+    await ensureMarketplaceCustomerSchema();
+    const token = getBearerToken(req);
+    if (!token) return null;
+    const decoded = verifyCustomerAuthToken(token);
+    const scope = String(decoded?.scope || "").toLowerCase();
+    if (scope !== MARKETPLACE_CUSTOMER_SCOPE || !decoded?.customer_id) return null;
+    const marketplaceCustomer = await getMarketplaceCustomerById(decoded.customer_id);
+    return marketplaceCustomer?.id ? marketplaceCustomer : null;
+  } catch {
+    return null;
+  }
+}
 
 router.get("/:identifier/events", async (req, res) => {
   const identifier = String(req.params.identifier || "").trim();
@@ -237,7 +273,43 @@ router.post("/:identifier/events/:eventId/bookings", async (req, res) => {
       return res.status(404).json({ error: "Restaurant not found" });
     }
 
-    const result = await createBooking(pool, restaurantId, eventId, req.body || {});
+    const customerPhone = normalizePhoneForVerification(
+      req.body?.customer_phone || req.body?.phone || ""
+    );
+    if (!/^90\d{10}$/.test(customerPhone)) {
+      return res.status(400).json({
+        error: "Valid phone number is required for concert booking.",
+        code: "invalid_phone",
+      });
+    }
+    const marketplaceCustomer = await resolveOptionalMarketplaceSession(req);
+    const phoneVerificationResult = assertCheckoutPhoneVerification({
+      restaurantId,
+      phoneNumber: customerPhone,
+      marketplaceCustomer,
+      phoneVerificationToken: normalizePhoneVerificationToken(
+        req.body?.phone_verification_token ||
+          req.body?.phoneVerificationToken ||
+          req.headers?.["x-phone-verification-token"] ||
+          ""
+      ),
+    });
+    if (!phoneVerificationResult?.ok) {
+      return res.status(Number(phoneVerificationResult?.statusCode || 403)).json({
+        error:
+          String(phoneVerificationResult?.message || "").trim() ||
+          "Phone verification is required before booking.",
+        code:
+          String(phoneVerificationResult?.code || "").trim() ||
+          "phone_verification_required",
+      });
+    }
+
+    const bookingPayload = {
+      ...(req.body || {}),
+      customer_phone: customerPhone,
+    };
+    const result = await createBooking(pool, restaurantId, eventId, bookingPayload);
     if (result.status >= 400) {
       return res.status(result.status).json({ error: result.error });
     }
