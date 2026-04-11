@@ -20,6 +20,7 @@ const GUEST_COMPOSITION_RESTRICTION_RULES = new Set([
   "couple_only",
   "custom_rule_later",
 ]);
+const CONCERTS_TIMEZONE = process.env.REPORTS_TIMEZONE || "Europe/Istanbul";
 const {
   loadBookingSlotSettings,
   computeConcertSlot,
@@ -1003,8 +1004,14 @@ async function listEvents(client, restaurantId, { includeHidden = true, upcoming
     conditions.push(`LOWER(COALESCE(status, '')) <> 'hidden'`);
   }
   if (upcomingOnly) {
+    params.push(CONCERTS_TIMEZONE);
+    const timezoneParam = `$${params.length}`;
     conditions.push(
-      `(event_date > CURRENT_DATE OR (event_date = CURRENT_DATE AND event_time >= (CURRENT_TIME - INTERVAL '6 hours')))`,
+      `(event_date > ((NOW() AT TIME ZONE ${timezoneParam})::date)
+        OR (
+          event_date = ((NOW() AT TIME ZONE ${timezoneParam})::date)
+          AND event_time >= (((NOW() AT TIME ZONE ${timezoneParam})::time) - INTERVAL '6 hours')
+        ))`,
     );
   }
 
