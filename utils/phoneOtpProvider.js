@@ -7,6 +7,18 @@ function normalizeText(value) {
   return String(value || "").trim();
 }
 
+function normalizeOtpLanguage(value) {
+  const raw = normalizeText(value).toLowerCase().split(",")[0];
+  const base = raw.split("-")[0];
+  if (["tr", "en", "de", "fr"].includes(base)) return base;
+  return "en";
+}
+
+function normalizeOtpBrandName(value) {
+  const normalized = normalizeText(value).replace(/\s+/g, " ");
+  return normalized ? normalized.slice(0, 48) : "Restaurant";
+}
+
 function shouldUseNetgsmProvider() {
   const explicitProvider = normalizeText(process.env.QR_PHONE_OTP_PROVIDER).toLowerCase();
   if (explicitProvider) {
@@ -15,16 +27,27 @@ function shouldUseNetgsmProvider() {
   return process.env.NODE_ENV === "production";
 }
 
-function resolveOtpMessageTemplate() {
+function resolveOtpMessageTemplate(language) {
   const configuredTemplate = normalizeText(process.env.QR_PHONE_OTP_MESSAGE_TEMPLATE);
   if (configuredTemplate) return configuredTemplate;
-  return "Beypro dogrulama kodunuz: {{code}}. Kod {{minutes}} dakika gecerlidir.";
+
+  switch (normalizeOtpLanguage(language)) {
+    case "tr":
+      return "{{brand_name}} doğrulama kodunuz: {{code}}. Kod {{minutes}} dakika geçerlidir.";
+    case "de":
+      return "Ihr {{brand_name}}-Bestätigungscode lautet: {{code}}. Dieser Code ist {{minutes}} Minuten gültig.";
+    case "fr":
+      return "Votre code de vérification {{brand_name}} est : {{code}}. Ce code expire dans {{minutes}} minutes.";
+    default:
+      return "Your {{brand_name}} verification code is: {{code}}. This code expires in {{minutes}} minutes.";
+  }
 }
 
-function buildOtpMessage({ code, ttlSeconds }) {
+function buildOtpMessage({ code, ttlSeconds, language = "en", brandName = "" }) {
   const minutes = Math.max(1, Math.ceil(Number(ttlSeconds || 0) / 60));
-  const template = resolveOtpMessageTemplate();
+  const template = resolveOtpMessageTemplate(language);
   return template
+    .replace(/\{\{\s*brand_name\s*\}\}/gi, normalizeOtpBrandName(brandName))
     .replace(/\{\{\s*code\s*\}\}/gi, String(code))
     .replace(/\{\{\s*minutes\s*\}\}/gi, String(minutes));
 }
@@ -88,7 +111,7 @@ async function sendViaMock({ code }) {
   };
 }
 
-async function sendPhoneOtpSms({ phoneNumber, code, ttlSeconds }) {
+async function sendPhoneOtpSms({ phoneNumber, code, ttlSeconds, language = "en", brandName = "" }) {
   const normalizedPhone = normalizePhoneForVerification(phoneNumber);
   if (!normalizedPhone) {
     throw createHttpError(400, "Valid phone number is required", "invalid_phone");
@@ -101,6 +124,8 @@ async function sendPhoneOtpSms({ phoneNumber, code, ttlSeconds }) {
   const message = buildOtpMessage({
     code: normalizedCode,
     ttlSeconds,
+    language,
+    brandName,
   });
 
   if (shouldUseNetgsmProvider()) {

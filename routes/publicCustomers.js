@@ -306,11 +306,20 @@ function buildPhoneOtpFallbackEmailMessage({
   code,
   phone,
   expiresInMinutes = 5,
+  language = "en",
+  brandName = "Restaurant",
 }) {
-  const subject = "Your Beypro phone verification code";
+  const normalizedLanguage = ["tr", "en", "de", "fr"].includes(
+    String(normalizeLanguage(language) || "").toLowerCase().split("-")[0]
+  )
+    ? String(normalizeLanguage(language) || "").toLowerCase().split("-")[0]
+    : "en";
+  const resolvedBrandName = normalizeText(brandName).replace(/\s+/g, " ") || "Restaurant";
   const maskedPhone = maskPhoneNumber(phone);
-  const text = [
-    "Your Beypro phone verification code is:",
+
+  let subject = `Your ${resolvedBrandName} phone verification code`;
+  let text = [
+    `Your ${resolvedBrandName} phone verification code is:`,
     "",
     code,
     "",
@@ -318,7 +327,105 @@ function buildPhoneOtpFallbackEmailMessage({
     `This code expires in ${expiresInMinutes} minutes.`,
     "If you did not request this code, you can ignore this email.",
   ].join("\n");
+
+  if (normalizedLanguage === "tr") {
+    subject = `${resolvedBrandName} telefon doğrulama kodunuz`;
+    text = [
+      `${resolvedBrandName} telefon doğrulama kodunuz:`,
+      "",
+      code,
+      "",
+      `Telefon: ${maskedPhone || phone}`,
+      `Bu kod ${expiresInMinutes} dakika içinde sona erer.`,
+      "Bu kodu siz talep etmediyseniz bu e-postayı yok sayabilirsiniz.",
+    ].join("\n");
+  } else if (normalizedLanguage === "de") {
+    subject = `Ihr ${resolvedBrandName}-Bestätigungscode`;
+    text = [
+      `Ihr ${resolvedBrandName}-Bestätigungscode lautet:`,
+      "",
+      code,
+      "",
+      `Telefon: ${maskedPhone || phone}`,
+      `Dieser Code läuft in ${expiresInMinutes} Minuten ab.`,
+      "Falls Sie diesen Code nicht angefordert haben, können Sie diese E-Mail ignorieren.",
+    ].join("\n");
+  } else if (normalizedLanguage === "fr") {
+    subject = `Votre code de vérification ${resolvedBrandName}`;
+    text = [
+      `Votre code de vérification ${resolvedBrandName} est :`,
+      "",
+      code,
+      "",
+      `Téléphone : ${maskedPhone || phone}`,
+      `Ce code expire dans ${expiresInMinutes} minutes.`,
+      "Si vous n'avez pas demandé ce code, vous pouvez ignorer cet e-mail.",
+    ].join("\n");
+  }
+
   return { subject, text };
+}
+
+function buildPhoneOtpFallbackDeliveryMessage({ maskedEmail, language = "en" }) {
+  const normalizedLanguage = ["tr", "en", "de", "fr"].includes(
+    String(normalizeLanguage(language) || "").toLowerCase().split("-")[0]
+  )
+    ? String(normalizeLanguage(language) || "").toLowerCase().split("-")[0]
+    : "en";
+
+  if (normalizedLanguage === "tr") {
+    return `${maskedEmail} adresine doğrulama kodu gönderildi.`;
+  }
+  if (normalizedLanguage === "de") {
+    return `Der Bestätigungscode wurde an ${maskedEmail} gesendet.`;
+  }
+  if (normalizedLanguage === "fr") {
+    return `Le code de vérification a été envoyé à ${maskedEmail}.`;
+  }
+  return `Verification code sent to ${maskedEmail}.`;
+}
+
+function parsePhoneOtpBrandingCustomization(row) {
+  if (row?.qr_menu_customization && typeof row.qr_menu_customization === "object") {
+    return row.qr_menu_customization;
+  }
+
+  const rawValue = normalizeText(row?.value);
+  if (!rawValue) return null;
+
+  try {
+    const parsed = JSON.parse(rawValue);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolvePhoneOtpBrandName(restaurantId) {
+  const { rows } = await pool.query(
+    `
+      SELECT
+        r.name AS restaurant_name,
+        s.qr_menu_customization,
+        s.value
+      FROM restaurants r
+      LEFT JOIN settings s
+        ON s.restaurant_id = r.id
+       AND s.key = 'qr-menu-customization'
+      WHERE r.id = $1
+      LIMIT 1
+    `,
+    [restaurantId]
+  );
+
+  const row = rows[0] || null;
+  const customization = parsePhoneOtpBrandingCustomization(row);
+  return (
+    normalizeText(customization?.app_display_name) ||
+    normalizeText(row?.restaurant_name) ||
+    normalizeText(customization?.main_title) ||
+    "Restaurant"
+  );
 }
 
 function normalizeOAuthProvider(value) {
@@ -2065,7 +2172,10 @@ router.post(
       const expiresAt = new Date(Date.now() + QR_CUSTOMER_PHONE_OTP_TTL_SECONDS * 1000);
       const requesterIp = getRequesterIp(req);
       const userAgent = normalizeText(req.get("user-agent"));
-      const requestLanguage = normalizeLanguage(req.get("accept-language")) || "en";
+      const requestLanguage =
+        normalizeLanguage(req.body?.language || req.body?.lang || req.get("accept-language")) ||
+        "en";
+      const brandName = await resolvePhoneOtpBrandName(restaurantId);
 
       let persistedOtpId = null;
       if (isLatestOtpActive) {
@@ -2175,6 +2285,8 @@ router.post(
             phoneNumber: phone,
             code,
             ttlSeconds: QR_CUSTOMER_PHONE_OTP_TTL_SECONDS,
+            language: requestLanguage,
+            brandName,
           });
         } catch (smsErr) {
           smsSendError = smsErr;
@@ -2201,11 +2313,14 @@ router.post(
           code,
           phone,
           expiresInMinutes: Math.ceil(QR_CUSTOMER_PHONE_OTP_TTL_SECONDS / 60),
+          language: requestLanguage,
+          brandName,
         });
 
         try {
           await sendEmail(fallbackEmail, subject, text, false, {
             language: requestLanguage,
+            fromName: brandName,
           });
         } catch (mailErr) {
           await invalidatePersistedOtp();
@@ -2226,7 +2341,10 @@ router.post(
         expires_in_seconds: QR_CUSTOMER_PHONE_OTP_TTL_SECONDS,
       };
       if (deliveryChannel === "email_fallback") {
-        responsePayload.message = `Verification code sent to ${fallbackEmailMasked}.`;
+        responsePayload.message = buildPhoneOtpFallbackDeliveryMessage({
+          maskedEmail: fallbackEmailMasked,
+          language: requestLanguage,
+        });
         responsePayload.fallback_email_masked = fallbackEmailMasked;
       }
       if (process.env.NODE_ENV !== "production" && smsResult?.provider === "mock") {
