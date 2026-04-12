@@ -31,6 +31,35 @@ const {
 const CALL_WAITER_COOLDOWN_MS = 15000;
 const callWaiterRateLimit = new Map();
 
+function normalizeWaiterRequestType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return null;
+  if (
+    normalized === "bill" ||
+    normalized === "account" ||
+    normalized === "check" ||
+    normalized === "invoice" ||
+    normalized === "hesap" ||
+    normalized === "addition" ||
+    normalized === "rechnung" ||
+    normalized === "adisyon"
+  ) {
+    return "bill";
+  }
+  if (
+    normalized === "reorder" ||
+    normalized === "re-order" ||
+    normalized === "repeat" ||
+    normalized === "again" ||
+    normalized === "tekrar" ||
+    normalized === "nachbestellen" ||
+    normalized === "recommander"
+  ) {
+    return "reorder";
+  }
+  return null;
+}
+
 const QR_BRANDING_DEFAULTS = {
   app_icon: "",
   app_icon_192: "",
@@ -1167,6 +1196,16 @@ router.post("/call-waiter/:identifier", async (req, res) => {
     const tableNumber = Number(req.body?.table_number ?? req.body?.tableNumber);
     const note = String(req.body?.note || "").trim();
     const requestedSource = String(req.body?.source || "").trim().toLowerCase();
+    const waiterRequestType = normalizeWaiterRequestType(
+      req.body?.call_type ??
+        req.body?.callType ??
+        req.body?.request_type ??
+        req.body?.requestType ??
+        req.body?.waiter_type ??
+        req.body?.waiterType ??
+        req.body?.type ??
+        req.body?.reason
+    );
 
     if (!identifier) {
       return res.status(400).json({ error: "Missing identifier" });
@@ -1224,6 +1263,9 @@ router.post("/call-waiter/:identifier", async (req, res) => {
       note: note || null,
       requested_at: new Date(now).toISOString(),
       source: requestedSource === "qr_menu_order_status" ? "qr_menu_order_status" : "qr_menu",
+      call_type: waiterRequestType,
+      request_type: waiterRequestType,
+      type: waiterRequestType,
     };
 
     try {
@@ -1235,7 +1277,12 @@ router.post("/call-waiter/:identifier", async (req, res) => {
 
     await saveNotification({
       restaurantId,
-      message: `Customer called waiter on Table ${tableNumber}`,
+      message:
+        waiterRequestType === "bill"
+          ? `Customer requested bill on Table ${tableNumber}`
+          : waiterRequestType === "reorder"
+          ? `Customer requested reorder on Table ${tableNumber}`
+          : `Customer called waiter on Table ${tableNumber}`,
       type: "customer_call",
       stockId: null,
       extra: payload,
