@@ -83,6 +83,14 @@ const QR_CUSTOMER_EMAIL_OTP_MAX_VERIFY_ATTEMPTS = Math.max(
 const QR_CUSTOMER_EMAIL_OTP_SECRET = String(
   process.env.QR_CUSTOMER_EMAIL_OTP_SECRET || process.env.JWT_SECRET || ""
 ).trim();
+const QR_CUSTOMER_EMAIL_MAGIC_LINK_TTL =
+  process.env.QR_CUSTOMER_EMAIL_MAGIC_LINK_TTL || `${QR_CUSTOMER_EMAIL_OTP_TTL_SECONDS}s`;
+const QR_CUSTOMER_EMAIL_MAGIC_LINK_SCOPE = "qr_customer_email_magic";
+const QR_CUSTOMER_EMAIL_MAGIC_LINK_PURPOSE = "qr_customer_email_magic";
+const QR_CUSTOMER_PHONE_MAGIC_LINK_TTL =
+  process.env.QR_CUSTOMER_PHONE_MAGIC_LINK_TTL || `${QR_CUSTOMER_PHONE_OTP_TTL_SECONDS}s`;
+const QR_CUSTOMER_PHONE_MAGIC_LINK_SCOPE = "qr_customer_phone_magic";
+const QR_CUSTOMER_PHONE_MAGIC_LINK_PURPOSE = "qr_customer_phone_magic";
 const QR_CUSTOMER_PHONE_OTP_EMAIL_FALLBACK_ENABLED = String(
   process.env.QR_CUSTOMER_PHONE_OTP_EMAIL_FALLBACK_ENABLED || "true"
 )
@@ -248,6 +256,43 @@ function generateEmailOtpSalt() {
   return crypto.randomBytes(16).toString("hex");
 }
 
+function normalizePublicBaseUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.replace(/\/+$/, "").replace(/\/api$/i, "");
+}
+
+function getFallbackPublicApiBaseUrl() {
+  return normalizePublicBaseUrl(
+    process.env.PUBLIC_API_BASE_URL ||
+      process.env.PUBLIC_API_BASE ||
+      process.env.API_BASE_URL ||
+      process.env.RENDER_EXTERNAL_URL ||
+      process.env.URL ||
+      ""
+  );
+}
+
+function resolveRequestOrigin(req) {
+  if (!req) return "";
+  const forwardedProto = String(req.get?.("x-forwarded-proto") || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const host = String(req.get?.("host") || "").trim();
+  if (!host) return "";
+  const isLocalHost =
+    host.includes("localhost") || host.startsWith("127.0.0.1") || host.startsWith("[::1]");
+  const protocol = forwardedProto || (isLocalHost ? "http" : "https");
+  return `${protocol}://${host}`;
+}
+
+function resolvePublicApiBaseUrl(req) {
+  const envBase = getFallbackPublicApiBaseUrl();
+  if (envBase) return envBase;
+  return resolveRequestOrigin(req);
+}
+
 function hashEmailOtpCode(code, salt) {
   const normalizedCode = normalizeOtpCode(code);
   const normalizedSalt = normalizeText(salt);
@@ -284,17 +329,46 @@ function maskEmailAddress(value) {
   return `${visible}${"*".repeat(hiddenLength)}@${domainPart}`;
 }
 
-function buildEmailOtpMessage({ code, expiresInMinutes = 10 }) {
-  const subject = "Your Beypro login code";
-  const text = [
-    "Your Beypro verification code is:",
-    "",
-    code,
-    "",
-    `This code expires in ${expiresInMinutes} minutes.`,
-    "If you did not request this code, you can ignore this email.",
-  ].join("\n");
-  return { subject, text };
+function buildEmailOtpMessage({ code, expiresInMinutes = 10, magicLinkUrl = "" }) {
+  const subject = "Your Beypro sign-in link";
+  const normalizedMagicLinkUrl = String(magicLinkUrl || "").trim();
+  const textLines = [];
+
+  if (normalizedMagicLinkUrl) {
+    textLines.push("Tap to sign in instantly:");
+    textLines.push(normalizedMagicLinkUrl);
+    textLines.push("");
+  }
+
+  textLines.push("Your Beypro verification code is:");
+  textLines.push("");
+  textLines.push(code);
+  textLines.push("");
+  textLines.push(`This code expires in ${expiresInMinutes} minutes.`);
+  textLines.push("If the button does not open, you can use the verification code manually.");
+  textLines.push("If you did not request this code, you can ignore this email.");
+
+  const text = textLines.join("\n");
+  const html = `
+    <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:560px;margin:0 auto;padding:24px;">
+      <h2 style="margin:0 0 12px;font-size:24px;color:#111827;">Sign in to Beypro</h2>
+      <p style="margin:0 0 16px;font-size:15px;color:#374151;">Use the secure sign-in link below or enter the verification code manually.</p>
+      ${
+          normalizedMagicLinkUrl
+           ? `<p style="margin:0 0 20px;"><a href="${normalizedMagicLinkUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:600;">Sign in instantly</a></p>
+             <p style="margin:0 0 16px;font-size:12px;color:#6b7280;word-break:break-all;">${normalizedMagicLinkUrl}</p>`
+          : ""
+      }
+      <div style="margin:0 0 16px;padding:16px;border:1px solid #e5e7eb;border-radius:16px;background:#f9fafb;">
+        <div style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px;">Verification code</div>
+        <div style="font-size:30px;font-weight:700;letter-spacing:0.18em;color:#111827;">${code}</div>
+      </div>
+      <p style="margin:0 0 8px;font-size:14px;color:#374151;">This code expires in ${expiresInMinutes} minutes.</p>
+      <p style="margin:0;font-size:13px;color:#6b7280;">If you did not request this email, you can ignore it.</p>
+    </div>
+  `.trim();
+
+  return { subject, text, html };
 }
 
 function isValidEmail(value) {
@@ -308,6 +382,7 @@ function buildPhoneOtpFallbackEmailMessage({
   expiresInMinutes = 5,
   language = "en",
   brandName = "Restaurant",
+  magicLinkUrl = "",
 }) {
   const normalizedLanguage = ["tr", "en", "de", "fr"].includes(
     String(normalizeLanguage(language) || "").toLowerCase().split("-")[0]
@@ -316,54 +391,113 @@ function buildPhoneOtpFallbackEmailMessage({
     : "en";
   const resolvedBrandName = normalizeText(brandName).replace(/\s+/g, " ") || "Restaurant";
   const maskedPhone = maskPhoneNumber(phone);
+  const normalizedMagicLinkUrl = normalizeText(magicLinkUrl);
 
   let subject = `Your ${resolvedBrandName} phone verification code`;
   let text = [
+    normalizedMagicLinkUrl ? `Tap to verify instantly: ${normalizedMagicLinkUrl}` : "",
+    normalizedMagicLinkUrl ? "" : "",
     `Your ${resolvedBrandName} phone verification code is:`,
     "",
     code,
     "",
     `Phone: ${maskedPhone || phone}`,
     `This code expires in ${expiresInMinutes} minutes.`,
+    "If the link does not open, you can use the verification code manually.",
     "If you did not request this code, you can ignore this email.",
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
+  let html = `
+    <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:560px;margin:0 auto;padding:24px;">
+      <h2 style="margin:0 0 12px;font-size:24px;color:#111827;">Verify your phone</h2>
+      <p style="margin:0 0 16px;font-size:15px;color:#374151;">Use the secure verification link below or enter the code manually.</p>
+      ${
+        normalizedMagicLinkUrl
+          ? `<p style="margin:0 0 20px;"><a href="${normalizedMagicLinkUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:600;">Verify phone instantly</a></p>
+             <p style="margin:0 0 16px;font-size:12px;color:#6b7280;word-break:break-all;">${normalizedMagicLinkUrl}</p>`
+          : ""
+      }
+      <div style="margin:0 0 16px;padding:16px;border:1px solid #e5e7eb;border-radius:16px;background:#f9fafb;">
+        <div style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px;">Verification code</div>
+        <div style="font-size:30px;font-weight:700;letter-spacing:0.18em;color:#111827;">${code}</div>
+      </div>
+      <p style="margin:0 0 8px;font-size:14px;color:#374151;">Phone: ${maskedPhone || phone}</p>
+      <p style="margin:0 0 8px;font-size:14px;color:#374151;">This code expires in ${expiresInMinutes} minutes.</p>
+      <p style="margin:0;font-size:13px;color:#6b7280;">If you did not request this email, you can ignore it.</p>
+    </div>
+  `.trim();
 
   if (normalizedLanguage === "tr") {
     subject = `${resolvedBrandName} telefon doğrulama kodunuz`;
     text = [
+      normalizedMagicLinkUrl ? `Tek dokunusla dogrulayin: ${normalizedMagicLinkUrl}` : "",
+      normalizedMagicLinkUrl ? "" : "",
       `${resolvedBrandName} telefon doğrulama kodunuz:`,
       "",
       code,
       "",
       `Telefon: ${maskedPhone || phone}`,
       `Bu kod ${expiresInMinutes} dakika içinde sona erer.`,
+      "Link acilmazsa kodu manuel olarak kullanabilirsiniz.",
       "Bu kodu siz talep etmediyseniz bu e-postayı yok sayabilirsiniz.",
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
+    html = `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:560px;margin:0 auto;padding:24px;">
+        <h2 style="margin:0 0 12px;font-size:24px;color:#111827;">Telefonunuzu dogrulayin</h2>
+        <p style="margin:0 0 16px;font-size:15px;color:#374151;">Guvenli dogrulama baglantisini kullanabilir veya kodu manuel girebilirsiniz.</p>
+        ${
+          normalizedMagicLinkUrl
+            ? `<p style="margin:0 0 20px;"><a href="${normalizedMagicLinkUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:600;">Telefonu hemen dogrula</a></p>
+               <p style="margin:0 0 16px;font-size:12px;color:#6b7280;word-break:break-all;">${normalizedMagicLinkUrl}</p>`
+            : ""
+        }
+        <div style="margin:0 0 16px;padding:16px;border:1px solid #e5e7eb;border-radius:16px;background:#f9fafb;">
+          <div style="font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px;">Dogrulama kodu</div>
+          <div style="font-size:30px;font-weight:700;letter-spacing:0.18em;color:#111827;">${code}</div>
+        </div>
+        <p style="margin:0 0 8px;font-size:14px;color:#374151;">Telefon: ${maskedPhone || phone}</p>
+        <p style="margin:0 0 8px;font-size:14px;color:#374151;">Bu kod ${expiresInMinutes} dakika icinde sona erer.</p>
+        <p style="margin:0;font-size:13px;color:#6b7280;">Bu dogrulamayi siz istemediyseniz bu e-postayi yok sayabilirsiniz.</p>
+      </div>
+    `.trim();
   } else if (normalizedLanguage === "de") {
     subject = `Ihr ${resolvedBrandName}-Bestätigungscode`;
     text = [
+      normalizedMagicLinkUrl ? `Jetzt direkt bestaetigen: ${normalizedMagicLinkUrl}` : "",
+      normalizedMagicLinkUrl ? "" : "",
       `Ihr ${resolvedBrandName}-Bestätigungscode lautet:`,
       "",
       code,
       "",
       `Telefon: ${maskedPhone || phone}`,
       `Dieser Code läuft in ${expiresInMinutes} Minuten ab.`,
+      "Wenn sich der Link nicht oeffnet, koennen Sie den Code manuell eingeben.",
       "Falls Sie diesen Code nicht angefordert haben, können Sie diese E-Mail ignorieren.",
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
   } else if (normalizedLanguage === "fr") {
     subject = `Votre code de vérification ${resolvedBrandName}`;
     text = [
+      normalizedMagicLinkUrl ? `Appuyez pour verifier instantanement : ${normalizedMagicLinkUrl}` : "",
+      normalizedMagicLinkUrl ? "" : "",
       `Votre code de vérification ${resolvedBrandName} est :`,
       "",
       code,
       "",
       `Téléphone : ${maskedPhone || phone}`,
       `Ce code expire dans ${expiresInMinutes} minutes.`,
+      "Si le lien ne s'ouvre pas, vous pouvez utiliser le code manuellement.",
       "Si vous n'avez pas demandé ce code, vous pouvez ignorer cet e-mail.",
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
-  return { subject, text };
+  return { subject, text, html };
 }
 
 function buildPhoneOtpFallbackDeliveryMessage({ maskedEmail, language = "en" }) {
@@ -449,6 +583,119 @@ function decodeJwtPayload(rawToken) {
 
 function getJwtSigningSecret() {
   return process.env.JWT_SECRET || "beypro_secret_2025";
+}
+
+function signEmailOtpMagicLinkToken({
+  otpId,
+  restaurantId,
+  marketplaceCustomerId = null,
+  email,
+  identifier = "",
+  returnTo = "",
+}) {
+  const normalizedEmail = normalizeEmail(email);
+  const parsedOtpId = Number(otpId || 0);
+  const parsedRestaurantId = Number(restaurantId || 0);
+  const parsedMarketplaceCustomerId = Number(marketplaceCustomerId || 0);
+  const normalizedIdentifier = normalizeText(identifier);
+  const normalizedReturnTo = normalizeText(returnTo);
+
+  if (!normalizedEmail || !parsedOtpId || !parsedRestaurantId || !normalizedReturnTo) {
+    throw new Error("Email magic link payload is incomplete.");
+  }
+
+  return jwt.sign(
+    {
+      purpose: QR_CUSTOMER_EMAIL_MAGIC_LINK_PURPOSE,
+      scope: QR_CUSTOMER_EMAIL_MAGIC_LINK_SCOPE,
+      otp_id: parsedOtpId,
+      restaurant_id: parsedRestaurantId,
+      marketplace_customer_id:
+        Number.isFinite(parsedMarketplaceCustomerId) && parsedMarketplaceCustomerId > 0
+          ? parsedMarketplaceCustomerId
+          : null,
+      email: normalizedEmail,
+      identifier: normalizedIdentifier || null,
+      return_to: normalizedReturnTo,
+    },
+    getJwtSigningSecret(),
+    { expiresIn: QR_CUSTOMER_EMAIL_MAGIC_LINK_TTL }
+  );
+}
+
+function verifyEmailOtpMagicLinkToken(rawToken) {
+  const token = normalizeText(rawToken);
+  if (!token) return null;
+
+  try {
+    const decoded = jwt.verify(token, getJwtSigningSecret());
+    if (
+      decoded?.purpose !== QR_CUSTOMER_EMAIL_MAGIC_LINK_PURPOSE ||
+      String(decoded?.scope || "").trim().toLowerCase() !== QR_CUSTOMER_EMAIL_MAGIC_LINK_SCOPE
+    ) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function signPhoneOtpMagicLinkToken({
+  otpId,
+  restaurantId,
+  customerId = null,
+  customerScope = "",
+  phone,
+  fallbackEmail = "",
+  returnTo = "",
+}) {
+  const parsedOtpId = Number(otpId || 0);
+  const parsedRestaurantId = Number(restaurantId || 0);
+  const parsedCustomerId = Number(customerId || 0);
+  const normalizedCustomerScope = normalizeText(customerScope).toLowerCase();
+  const normalizedPhone = normalizePhoneForVerification(phone);
+  const normalizedFallbackEmail = normalizeEmail(fallbackEmail);
+  const normalizedReturnTo = normalizeText(returnTo);
+
+  if (!parsedOtpId || !parsedRestaurantId || !normalizedPhone || !normalizedReturnTo) {
+    throw new Error("Phone magic link payload is incomplete.");
+  }
+
+  return jwt.sign(
+    {
+      purpose: QR_CUSTOMER_PHONE_MAGIC_LINK_PURPOSE,
+      scope: QR_CUSTOMER_PHONE_MAGIC_LINK_SCOPE,
+      otp_id: parsedOtpId,
+      restaurant_id: parsedRestaurantId,
+      customer_id:
+        Number.isFinite(parsedCustomerId) && parsedCustomerId > 0 ? parsedCustomerId : null,
+      customer_scope: normalizedCustomerScope || null,
+      phone: normalizedPhone,
+      fallback_email: normalizedFallbackEmail || null,
+      return_to: normalizedReturnTo,
+    },
+    getJwtSigningSecret(),
+    { expiresIn: QR_CUSTOMER_PHONE_MAGIC_LINK_TTL }
+  );
+}
+
+function verifyPhoneOtpMagicLinkToken(rawToken) {
+  const token = normalizeText(rawToken);
+  if (!token) return null;
+
+  try {
+    const decoded = jwt.verify(token, getJwtSigningSecret());
+    if (
+      decoded?.purpose !== QR_CUSTOMER_PHONE_MAGIC_LINK_PURPOSE ||
+      String(decoded?.scope || "").trim().toLowerCase() !== QR_CUSTOMER_PHONE_MAGIC_LINK_SCOPE
+    ) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
 }
 
 function signQrCustomerOAuthState(payload) {
@@ -656,6 +903,20 @@ function buildOAuthErrorRedirectUrl(returnTo, payload = {}) {
   return appendQueryParamsToUrl(cleanUrl, {
     qr_oauth_error: payload.error || "oauth_failed",
     qr_oauth_provider: payload.provider || null,
+  });
+}
+
+function buildPhoneVerificationSuccessRedirectUrl(returnTo, payload = {}) {
+  const cleanUrl = appendQueryParamsToUrl(returnTo, {
+    qr_phone_verification_token: null,
+    qr_phone_verified_phone: null,
+  });
+
+  return appendQueryParamsToUrl(cleanUrl, {
+    qr_oauth_provider: payload.provider || null,
+    qr_oauth_token: payload.token || null,
+    qr_phone_verification_token: payload.phoneVerificationToken || null,
+    qr_phone_verified_phone: payload.phone || null,
   });
 }
 
@@ -1013,6 +1274,70 @@ async function getLatestEmailOtpRecord(restaurantId, email, runner = pool) {
       LIMIT 1
     `,
     [restaurantId, normalizedEmail]
+  );
+
+  return rows[0] || null;
+}
+
+async function getEmailOtpRecordById(restaurantId, otpId, runner = pool) {
+  const parsedRestaurantId = Number(restaurantId || 0);
+  const parsedOtpId = Number(otpId || 0);
+  if (!parsedRestaurantId || !parsedOtpId) return null;
+
+  const { rows } = await runner.query(
+    `
+      SELECT
+        id,
+        restaurant_id,
+        marketplace_customer_id,
+        email,
+        code_hash,
+        code_salt,
+        purpose,
+        expires_at,
+        consumed_at,
+        attempt_count,
+        max_attempts,
+        resend_count,
+        last_sent_at,
+        created_at
+      FROM qr_customer_email_otps
+      WHERE restaurant_id = $1 AND id = $2
+      LIMIT 1
+    `,
+    [parsedRestaurantId, parsedOtpId]
+  );
+
+  return rows[0] || null;
+}
+
+async function getPhoneOtpRecordById(otpId, runner = pool) {
+  const parsedOtpId = Number(otpId || 0);
+  if (!parsedOtpId) return null;
+
+  const { rows } = await runner.query(
+    `
+      SELECT
+        id,
+        restaurant_id,
+        marketplace_customer_id,
+        phone_number,
+        normalized_phone,
+        code_hash,
+        code_salt,
+        purpose,
+        attempt_count,
+        max_attempts,
+        resend_count,
+        last_sent_at,
+        expires_at,
+        consumed_at,
+        created_at
+      FROM qr_customer_phone_otps
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [parsedOtpId]
   );
 
   return rows[0] || null;
@@ -1790,6 +2115,12 @@ router.post(
   async (req, res) => {
     const restaurantId = req.restaurantId;
     const email = normalizeEmail(req.body?.email);
+    const identifier =
+      normalizeText(req.query.identifier || req.body?.identifier || req.params?.identifier) || "";
+    const returnTo = sanitizeOAuthReturnToUrl(
+      req.body?.return_to || req.body?.returnTo,
+      identifier
+    );
 
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: "A valid email address is required." });
@@ -1918,12 +2249,28 @@ router.post(
         persistedOtpId = Number(inserted.rows[0]?.id || 0) || null;
       }
 
-      const { subject, text } = buildEmailOtpMessage({
+      const magicLinkToken = signEmailOtpMagicLinkToken({
+        otpId: persistedOtpId,
+        restaurantId,
+        marketplaceCustomerId: marketplaceCustomer.id,
+        email,
+        identifier,
+        returnTo,
+      });
+      const magicLinkUrl = `${resolvePublicApiBaseUrl(
+        req
+      )}/api/public/customer-auth/email-otp/magic?token=${encodeURIComponent(magicLinkToken)}`;
+      const { subject, text, html } = buildEmailOtpMessage({
         code,
         expiresInMinutes: Math.ceil(QR_CUSTOMER_EMAIL_OTP_TTL_SECONDS / 60),
+        magicLinkUrl,
       });
       try {
-        await sendEmail(email, subject, text, false, {
+        await sendEmail({
+          to: email,
+          subject,
+          html,
+          text,
           language: normalizeLanguage(req.get("accept-language")) || "en",
         });
       } catch (mailErr) {
@@ -1954,6 +2301,157 @@ router.post(
     }
   }
 );
+
+router.get("/customer-auth/email-otp/magic", async (req, res) => {
+  const rawToken = normalizeText(req.query?.token);
+  const decodedPreview = decodeJwtPayload(rawToken) || null;
+  const fallbackIdentifier = normalizeText(decodedPreview?.identifier || "");
+  const fallbackReturnTo = sanitizeOAuthReturnToUrl(
+    decodedPreview?.return_to,
+    fallbackIdentifier
+  );
+
+  const redirectError = (errorCode) =>
+    res.redirect(
+      302,
+      buildOAuthErrorRedirectUrl(fallbackReturnTo, {
+        error: errorCode,
+      })
+    );
+
+  try {
+    await ensureMarketplaceCustomerSchema();
+    await ensureQrCustomerEmailOtpSchema();
+
+    const decoded = verifyEmailOtpMagicLinkToken(rawToken);
+    if (!decoded) {
+      return redirectError("invalid_magic_link");
+    }
+
+    const restaurantId = Number(decoded.restaurant_id || 0);
+    const otpId = Number(decoded.otp_id || 0);
+    const email = normalizeEmail(decoded.email);
+    const returnTo = sanitizeOAuthReturnToUrl(decoded.return_to, decoded.identifier || "");
+
+    if (!restaurantId || !otpId || !email) {
+      return res.redirect(
+        302,
+        buildOAuthErrorRedirectUrl(returnTo, { error: "invalid_magic_link" })
+      );
+    }
+
+    const client = await pool.connect();
+    let marketplaceCustomer = null;
+    try {
+      await client.query("BEGIN");
+
+      const otpRecord = await getEmailOtpRecordById(restaurantId, otpId, client);
+      if (!otpRecord) {
+        await client.query("ROLLBACK");
+        return res.redirect(
+          302,
+          buildOAuthErrorRedirectUrl(returnTo, { error: "invalid_magic_link" })
+        );
+      }
+
+      if (normalizeEmail(otpRecord.email) !== email) {
+        await client.query("ROLLBACK");
+        return res.redirect(
+          302,
+          buildOAuthErrorRedirectUrl(returnTo, { error: "invalid_magic_link" })
+        );
+      }
+
+      if (otpRecord.consumed_at) {
+        await client.query("ROLLBACK");
+        return res.redirect(
+          302,
+          buildOAuthErrorRedirectUrl(returnTo, { error: "magic_link_already_used" })
+        );
+      }
+
+      const expired = Date.parse(otpRecord.expires_at || 0) <= Date.now();
+      if (expired) {
+        await client.query(
+          `
+            UPDATE qr_customer_email_otps
+            SET consumed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+          `,
+          [otpRecord.id]
+        );
+        await client.query("COMMIT");
+        return res.redirect(
+          302,
+          buildOAuthErrorRedirectUrl(returnTo, { error: "magic_link_expired" })
+        );
+      }
+
+      await client.query(
+        `
+          UPDATE qr_customer_email_otps
+          SET consumed_at = NOW(),
+              updated_at = NOW()
+          WHERE id = $1
+        `,
+        [otpRecord.id]
+      );
+
+      marketplaceCustomer = otpRecord.marketplace_customer_id
+        ? await getMarketplaceCustomerById(otpRecord.marketplace_customer_id)
+        : await getMarketplaceCustomerByEmail(email);
+
+      if (!marketplaceCustomer?.id || normalizeEmail(marketplaceCustomer.email) !== email) {
+        await client.query("ROLLBACK");
+        return res.redirect(
+          302,
+          buildOAuthErrorRedirectUrl(returnTo, { error: "invalid_magic_link" })
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error("❌ QR customer magic link rollback failed:", rollbackErr);
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const customerId = await ensureRestaurantCustomerForMarketplace({
+      restaurantId,
+      marketplaceCustomer,
+    });
+    const customer = await getRestaurantCustomerProfile(restaurantId, customerId);
+    const token = signMarketplaceCustomerToken({
+      customerId: marketplaceCustomer.id,
+      email: marketplaceCustomer.email,
+      phone: marketplaceCustomer.phone,
+    });
+
+    if (!customer?.id || !token) {
+      return res.redirect(
+        302,
+        buildOAuthErrorRedirectUrl(returnTo, { error: "magic_link_failed" })
+      );
+    }
+
+    return res.redirect(
+      302,
+      buildOAuthSuccessRedirectUrl(returnTo, {
+        provider: "email",
+        token,
+      })
+    );
+  } catch (err) {
+    console.error("❌ QR customer magic link login failed:", err);
+    return redirectError("magic_link_failed");
+  }
+});
 
 router.post(
   "/customer-auth/email-otp/verify",
@@ -2095,6 +2593,12 @@ router.post(
   async (req, res) => {
     const restaurantId = req.restaurantId;
     const phone = normalizePhoneForVerification(req.body?.phone || req.body?.customer_phone);
+    const identifier =
+      normalizeText(req.query.identifier || req.body?.identifier || req.params?.identifier) || "";
+    const returnTo = sanitizeOAuthReturnToUrl(
+      req.body?.return_to || req.body?.returnTo || req.get?.("referer"),
+      identifier
+    );
     if (!/^90\d{10}$/.test(phone)) {
       return res.status(400).json({ error: "A valid phone number is required." });
     }
@@ -2104,6 +2608,9 @@ router.post(
       await ensureMarketplaceCustomerSchema();
 
       const marketplaceCustomer = await resolveOptionalMarketplaceSession(req);
+      const qrSessionCustomer = marketplaceCustomer
+        ? null
+        : await resolveOptionalQrCustomerSession(req);
       const accountVerified = isVerifiedMarketplacePhone(marketplaceCustomer, phone);
       const accountPhoneMatch = isMarketplaceSessionPhoneMatch(
         marketplaceCustomer,
@@ -2309,18 +2816,34 @@ router.post(
           });
         }
 
-        const { subject, text } = buildPhoneOtpFallbackEmailMessage({
+        const magicLinkToken = signPhoneOtpMagicLinkToken({
+          otpId: persistedOtpId,
+          restaurantId,
+          customerId: marketplaceCustomer?.id || qrSessionCustomer?.id || null,
+          customerScope: marketplaceCustomer?.id ? MARKETPLACE_CUSTOMER_SCOPE : "qr_customer",
+          phone,
+          fallbackEmail,
+          returnTo,
+        });
+        const magicLinkUrl = `${resolvePublicApiBaseUrl(
+          req
+        )}/api/public/customer-auth/phone-otp/magic?token=${encodeURIComponent(magicLinkToken)}`;
+        const { subject, text, html } = buildPhoneOtpFallbackEmailMessage({
           code,
           phone,
           expiresInMinutes: Math.ceil(QR_CUSTOMER_PHONE_OTP_TTL_SECONDS / 60),
           language: requestLanguage,
           brandName,
+          magicLinkUrl,
         });
 
         try {
-          await sendEmail(fallbackEmail, subject, text, false, {
+          await sendEmail({
+            to: fallbackEmail,
+            subject,
+            html,
+            text,
             language: requestLanguage,
-            fromName: brandName,
           });
         } catch (mailErr) {
           await invalidatePersistedOtp();
@@ -2363,6 +2886,258 @@ router.post(
     }
   }
 );
+
+router.get("/customer-auth/phone-otp/magic", async (req, res) => {
+  const rawToken = normalizeText(req.query?.token);
+  const decodedPreview = decodeJwtPayload(rawToken) || null;
+  const fallbackReturnTo = sanitizeOAuthReturnToUrl(decodedPreview?.return_to, "");
+
+  const redirectError = (errorCode) =>
+    res.redirect(
+      302,
+      buildOAuthErrorRedirectUrl(fallbackReturnTo, {
+        error: errorCode,
+      })
+    );
+
+  try {
+    await ensureMarketplaceCustomerSchema();
+    await ensureQrCustomerPhoneOtpSchema();
+    await ensureQrCustomerAuthSchema();
+
+    const decoded = verifyPhoneOtpMagicLinkToken(rawToken);
+    if (!decoded) {
+      return redirectError("invalid_magic_link");
+    }
+
+    const restaurantId = Number(decoded.restaurant_id || 0);
+    const otpId = Number(decoded.otp_id || 0);
+    const phone = normalizePhoneForVerification(decoded.phone);
+    const customerId = Number(decoded.customer_id || 0);
+    const customerScope = normalizeText(decoded.customer_scope).toLowerCase();
+    const returnTo = sanitizeOAuthReturnToUrl(decoded.return_to, "");
+
+    if (!restaurantId || !otpId || !/^90\d{10}$/.test(phone)) {
+      return res.redirect(
+        302,
+        buildOAuthErrorRedirectUrl(returnTo, { error: "invalid_magic_link" })
+      );
+    }
+
+    const client = await pool.connect();
+    let localCustomerId = null;
+    let updatedMarketplaceCustomer = null;
+    let updatedQrCustomer = null;
+
+    try {
+      await client.query("BEGIN");
+
+      const otpRecord = await getPhoneOtpRecordById(otpId, client);
+      if (
+        !otpRecord ||
+        Number(otpRecord.restaurant_id || 0) !== restaurantId ||
+        normalizePhoneForVerification(otpRecord.normalized_phone || otpRecord.phone_number) !== phone ||
+        normalizeText(otpRecord.purpose) !== "checkout_contact"
+      ) {
+        await client.query("ROLLBACK");
+        return res.redirect(
+          302,
+          buildOAuthErrorRedirectUrl(returnTo, { error: "invalid_magic_link" })
+        );
+      }
+
+      if (otpRecord.consumed_at) {
+        await client.query("ROLLBACK");
+        return res.redirect(
+          302,
+          buildOAuthErrorRedirectUrl(returnTo, { error: "magic_link_already_used" })
+        );
+      }
+
+      const expired = Date.parse(otpRecord.expires_at || 0) <= Date.now();
+      if (expired) {
+        await client.query(
+          `
+            UPDATE qr_customer_phone_otps
+            SET consumed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+          `,
+          [otpRecord.id]
+        );
+        await client.query("COMMIT");
+        return res.redirect(
+          302,
+          buildOAuthErrorRedirectUrl(returnTo, { error: "magic_link_expired" })
+        );
+      }
+
+      await client.query(
+        `
+          UPDATE qr_customer_phone_otps
+          SET consumed_at = NOW(),
+              attempt_count = COALESCE(attempt_count, 0) + 1,
+              updated_at = NOW()
+          WHERE id = $1
+        `,
+        [otpRecord.id]
+      );
+
+      if (customerScope === MARKETPLACE_CUSTOMER_SCOPE && customerId > 0) {
+        updatedMarketplaceCustomer = await getMarketplaceCustomerById(customerId, client);
+        if (!updatedMarketplaceCustomer?.id) {
+          await client.query("ROLLBACK");
+          return res.redirect(
+            302,
+            buildOAuthErrorRedirectUrl(returnTo, { error: "invalid_magic_link" })
+          );
+        }
+
+        await markMarketplaceCustomerPhoneVerified(
+          {
+            marketplaceCustomerId: updatedMarketplaceCustomer.id,
+            phoneNumber: phone,
+          },
+          client
+        );
+        updatedMarketplaceCustomer = await getMarketplaceCustomerById(
+          updatedMarketplaceCustomer.id,
+          client
+        );
+        if (updatedMarketplaceCustomer?.id) {
+          localCustomerId = await ensureRestaurantCustomerForMarketplace(
+            {
+              restaurantId,
+              marketplaceCustomer: updatedMarketplaceCustomer,
+            },
+            client
+          );
+        }
+      } else if (customerScope === "qr_customer" && customerId > 0) {
+        const qrSessionCustomer = await getQrCustomerProfileById(restaurantId, customerId, client);
+        if (!qrSessionCustomer?.id) {
+          await client.query("ROLLBACK");
+          return res.redirect(
+            302,
+            buildOAuthErrorRedirectUrl(returnTo, { error: "invalid_magic_link" })
+          );
+        }
+
+        const existingPhoneCustomer = await findCustomerByPhoneIdentity(
+          restaurantId,
+          phone,
+          client
+        );
+        if (
+          existingPhoneCustomer?.id &&
+          Number(existingPhoneCustomer.id) !== Number(qrSessionCustomer.id)
+        ) {
+          await client.query("ROLLBACK");
+          return res.redirect(
+            302,
+            buildOAuthErrorRedirectUrl(returnTo, { error: "phone_already_in_use" })
+          );
+        }
+
+        const authPhoneOwner = await client.query(
+          `
+            SELECT customer_id
+            FROM qr_customer_auth
+            WHERE restaurant_id = $1
+              AND phone = $2
+            LIMIT 1
+          `,
+          [restaurantId, phone]
+        );
+        const authOwnerCustomerId = Number(authPhoneOwner.rows?.[0]?.customer_id || 0);
+        if (
+          Number.isFinite(authOwnerCustomerId) &&
+          authOwnerCustomerId > 0 &&
+          authOwnerCustomerId !== Number(qrSessionCustomer.id)
+        ) {
+          await client.query("ROLLBACK");
+          return res.redirect(
+            302,
+            buildOAuthErrorRedirectUrl(returnTo, { error: "phone_already_in_use" })
+          );
+        }
+
+        await client.query(
+          `
+            UPDATE customers
+            SET
+              phone = $1,
+              phone_verified = TRUE,
+              phone_verified_at = NOW()
+            WHERE restaurant_id = $2 AND id = $3
+          `,
+          [phone, restaurantId, qrSessionCustomer.id]
+        );
+        await client.query(
+          `
+            UPDATE qr_customer_auth
+            SET
+              phone = $1,
+              updated_at = NOW()
+            WHERE restaurant_id = $2 AND customer_id = $3
+          `,
+          [phone, restaurantId, qrSessionCustomer.id]
+        );
+        updatedQrCustomer = await getQrCustomerProfileById(
+          restaurantId,
+          qrSessionCustomer.id,
+          client
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error("❌ QR customer phone magic link rollback failed:", rollbackErr);
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const phoneVerificationToken = signPhoneVerificationTrustToken({
+      restaurantId,
+      marketplaceCustomerId: updatedMarketplaceCustomer?.id || null,
+      phoneNumber: phone,
+      trustLevel: "otp_verified",
+    });
+
+    let sessionToken = "";
+    if (updatedMarketplaceCustomer?.id) {
+      sessionToken = signMarketplaceCustomerToken({
+        customerId: updatedMarketplaceCustomer.id,
+        email: updatedMarketplaceCustomer.email,
+        phone: updatedMarketplaceCustomer.phone,
+      });
+    } else if (updatedQrCustomer?.id) {
+      sessionToken = signQrCustomerToken({
+        customerId: updatedQrCustomer.id,
+        restaurantId,
+        phone: updatedQrCustomer.phone,
+      });
+    }
+
+    return res.redirect(
+      302,
+      buildPhoneVerificationSuccessRedirectUrl(returnTo, {
+        provider: sessionToken ? "phone" : null,
+        token: sessionToken || null,
+        phoneVerificationToken,
+        phone,
+      })
+    );
+  } catch (err) {
+    console.error("❌ QR customer phone magic link verify failed:", err);
+    return redirectError("magic_link_failed");
+  }
+});
 
 router.post(
   "/customer-auth/phone-otp/verify",

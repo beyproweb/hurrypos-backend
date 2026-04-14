@@ -25,8 +25,10 @@ const {
 const {
   MARKETPLACE_CUSTOMER_SCOPE,
   ensureMarketplaceCustomerSchema,
+  getRestaurantCustomerProfile,
   getMarketplaceCustomerById,
   verifyCustomerAuthToken,
+  ensureRestaurantCustomerForMarketplace,
 } = require("../utils/marketplaceCustomerAuth");
 const {
   assertCheckoutPhoneVerification,
@@ -54,6 +56,33 @@ async function resolveOptionalMarketplaceSession(req) {
     if (scope !== MARKETPLACE_CUSTOMER_SCOPE || !decoded?.customer_id) return null;
     const marketplaceCustomer = await getMarketplaceCustomerById(decoded.customer_id);
     return marketplaceCustomer?.id ? marketplaceCustomer : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveOptionalQrCustomerSession(req, restaurantId) {
+  try {
+    const token = getBearerToken(req);
+    if (!token) return null;
+    const decoded = verifyCustomerAuthToken(token);
+    if (!decoded?.customer_id) return null;
+
+    const scope = String(decoded?.scope || "").toLowerCase();
+    if (scope === MARKETPLACE_CUSTOMER_SCOPE) {
+      const marketplaceCustomer = await getMarketplaceCustomerById(decoded.customer_id);
+      if (!marketplaceCustomer?.id) return null;
+      const localCustomerId = await ensureRestaurantCustomerForMarketplace({
+        restaurantId,
+        marketplaceCustomer,
+      });
+      return (await getRestaurantCustomerProfile(restaurantId, localCustomerId)) || null;
+    }
+
+    if (scope !== "qr_customer") return null;
+    if (Number(decoded.restaurant_id) !== Number(restaurantId)) return null;
+
+    return (await getRestaurantCustomerProfile(restaurantId, decoded.customer_id)) || null;
   } catch {
     return null;
   }
@@ -283,10 +312,12 @@ router.post("/:identifier/events/:eventId/bookings", async (req, res) => {
       });
     }
     const marketplaceCustomer = await resolveOptionalMarketplaceSession(req);
+    const qrCustomer = await resolveOptionalQrCustomerSession(req, restaurantId);
     const phoneVerificationResult = assertCheckoutPhoneVerification({
       restaurantId,
       phoneNumber: customerPhone,
       marketplaceCustomer,
+      qrCustomer,
       phoneVerificationToken: normalizePhoneVerificationToken(
         req.body?.phone_verification_token ||
           req.body?.phoneVerificationToken ||

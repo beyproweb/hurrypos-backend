@@ -238,6 +238,21 @@ function isMarketplaceSessionPhoneMatch(marketplaceCustomer, phoneNumber) {
   return Boolean(normalizedPhone && accountPhone && normalizedPhone === accountPhone);
 }
 
+function isVerifiedQrCustomerPhone(qrCustomer, phoneNumber) {
+  if (!qrCustomer?.id) return false;
+  if (qrCustomer.phone_verified !== true) return false;
+  const normalizedPhone = normalizePhone(phoneNumber);
+  const accountPhone = normalizePhone(qrCustomer.phone);
+  return Boolean(normalizedPhone && accountPhone && normalizedPhone === accountPhone);
+}
+
+function isQrCustomerSessionPhoneMatch(qrCustomer, phoneNumber) {
+  if (!qrCustomer?.id) return false;
+  const normalizedPhone = normalizePhone(phoneNumber);
+  const accountPhone = normalizePhone(qrCustomer.phone);
+  return Boolean(normalizedPhone && accountPhone && normalizedPhone === accountPhone);
+}
+
 function normalizePhoneVerificationToken(value) {
   return normalizeText(value);
 }
@@ -306,6 +321,7 @@ function assertCheckoutPhoneVerification({
   restaurantId,
   phoneNumber,
   marketplaceCustomer = null,
+  qrCustomer = null,
   phoneVerificationToken = "",
 }) {
   const normalizedPhone = normalizePhone(phoneNumber);
@@ -332,6 +348,24 @@ function assertCheckoutPhoneVerification({
       ok: true,
       normalizedPhone,
       verifiedBy: "marketplace_session_phone_match",
+      decodedToken: null,
+    };
+  }
+
+  if (isVerifiedQrCustomerPhone(qrCustomer, normalizedPhone)) {
+    return {
+      ok: true,
+      normalizedPhone,
+      verifiedBy: "qr_customer_verified_phone",
+      decodedToken: null,
+    };
+  }
+
+  if (isQrCustomerSessionPhoneMatch(qrCustomer, normalizedPhone)) {
+    return {
+      ok: true,
+      normalizedPhone,
+      verifiedBy: "qr_customer_session_phone_match",
       decodedToken: null,
     };
   }
