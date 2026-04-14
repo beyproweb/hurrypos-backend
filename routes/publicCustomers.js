@@ -395,8 +395,7 @@ function buildPhoneOtpFallbackEmailMessage({
 
   let subject = `Your ${resolvedBrandName} phone verification code`;
   let text = [
-    normalizedMagicLinkUrl ? `Tap to verify instantly: ${normalizedMagicLinkUrl}` : "",
-    normalizedMagicLinkUrl ? "" : "",
+    normalizedMagicLinkUrl ? "Use the verification button in the email to verify instantly." : "",
     `Your ${resolvedBrandName} phone verification code is:`,
     "",
     code,
@@ -414,8 +413,8 @@ function buildPhoneOtpFallbackEmailMessage({
       <p style="margin:0 0 16px;font-size:15px;color:#374151;">Use the secure verification link below or enter the code manually.</p>
       ${
         normalizedMagicLinkUrl
-          ? `<p style="margin:0 0 20px;"><a href="${normalizedMagicLinkUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:600;">Verify phone instantly</a></p>
-             <p style="margin:0 0 16px;font-size:12px;color:#6b7280;word-break:break-all;">${normalizedMagicLinkUrl}</p>`
+          ? `<p style="margin:0 0 20px;"><a href="${normalizedMagicLinkUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:600;">Verify Number</a></p>
+             `
           : ""
       }
       <div style="margin:0 0 16px;padding:16px;border:1px solid #e5e7eb;border-radius:16px;background:#f9fafb;">
@@ -431,8 +430,7 @@ function buildPhoneOtpFallbackEmailMessage({
   if (normalizedLanguage === "tr") {
     subject = `${resolvedBrandName} telefon doğrulama kodunuz`;
     text = [
-      normalizedMagicLinkUrl ? `Tek dokunusla dogrulayin: ${normalizedMagicLinkUrl}` : "",
-      normalizedMagicLinkUrl ? "" : "",
+      normalizedMagicLinkUrl ? "Dogrulamayi e-postadaki buton ile tamamlayin." : "",
       `${resolvedBrandName} telefon doğrulama kodunuz:`,
       "",
       code,
@@ -450,8 +448,7 @@ function buildPhoneOtpFallbackEmailMessage({
         <p style="margin:0 0 16px;font-size:15px;color:#374151;">Guvenli dogrulama baglantisini kullanabilir veya kodu manuel girebilirsiniz.</p>
         ${
           normalizedMagicLinkUrl
-            ? `<p style="margin:0 0 20px;"><a href="${normalizedMagicLinkUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:600;">Telefonu hemen dogrula</a></p>
-               <p style="margin:0 0 16px;font-size:12px;color:#6b7280;word-break:break-all;">${normalizedMagicLinkUrl}</p>`
+            ? `<p style="margin:0 0 20px;"><a href="${normalizedMagicLinkUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:600;">Telefonu hemen dogrula</a></p>`
             : ""
         }
         <div style="margin:0 0 16px;padding:16px;border:1px solid #e5e7eb;border-radius:16px;background:#f9fafb;">
@@ -466,8 +463,7 @@ function buildPhoneOtpFallbackEmailMessage({
   } else if (normalizedLanguage === "de") {
     subject = `Ihr ${resolvedBrandName}-Bestätigungscode`;
     text = [
-      normalizedMagicLinkUrl ? `Jetzt direkt bestaetigen: ${normalizedMagicLinkUrl}` : "",
-      normalizedMagicLinkUrl ? "" : "",
+      normalizedMagicLinkUrl ? "Verwenden Sie die Schaltflaeche in der E-Mail, um die Bestaetigung direkt abzuschliessen." : "",
       `Ihr ${resolvedBrandName}-Bestätigungscode lautet:`,
       "",
       code,
@@ -482,8 +478,7 @@ function buildPhoneOtpFallbackEmailMessage({
   } else if (normalizedLanguage === "fr") {
     subject = `Votre code de vérification ${resolvedBrandName}`;
     text = [
-      normalizedMagicLinkUrl ? `Appuyez pour verifier instantanement : ${normalizedMagicLinkUrl}` : "",
-      normalizedMagicLinkUrl ? "" : "",
+      normalizedMagicLinkUrl ? "Utilisez le bouton dans l’e-mail pour verifier instantanement." : "",
       `Votre code de vérification ${resolvedBrandName} est :`,
       "",
       code,
