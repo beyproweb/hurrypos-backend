@@ -1931,6 +1931,7 @@ function normalizeReservationGuestCompositionRestrictionRule(
   const normalized = String(value || fallback).trim().toLowerCase();
   return [
     "no_restriction",
+    "minimum_guests_per_table",
     "male_only_groups_not_allowed",
     "female_only_groups_not_allowed",
     "at_least_1_female_required",
@@ -1941,8 +1942,23 @@ function normalizeReservationGuestCompositionRestrictionRule(
     : fallback;
 }
 
-function getDefaultReservationGuestCompositionMessage(rule) {
+function normalizeReservationMinimumGuestsPerTable(value, fallback = 1) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return Math.max(1, Number.parseInt(String(fallback ?? "1"), 10) || 1);
+  }
+  return Math.max(1, Math.min(20, parsed));
+}
+
+function getDefaultReservationGuestCompositionMessage(rule, options = {}) {
   switch (normalizeReservationGuestCompositionRestrictionRule(rule)) {
+    case "minimum_guests_per_table": {
+      const minimum = normalizeReservationMinimumGuestsPerTable(
+        options?.minimumGuestsPerTable,
+        1
+      );
+      return `Minimum ${minimum} guests are required per table reservation.`;
+    }
     case "male_only_groups_not_allowed":
       return "Male-only groups are not allowed for this reservation.";
     case "female_only_groups_not_allowed":
@@ -2002,9 +2018,13 @@ function validateReservationGuestComposition({
   const effectiveFieldMode = reservationRestrictionRuleRequiresInput(restrictionRule)
     ? "required"
     : fieldMode;
+  const minimumGuestsPerTable = normalizeReservationMinimumGuestsPerTable(
+    config?.reservation_guest_composition_min_guests_per_table,
+    1
+  );
+  const usesMinimumGuestsRule = restrictionRule === "minimum_guests_per_table";
   if (
     !enabled ||
-    effectiveFieldMode === "hidden" ||
     (Number.isFinite(normalizedTableNumber) &&
       normalizedTableNumber > 0 &&
       excludedTableNumbers.includes(normalizedTableNumber))
@@ -2021,7 +2041,23 @@ function validateReservationGuestComposition({
   const totalGuests = parseReservationGuestCompositionValue(guestCount);
   const validationMessage =
     String(config?.reservation_guest_composition_validation_message || "").trim() ||
-    getDefaultReservationGuestCompositionMessage(restrictionRule);
+    getDefaultReservationGuestCompositionMessage(restrictionRule, {
+      minimumGuestsPerTable,
+    });
+
+  if (usesMinimumGuestsRule && totalGuests > 0 && totalGuests < minimumGuestsPerTable) {
+    return {
+      error: validationMessage,
+    };
+  }
+
+  if (effectiveFieldMode === "hidden") {
+    return {
+      reservationMenCount: null,
+      reservationWomenCount: null,
+    };
+  }
+
   if (restrictionRule === "couple_only" && totalGuests > 0 && totalGuests % 2 !== 0) {
     return {
       error: validationMessage,
@@ -2054,6 +2090,9 @@ function validateReservationGuestComposition({
 
   let blocked = false;
   switch (restrictionRule) {
+    case "minimum_guests_per_table":
+      blocked = totalGuests < minimumGuestsPerTable;
+      break;
     case "male_only_groups_not_allowed":
       blocked = reservationMenCount > 0 && reservationWomenCount === 0;
       break;

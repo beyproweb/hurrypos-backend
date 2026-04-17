@@ -105,6 +105,33 @@ async function ensureTablesColumn() {
   );
 }
 
+let ensureShopHoursSchemaPromise = null;
+
+async function ensureShopHoursSchema() {
+  if (!ensureShopHoursSchemaPromise) {
+    ensureShopHoursSchemaPromise = (async () => {
+      await pool.query(
+        "ALTER TABLE shop_hours ADD COLUMN IF NOT EXISTS restaurant_id integer"
+      );
+      await pool.query(
+        "ALTER TABLE shop_hours DROP CONSTRAINT IF EXISTS shop_hours_day_key"
+      );
+      await pool.query(
+        `
+        CREATE UNIQUE INDEX IF NOT EXISTS shop_hours_restaurant_day_unique_idx
+        ON shop_hours (restaurant_id, day)
+        WHERE restaurant_id IS NOT NULL
+        `
+      );
+    })().catch((err) => {
+      ensureShopHoursSchemaPromise = null;
+      throw err;
+    });
+  }
+
+  return ensureShopHoursSchemaPromise;
+}
+
 let ensureRestaurantCustomDomainColumnPromise = null;
 
 async function ensureRestaurantCustomDomainColumn() {
@@ -242,6 +269,8 @@ router.post("/shop-hours/all", async (req, res) => {
   if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
     return res.status(400).json({ error: "Missing restaurant context" });
   }
+
+  await ensureShopHoursSchema();
 
   const client = await pool.connect();
   try {
@@ -425,6 +454,8 @@ router.get("/shop-hours/all", async (req, res) => {
     if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
       return res.status(400).json({ error: "Missing restaurant context" });
     }
+
+    await ensureShopHoursSchema();
 
     res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.set("Pragma", "no-cache");
@@ -1011,6 +1042,7 @@ router.get("/qr-menu-customization", async (req, res) => {
       reservation_guest_composition_enabled: false,
       reservation_guest_composition_field_mode: "optional",
       reservation_guest_composition_restriction_rule: "no_restriction",
+      reservation_guest_composition_min_guests_per_table: 1,
       reservation_guest_composition_validation_message: "",
       reservation_guest_composition_disabled_tables: [],
       disable_all_products: false,
