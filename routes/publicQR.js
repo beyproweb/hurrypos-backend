@@ -2950,6 +2950,7 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
       delivery_time: "25–35 min",
       pickup_time: "10 min",
       call_button_enabled: true,
+      call_waiter_button_enabled: true,
       enable_popular: true,
       qr_theme: "auto",
       loyalty_enabled: false,
@@ -2977,6 +2978,13 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
       ...defaults,
       ...data,
     };
+    if (
+      data &&
+      Object.prototype.hasOwnProperty.call(data, "call_button_enabled") &&
+      !Object.prototype.hasOwnProperty.call(data, "call_waiter_button_enabled")
+    ) {
+      mergedCustomization.call_waiter_button_enabled = data.call_button_enabled !== false;
+    }
     const sanitizedBranding = {
       ...mergedCustomization,
       app_icon: resolveAvailableAssetPath(mergedCustomization.app_icon, ""),

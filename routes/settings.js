@@ -1020,6 +1020,7 @@ router.get("/qr-menu-customization", async (req, res) => {
       delivery_time: "25–35 min",
       pickup_time: "10 min",
       call_button_enabled: true,
+      call_waiter_button_enabled: true,
 
       // === New customization fields ===
       enable_popular: true,
@@ -1053,12 +1054,22 @@ router.get("/qr-menu-customization", async (req, res) => {
       app_display_name: restaurantName || "Restaurant",
     };
 
+    const customization = {
+      ...defaults,
+      ...data,
+    };
+
+    if (
+      data &&
+      Object.prototype.hasOwnProperty.call(data, "call_button_enabled") &&
+      !Object.prototype.hasOwnProperty.call(data, "call_waiter_button_enabled")
+    ) {
+      customization.call_waiter_button_enabled = data.call_button_enabled !== false;
+    }
+
     res.json({
       success: true,
-      customization: {
-        ...defaults,
-        ...data,
-      },
+      customization,
       restaurant: {
         slug: restaurantSlug || "",
         custom_domain: restaurantCustomDomain || "",
