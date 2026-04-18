@@ -2836,6 +2836,7 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
     });
 
     lockedRows.forEach((row) => {
+      if (!includeCurrentOccupancy) return;
       const tableNumber = Number(row?.table_number);
       if (!Number.isFinite(tableNumber) || tableNumber <= 0) return;
       unavailableSet.add(tableNumber);

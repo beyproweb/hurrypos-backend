@@ -40,6 +40,24 @@ function normalizeText(value) {
   return String(value || "").trim();
 }
 
+function currentLocalYmd(timeZone = process.env.REPORTS_TIMEZONE || "Europe/Istanbul") {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date());
+    const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    if (byType.year && byType.month && byType.day) {
+      return `${byType.year}-${byType.month}-${byType.day}`;
+    }
+  } catch {
+    // Fall through to ISO date.
+  }
+  return new Date().toISOString().slice(0, 10);
+}
+
 function getBearerToken(req) {
   const authHeader = normalizeText(req.headers?.authorization);
   if (!authHeader.toLowerCase().startsWith("bearer ")) return "";
@@ -219,6 +237,7 @@ router.get("/:identifier/events/:eventId/floor-plan", async (req, res) => {
       eventLayout: event.floor_plan_layout,
       tables: tablesResult.rows,
     });
+    const isEventToday = String(event?.event_date || "").slice(0, 10) === currentLocalYmd();
     const layoutIndex = buildFloorPlanElementIndex(layout);
     const availableSet = new Set(
       (Array.isArray(availableTables) ? availableTables : [])
@@ -247,7 +266,7 @@ router.get("/:identifier/events/:eventId/floor-plan", async (req, res) => {
       if (element?.hidden || restriction.reason === "Hidden table") {
         status = "hidden";
         reason = restriction.reason;
-      } else if (Boolean(table?.locked)) {
+      } else if (Boolean(table?.locked) && isEventToday) {
         status = "blocked";
         reason = "Table is locked";
       } else if (!restriction.valid) {

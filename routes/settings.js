@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
 const sharp = require("sharp");
+const cloudinary = require("../utils/cloudinary");
 const authMiddleware = require("../middleware/authMiddleware");
 const { attachAllowedModules } = require("../middleware/moduleGuard");
 const { ensureCashLogColumns } = require("../utils/registerLogColumns");
@@ -92,6 +93,29 @@ const brandingUpload = multer({
     return cb(null, false);
   },
 });
+
+function uploadBufferToCloudinary(buffer, options = {}) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: "image",
+        folder: options.folder,
+        public_id: options.publicId,
+        overwrite: options.overwrite !== false,
+        invalidate: options.invalidate !== false,
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        if (!result?.secure_url) {
+          return reject(new Error("No URL returned from Cloudinary"));
+        }
+        return resolve(result.secure_url);
+      }
+    );
+
+    stream.end(buffer);
+  });
+}
 
 async function ensureTransactionsColumn() {
   await pool.query(
@@ -1276,80 +1300,92 @@ router.post(
       }
 
       const safeSlug = sanitizeSlugForPath(slug, `restaurant-${restaurantId}`);
-      const relativeDir = path.join("uploads", "restaurants", safeSlug);
-      const absoluteDir = path.join(__dirname, "..", "public", relativeDir);
-      await fs.promises.mkdir(absoluteDir, { recursive: true });
+      const cloudinaryFolder = `qr-branding/${safeSlug}`;
 
       if (appIconFile?.buffer) {
-        const icon192RelPath = path.join(relativeDir, "icon-192.png");
-        const icon512RelPath = path.join(relativeDir, "icon-512.png");
-        const appleTouchRelPath = path.join(relativeDir, "apple-touch-icon.png");
-
-        await sharp(appIconFile.buffer, { density: 300 })
+        const icon192Buffer = await sharp(appIconFile.buffer, { density: 300 })
           .resize(192, 192, {
             fit: "contain",
             background: { r: 0, g: 0, b: 0, alpha: 0 },
             withoutEnlargement: false,
           })
           .png({ compressionLevel: 9, quality: 90 })
-          .toFile(path.join(__dirname, "..", "public", icon192RelPath));
+          .toBuffer();
 
-        await sharp(appIconFile.buffer, { density: 300 })
+        const icon512Buffer = await sharp(appIconFile.buffer, { density: 300 })
           .resize(512, 512, {
             fit: "contain",
             background: { r: 0, g: 0, b: 0, alpha: 0 },
             withoutEnlargement: false,
           })
           .png({ compressionLevel: 9, quality: 90 })
-          .toFile(path.join(__dirname, "..", "public", icon512RelPath));
+          .toBuffer();
 
-        await sharp(appIconFile.buffer, { density: 300 })
+        const appleTouchBuffer = await sharp(appIconFile.buffer, { density: 300 })
           .resize(180, 180, {
             fit: "contain",
             background: { r: 255, g: 255, b: 255, alpha: 1 },
             withoutEnlargement: false,
           })
           .png({ compressionLevel: 9, quality: 90 })
-          .toFile(path.join(__dirname, "..", "public", appleTouchRelPath));
+          .toBuffer();
 
-        next.app_icon = `/${icon512RelPath.replace(/\\/g, "/")}`;
-        next.app_icon_192 = `/${icon192RelPath.replace(/\\/g, "/")}`;
-        next.app_icon_512 = `/${icon512RelPath.replace(/\\/g, "/")}`;
-        next.apple_touch_icon = `/${appleTouchRelPath.replace(/\\/g, "/")}`;
+        const [icon192Url, icon512Url, appleTouchUrl] = await Promise.all([
+          uploadBufferToCloudinary(icon192Buffer, {
+            folder: cloudinaryFolder,
+            publicId: "icon-192",
+          }),
+          uploadBufferToCloudinary(icon512Buffer, {
+            folder: cloudinaryFolder,
+            publicId: "icon-512",
+          }),
+          uploadBufferToCloudinary(appleTouchBuffer, {
+            folder: cloudinaryFolder,
+            publicId: "apple-touch-icon",
+          }),
+        ]);
+
+        next.app_icon = icon512Url;
+        next.app_icon_192 = icon192Url;
+        next.app_icon_512 = icon512Url;
+        next.apple_touch_icon = appleTouchUrl;
       }
 
       if (splashLogoFile?.buffer) {
-        const splashRelPath = path.join(relativeDir, "splash-logo.png");
         const splashBackground = colorHexToRgba(
           req.body?.pwa_background_color || existing?.pwa_background_color || "#FFFFFF",
           { r: 255, g: 255, b: 255, alpha: 1 }
         );
 
-        await sharp(splashLogoFile.buffer, { density: 300 })
+        const splashBuffer = await sharp(splashLogoFile.buffer, { density: 300 })
           .resize(1024, 1024, {
             fit: "contain",
             background: splashBackground,
             withoutEnlargement: true,
           })
           .png({ compressionLevel: 9, quality: 90 })
-          .toFile(path.join(__dirname, "..", "public", splashRelPath));
+          .toBuffer();
 
-        next.splash_logo = `/${splashRelPath.replace(/\\/g, "/")}`;
+        next.splash_logo = await uploadBufferToCloudinary(splashBuffer, {
+          folder: cloudinaryFolder,
+          publicId: "splash-logo",
+        });
       }
 
       if (marketplaceBannerFile?.buffer) {
-        const marketplaceBannerRelPath = path.join(relativeDir, "marketplace-banner.jpg");
-
-        await sharp(marketplaceBannerFile.buffer, { density: 300 })
+        const marketplaceBannerBuffer = await sharp(marketplaceBannerFile.buffer, { density: 300 })
           .resize(1600, 900, {
             fit: "cover",
             position: "centre",
             withoutEnlargement: true,
           })
           .jpeg({ quality: 88, mozjpeg: true })
-          .toFile(path.join(__dirname, "..", "public", marketplaceBannerRelPath));
+          .toBuffer();
 
-        next.marketplace_banner = `/${marketplaceBannerRelPath.replace(/\\/g, "/")}`;
+        next.marketplace_banner = await uploadBufferToCloudinary(marketplaceBannerBuffer, {
+          folder: cloudinaryFolder,
+          publicId: "marketplace-banner",
+        });
       }
 
       next.branding_updated_at = new Date().toISOString();
