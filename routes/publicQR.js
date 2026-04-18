@@ -2789,6 +2789,8 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
 
     const unavailableSet = new Set();
     const reservedSet = new Set();
+    const includeCurrentOccupancy =
+      !requestedDateYmd || requestedDateYmd === currentLocalYmd();
 
     busyRows.forEach((row) => {
       const tableNumber = Number(row?.table_number);
@@ -2796,7 +2798,12 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
       const status = String(row?.status || "").toLowerCase();
 
       if (!isReservationLikeRow(row)) {
+        if (!includeCurrentOccupancy) return;
         unavailableSet.add(tableNumber);
+        return;
+      }
+
+      if (isCheckedInLike(status) && !includeCurrentOccupancy) {
         return;
       }
 
@@ -2815,6 +2822,9 @@ router.get("/unavailable-tables/:identifier", async (req, res) => {
       if (!Number.isFinite(tableNumber) || tableNumber <= 0) return;
 
       const reservationOrderStatus = String(row?.reservation_order_status || "").toLowerCase();
+      if (isCheckedInLike(reservationOrderStatus) && !includeCurrentOccupancy) {
+        return;
+      }
       if (!isCheckedInLike(reservationOrderStatus) && !isScheduledForToday(row)) {
         return;
       }
