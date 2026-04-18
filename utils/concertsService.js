@@ -408,6 +408,10 @@ function sanitizeEventInput(payload = {}, { isPatch = false } = {}) {
     bank_transfer_instructions: asNullableText(payload.bank_transfer_instructions),
     status,
     free_concert: asBoolean(payload.free_concert, false),
+    hide_ticket_amount_display_badge: asBoolean(
+      payload.hide_ticket_amount_display_badge,
+      false
+    ),
     guest_composition_enabled: asBoolean(payload.guest_composition_enabled, false),
     guest_composition_field_mode: normalizeGuestCompositionFieldMode(
       payload.guest_composition_field_mode,
@@ -499,6 +503,10 @@ async function ensureConcertTables(pool) {
   await pool.query(`
     ALTER TABLE concert_events
     ADD COLUMN IF NOT EXISTS free_concert BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+  await pool.query(`
+    ALTER TABLE concert_events
+    ADD COLUMN IF NOT EXISTS hide_ticket_amount_display_badge BOOLEAN NOT NULL DEFAULT FALSE
   `);
   await pool.query(`
     ALTER TABLE concert_events
@@ -946,6 +954,9 @@ async function buildEventView(client, eventRow, bookingSettings = null) {
     bank_transfer_instructions: eventRow.bank_transfer_instructions || "",
     status: normalizeEventStatus(eventRow.status, "active"),
     free_concert: Boolean(eventRow.free_concert),
+    hide_ticket_amount_display_badge: Boolean(
+      eventRow.hide_ticket_amount_display_badge
+    ),
     guest_composition_enabled: Boolean(eventRow.guest_composition_enabled),
     guest_composition_field_mode: normalizeGuestCompositionFieldMode(
       eventRow.guest_composition_field_mode,
@@ -1061,6 +1072,7 @@ async function createEvent(pool, restaurantId, payload) {
         bank_transfer_instructions,
         status,
         free_concert,
+        hide_ticket_amount_display_badge,
         guest_composition_enabled,
         guest_composition_field_mode,
         guest_composition_restriction_rule,
@@ -1069,7 +1081,7 @@ async function createEvent(pool, restaurantId, payload) {
       )
       VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-        'bank_transfer', $11, $12, $13, $14, $15, $16, $17, $18::jsonb
+        'bank_transfer', $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb
       )
       RETURNING id
       `,
@@ -1087,6 +1099,7 @@ async function createEvent(pool, restaurantId, payload) {
         clean.bank_transfer_instructions,
         clean.status,
         clean.free_concert,
+        clean.hide_ticket_amount_display_badge,
         clean.guest_composition_enabled,
         clean.guest_composition_field_mode,
         clean.guest_composition_restriction_rule,
@@ -1139,11 +1152,12 @@ async function updateEvent(pool, restaurantId, eventId, payload) {
           bank_transfer_instructions = $12,
           status = $13,
           free_concert = $14,
-          guest_composition_enabled = $15,
-          guest_composition_field_mode = $16,
-          guest_composition_restriction_rule = $17,
-          guest_composition_validation_message = $18,
-          floor_plan_layout = $19::jsonb,
+          hide_ticket_amount_display_badge = $15,
+          guest_composition_enabled = $16,
+          guest_composition_field_mode = $17,
+          guest_composition_restriction_rule = $18,
+          guest_composition_validation_message = $19,
+          floor_plan_layout = $20::jsonb,
           updated_at = NOW()
       WHERE restaurant_id = $1
         AND id = $2
@@ -1163,6 +1177,7 @@ async function updateEvent(pool, restaurantId, eventId, payload) {
         clean.bank_transfer_instructions,
         clean.status,
         clean.free_concert,
+        clean.hide_ticket_amount_display_badge,
         clean.guest_composition_enabled,
         clean.guest_composition_field_mode,
         clean.guest_composition_restriction_rule,
