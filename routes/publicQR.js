@@ -530,6 +530,42 @@ function getCurrentMinuteOfDay(timeZone = process.env.REPORTS_TIMEZONE || "Europ
   }
 }
 
+function getDateTimeTimePart(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const parts = raw.split(/[T\s]+/);
+  return parts.length >= 2 ? String(parts[1] || "").trim() : "";
+}
+
+function shouldIncludeCurrentReservationOccupancy({
+  reservationDateYmd = "",
+  requestedSlot = null,
+} = {}) {
+  const targetDateYmd = String(reservationDateYmd || "").trim();
+  if (!targetDateYmd) return true;
+  if (targetDateYmd !== currentLocalYmd()) return false;
+  if (!requestedSlot || typeof requestedSlot !== "object") return true;
+
+  const nowMinuteOfDay = getCurrentMinuteOfDay();
+  if (!Number.isFinite(nowMinuteOfDay)) return false;
+
+  const slotStartMinute = parseTimeToMinutes(
+    getDateTimeTimePart(requestedSlot?.slot_start_datetime)
+  );
+  const slotEndMinute = parseTimeToMinutes(
+    getDateTimeTimePart(requestedSlot?.slot_end_datetime)
+  );
+  if (!Number.isFinite(slotStartMinute) || !Number.isFinite(slotEndMinute)) {
+    return false;
+  }
+
+  if (slotStartMinute === slotEndMinute) return true;
+  if (slotEndMinute > slotStartMinute) {
+    return nowMinuteOfDay >= slotStartMinute && nowMinuteOfDay < slotEndMinute;
+  }
+  return nowMinuteOfDay >= slotStartMinute || nowMinuteOfDay < slotEndMinute;
+}
+
 function getCurrentWeekdayKey(timeZone = process.env.REPORTS_TIMEZONE || "Europe/Istanbul") {
   try {
     return new Intl.DateTimeFormat("en-US", {
@@ -692,6 +728,10 @@ function evaluatePublicReservationAvailability({
   targetDateYmd = "",
 }) {
   const maxPerTablePerDay = asPositiveInt(bookingSettings.reservation_max_per_table_per_day, 0);
+  const includeCurrentOccupancy = shouldIncludeCurrentReservationOccupancy({
+    reservationDateYmd: targetDateYmd,
+    requestedSlot,
+  });
   const overlappingTableSet = new Set();
   const perDayReservationCount = new Map();
 
@@ -723,7 +763,7 @@ function evaluatePublicReservationAvailability({
     if (!Number.isFinite(tableNumber) || tableNumber <= 0) continue;
 
     const seats = asPositiveInt(table?.seats ?? table?.guests, 0);
-    const isLocked = Boolean(table?.locked);
+    const isLocked = includeCurrentOccupancy && Boolean(table?.locked);
     const exceedsGuestCount = guestCount > 0 && seats > 0 && guestCount > seats;
     const exceedsDailyLimit =
       maxPerTablePerDay > 0 &&
@@ -747,7 +787,7 @@ function evaluatePublicReservationAvailability({
   }
 
   const totalBookableTables = (Array.isArray(tables) ? tables : []).filter(
-    (table) => !Boolean(table?.locked)
+    (table) => !includeCurrentOccupancy || !Boolean(table?.locked)
   ).length;
   const limitedThreshold = Math.max(1, Math.ceil(totalBookableTables / 3));
   const availabilityStatus =
@@ -916,6 +956,7 @@ function buildReservationFloorPlanTableStates({
   guestCount = 0,
   reservationMen = null,
   reservationWomen = null,
+  includeCurrentOccupancy = true,
 }) {
   const layoutIndex = buildFloorPlanElementIndex(layout);
   const availableSet = new Set(
@@ -952,7 +993,7 @@ function buildReservationFloorPlanTableStates({
     if (element?.hidden || restriction.reason === "Hidden table") {
       status = "hidden";
       reason = restriction.reason;
-    } else if (Boolean(table?.locked)) {
+    } else if (includeCurrentOccupancy && Boolean(table?.locked)) {
       status = "blocked";
       reason = "Table is locked";
     } else if (!restriction.valid) {
@@ -2458,6 +2499,10 @@ router.get("/floor-plan/:identifier", async (req, res) => {
     let unavailableTableNumbers = [];
     let reservedTableNumbers = [];
     let selectedSlot = null;
+    const includeCurrentOccupancy = shouldIncludeCurrentReservationOccupancy({
+      reservationDateYmd: requestedDate,
+      requestedSlot: selectedSlot,
+    });
 
     if (/^\d{4}-\d{2}-\d{2}$/.test(requestedDate) && requestedTime) {
       const requestedSlot = computeReservationSlot({
@@ -2495,6 +2540,7 @@ router.get("/floor-plan/:identifier", async (req, res) => {
       guestCount,
       reservationMen,
       reservationWomen,
+      includeCurrentOccupancy,
     });
 
     return res.json({
