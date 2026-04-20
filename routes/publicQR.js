@@ -78,6 +78,37 @@ const QR_BRANDING_DEFAULTS = {
 const QR_BOOKING_DEFAULTS = {
   ...DEFAULT_BOOKING_SLOT_SETTINGS,
 };
+const QR_MENU_DEFAULT_DISPLAY_ORDER = [
+  "products_search_categories",
+  "concert_tickets_events",
+  "popular_this_week",
+  "hero_slider",
+  "loyalty_program",
+  "our_story_section",
+  "story_images",
+  "customer_reviews",
+];
+
+function normalizeQrMenuDisplayOrder(value) {
+  const normalizedOrder = [];
+  const seen = new Set();
+
+  (Array.isArray(value) ? value : []).forEach((entry) => {
+    const normalizedEntry = String(entry || "").trim();
+    if (!normalizedEntry) return;
+    if (!QR_MENU_DEFAULT_DISPLAY_ORDER.includes(normalizedEntry)) return;
+    if (seen.has(normalizedEntry)) return;
+    seen.add(normalizedEntry);
+    normalizedOrder.push(normalizedEntry);
+  });
+
+  QR_MENU_DEFAULT_DISPLAY_ORDER.forEach((entry) => {
+    if (seen.has(entry)) return;
+    normalizedOrder.push(entry);
+  });
+
+  return normalizedOrder;
+}
 
 function parseCustomizationPayload(row) {
   if (!row) return {};
@@ -2995,6 +3026,7 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
       phone: "",
       primary_color: "#4F46E5",
       hero_slides: [],
+      display_order: QR_MENU_DEFAULT_DISPLAY_ORDER,
       story_title: "",
       story_text: "",
       story_image: "",
@@ -3042,6 +3074,9 @@ router.get("/qr-menu-customization/:slug", async (req, res) => {
     ) {
       mergedCustomization.call_waiter_button_enabled = data.call_button_enabled !== false;
     }
+    mergedCustomization.display_order = normalizeQrMenuDisplayOrder(
+      data?.display_order ?? mergedCustomization.display_order
+    );
     const sanitizedBranding = {
       ...mergedCustomization,
       app_icon: resolveAvailableAssetPath(mergedCustomization.app_icon, ""),

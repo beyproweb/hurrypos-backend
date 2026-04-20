@@ -808,6 +808,37 @@ const BRANDING_DEFAULTS = {
   concert_reservation_button_color: "#111827",
   qr_floor_plan_layout: null,
 };
+const QR_MENU_DEFAULT_DISPLAY_ORDER = [
+  "products_search_categories",
+  "concert_tickets_events",
+  "popular_this_week",
+  "hero_slider",
+  "loyalty_program",
+  "our_story_section",
+  "story_images",
+  "customer_reviews",
+];
+
+function normalizeQrMenuDisplayOrder(value) {
+  const normalizedOrder = [];
+  const seen = new Set();
+
+  (Array.isArray(value) ? value : []).forEach((entry) => {
+    const normalizedEntry = String(entry || "").trim();
+    if (!normalizedEntry) return;
+    if (!QR_MENU_DEFAULT_DISPLAY_ORDER.includes(normalizedEntry)) return;
+    if (seen.has(normalizedEntry)) return;
+    seen.add(normalizedEntry);
+    normalizedOrder.push(normalizedEntry);
+  });
+
+  QR_MENU_DEFAULT_DISPLAY_ORDER.forEach((entry) => {
+    if (seen.has(entry)) return;
+    normalizedOrder.push(entry);
+  });
+
+  return normalizedOrder;
+}
 
 function parseCustomizationPayload(row) {
   if (!row) return {};
@@ -982,7 +1013,7 @@ async function saveQrMenuCustomization(restaurantId, payload) {
 }
 
 // Place these BEFORE the generic /:section handlers so they are not shadowed
-router.get("/qr-menu-customization", async (req, res) => {
+const getQrMenuCustomizationHandler = async (req, res) => {
   try {
     const restaurantId = req.user.restaurant_id;
     const {
@@ -1027,6 +1058,7 @@ router.get("/qr-menu-customization", async (req, res) => {
       primary_color: "#4F46E5",
 
       hero_slides: [],
+  display_order: QR_MENU_DEFAULT_DISPLAY_ORDER,
 
       story_title: "",
       story_text: "",
@@ -1090,6 +1122,9 @@ router.get("/qr-menu-customization", async (req, res) => {
     ) {
       customization.call_waiter_button_enabled = data.call_button_enabled !== false;
     }
+    customization.display_order = normalizeQrMenuDisplayOrder(
+      data?.display_order ?? customization.display_order
+    );
 
     res.json({
       success: true,
@@ -1107,9 +1142,12 @@ router.get("/qr-menu-customization", async (req, res) => {
     console.error("❌ Failed to load QR menu customization:", err);
     res.status(500).json({ error: "Failed to load QR menu customization" });
   }
-});
+};
 
-router.post("/qr-menu-customization", async (req, res) => {
+router.get("/qr-menu-customization", getQrMenuCustomizationHandler);
+router.get("/qrmenu", getQrMenuCustomizationHandler);
+
+const postQrMenuCustomizationHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     await ensureRestaurantCustomDomainColumn();
@@ -1202,6 +1240,9 @@ router.post("/qr-menu-customization", async (req, res) => {
     delete sanitizedNewData.slug;
     delete sanitizedNewData.generated_slug;
     delete sanitizedNewData.restaurant_slug;
+    if (Object.prototype.hasOwnProperty.call(sanitizedNewData, "display_order")) {
+      sanitizedNewData.display_order = normalizeQrMenuDisplayOrder(sanitizedNewData.display_order);
+    }
     if (Object.prototype.hasOwnProperty.call(sanitizedNewData, "delivery_zone_cities")) {
       sanitizedNewData.delivery_zone_cities = normalizeDeliveryZoneCitiesInput(
         sanitizedNewData.delivery_zone_cities
@@ -1233,6 +1274,7 @@ router.post("/qr-menu-customization", async (req, res) => {
       ...existingData,
       ...sanitizedNewData,
     };
+    mergedData.display_order = normalizeQrMenuDisplayOrder(mergedData.display_order);
 
     await client.query(
       `
@@ -1269,7 +1311,10 @@ router.post("/qr-menu-customization", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+
+router.post("/qr-menu-customization", postQrMenuCustomizationHandler);
+router.post("/qrmenu", postQrMenuCustomizationHandler);
 
 router.post(
   "/qr-menu-branding-assets",
