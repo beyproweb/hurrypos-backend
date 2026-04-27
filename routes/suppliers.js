@@ -2519,6 +2519,205 @@ const parseCurrency = (text) => {
     }
   });
 
+  // GET /suppliers/ingredients - distinct ingredient list across supplier-linked stock
+  router.get("/ingredients", async (req, res) => {
+    try {
+      const restaurantId = req.user.restaurant_id;
+      const result = await pool.query(
+        `
+        SELECT DISTINCT ON (LOWER(BTRIM(name)), LOWER(BTRIM(unit)))
+          name,
+          unit,
+          supplier_id,
+          COALESCE(price_per_unit, 0) AS price_per_unit,
+          quantity
+        FROM stock
+        WHERE restaurant_id = $1
+          AND supplier_id IS NOT NULL
+        ORDER BY LOWER(BTRIM(name)), LOWER(BTRIM(unit)), id DESC
+        `,
+        [restaurantId]
+      );
+      res.json(result.rows);
+    } catch (err) {
+      const missingPricePerUnit =
+        String(err?.code || "") === "42703" ||
+        String(err?.message || "").toLowerCase().includes("price_per_unit");
+      if (missingPricePerUnit) {
+        try {
+          const fallback = await pool.query(
+            `
+            SELECT DISTINCT ON (LOWER(BTRIM(name)), LOWER(BTRIM(unit)))
+              name,
+              unit,
+              supplier_id,
+              0::numeric AS price_per_unit,
+              quantity
+            FROM stock
+            WHERE restaurant_id = $1
+              AND supplier_id IS NOT NULL
+            ORDER BY LOWER(BTRIM(name)), LOWER(BTRIM(unit)), id DESC
+            `,
+            [restaurantId]
+          );
+          return res.json(fallback.rows);
+        } catch (fallbackErr) {
+          console.error("❌ Error fetching supplier ingredients fallback:", fallbackErr);
+        }
+      }
+      console.error("❌ Error fetching supplier ingredients:", err);
+      res.status(500).json({ error: "Database error" });
+    }
+  });
+
+  // GET /suppliers/:id - tenant-safe supplier details with aggregates
+  router.get("/:id", async (req, res) => {
+    try {
+      const restaurantId = req.user.restaurant_id;
+      const supplierId = toFiniteNumber(req.params?.id);
+      if (!supplierId) {
+        return res.status(400).json({ error: "Invalid supplier id" });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT
+          s.*,
+          COALESCE(tx.total_spent, 0)::numeric AS total_spent,
+          COALESCE(tx.total_spent, 0)::numeric AS total_purchase,
+          COALESCE(tx.total_paid, 0)::numeric AS total_paid,
+          tx.last_purchase_date
+        FROM suppliers s
+        LEFT JOIN (
+          SELECT
+            supplier_id,
+            COALESCE(SUM(
+              CASE
+                WHEN ingredient <> 'Payment' THEN total_cost
+                ELSE 0
+              END
+            ), 0) AS total_spent,
+            COALESCE(SUM(
+              CASE
+                WHEN ingredient = 'Payment' THEN amount_paid
+                ELSE 0
+              END
+            ), 0) AS total_paid,
+            MAX(
+              CASE
+                WHEN ingredient <> 'Payment' THEN delivery_date
+                ELSE NULL
+              END
+            ) AS last_purchase_date
+          FROM transactions
+          WHERE restaurant_id = $1
+          GROUP BY supplier_id
+        ) AS tx
+          ON tx.supplier_id = s.id
+        WHERE s.restaurant_id = $1
+          AND s.id = $2
+        LIMIT 1
+        `,
+        [restaurantId, supplierId]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: "Supplier not found" });
+      }
+
+      res.json(result.rows[0]);
+    } catch (err) {
+      console.error("❌ Error fetching supplier details:", err);
+      res.status(500).json({ error: "Database error" });
+    }
+  });
+
+  // GET /suppliers/:id/transactions - tenant-safe supplier transaction history
+  router.get("/:id/transactions", async (req, res) => {
+    try {
+      const restaurantId = req.user.restaurant_id;
+      const supplierId = toFiniteNumber(req.params?.id);
+      if (!supplierId) {
+        return res.status(400).json({ error: "Invalid supplier id" });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM transactions
+        WHERE restaurant_id = $1
+          AND supplier_id = $2
+        ORDER BY COALESCE(delivery_date, created_at, NOW()) DESC, id DESC
+        `,
+        [restaurantId, supplierId]
+      );
+
+      res.json(result.rows);
+    } catch (err) {
+      console.error("❌ Error fetching supplier transactions:", err);
+      res.status(500).json({ error: "Database error" });
+    }
+  });
+
+  // GET /suppliers/:id/ingredients - tenant-safe supplier ingredient list
+  router.get("/:id/ingredients", async (req, res) => {
+    try {
+      const restaurantId = req.user.restaurant_id;
+      const supplierId = toFiniteNumber(req.params?.id);
+      if (!supplierId) {
+        return res.status(400).json({ error: "Invalid supplier id" });
+      }
+
+      const result = await pool.query(
+        `
+        SELECT DISTINCT ON (LOWER(BTRIM(name)), LOWER(BTRIM(unit)))
+          id,
+          name,
+          unit,
+          supplier_id,
+          COALESCE(price_per_unit, 0) AS price_per_unit,
+          quantity
+        FROM stock
+        WHERE restaurant_id = $1
+          AND supplier_id = $2
+        ORDER BY LOWER(BTRIM(name)), LOWER(BTRIM(unit)), id DESC
+        `,
+        [restaurantId, supplierId]
+      );
+
+      res.json(result.rows);
+    } catch (err) {
+      const missingPricePerUnit =
+        String(err?.code || "") === "42703" ||
+        String(err?.message || "").toLowerCase().includes("price_per_unit");
+      if (missingPricePerUnit) {
+        try {
+          const fallback = await pool.query(
+            `
+            SELECT DISTINCT ON (LOWER(BTRIM(name)), LOWER(BTRIM(unit)))
+              id,
+              name,
+              unit,
+              supplier_id,
+              0::numeric AS price_per_unit,
+              quantity
+            FROM stock
+            WHERE restaurant_id = $1
+              AND supplier_id = $2
+            ORDER BY LOWER(BTRIM(name)), LOWER(BTRIM(unit)), id DESC
+            `,
+            [restaurantId, supplierId]
+          );
+          return res.json(fallback.rows);
+        } catch (fallbackErr) {
+          console.error("❌ Error fetching supplier-specific ingredients fallback:", fallbackErr);
+        }
+      }
+      console.error("❌ Error fetching supplier-specific ingredients:", err);
+      res.status(500).json({ error: "Database error" });
+    }
+  });
+
   // POST /suppliers - tenant-safe
   router.post("/", async (req, res) => {
     try {

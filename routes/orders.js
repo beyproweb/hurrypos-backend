@@ -3044,6 +3044,7 @@ router.post("/", async (req, res) => {
       payment_method,
       reservation_clients,
     } = req.body;
+    const normalizedOrderType = String(order_type || "").trim().toLowerCase();
     const marketplaceCustomer = req.marketplaceCustomer || null;
     const normalizedCustomerEmail = normalizeCustomerEmail(customer_email);
     const normalizedMarketplaceEmail = normalizeCustomerEmail(
@@ -3070,6 +3071,15 @@ router.post("/", async (req, res) => {
         req.headers?.["x-phone-verification-token"] ||
         ""
     );
+    const skipPhoneVerificationHeader =
+      String(req.headers?.["x-skip-phone-verification"] || "").trim() === "1";
+    const requestUserRole = String(req.user?.role || "").trim().toLowerCase();
+    const isQrScopedRole = ["qr-customer", "qr-guest", "qr-table"].includes(requestUserRole);
+    const shouldBypassPhoneVerification =
+      normalizedOrderType === "phone" &&
+      skipPhoneVerificationHeader &&
+      !marketplaceCustomer?.id &&
+      !isQrScopedRole;
     const hasReservationClientsInPayload =
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservation_clients") ||
       Object.prototype.hasOwnProperty.call(req.body || {}, "reservationClients");
@@ -3092,7 +3102,7 @@ router.post("/", async (req, res) => {
       }
     }
 
-    if (requiresVerifiedPhoneForOrderType(order_type)) {
+    if (requiresVerifiedPhoneForOrderType(order_type) && !shouldBypassPhoneVerification) {
       if (!effectiveCustomerPhone) {
         return res.status(400).json({
           error: "Valid phone number is required for this checkout flow.",

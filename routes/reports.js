@@ -1028,7 +1028,6 @@ async function fetchCashSalesLite(restaurantId, startTs, endTs) {
 
 async function fetchCashExpenses(restaurantId, startTs, endTs, options = {}) {
   const includeTransactions = options.includeTransactions !== false;
-  const cashMethods = ["cash", "Cash", "CASH"];
 
   const res1 = await pool
     .query({
@@ -1036,11 +1035,11 @@ async function fetchCashExpenses(restaurantId, startTs, endTs, options = {}) {
       SELECT COALESCE(SUM(amount), 0) AS total
       FROM cash_register_logs
       WHERE restaurant_id = $1
-        AND type = 'expense'
+        AND type = ANY($4)
         AND created_at >= $2
         AND created_at < $3
       `,
-      values: [restaurantId, startTs, endTs],
+      values: [restaurantId, startTs, endTs, ["expense", "supplier", "payroll", "change"]],
       query_timeout: RECON_QUERY_TIMEOUT_MS,
     })
     .catch(() => ({ rows: [{ total: 0 }] }));
@@ -1052,11 +1051,11 @@ async function fetchCashExpenses(restaurantId, startTs, endTs, options = {}) {
           SELECT COALESCE(SUM(amount_paid), 0) AS total
           FROM transactions
           WHERE restaurant_id = $1
-            AND delivery_date >= $2
-            AND delivery_date < $3
-            AND payment_method = ANY($4)
+            AND COALESCE(created_at, delivery_date::timestamptz) >= $2::timestamptz
+            AND COALESCE(created_at, delivery_date::timestamptz) < $3::timestamptz
+            AND ${isCashMethodSql("payment_method")}
           `,
-          values: [restaurantId, startTs, endTs, cashMethods],
+          values: [restaurantId, startTs, endTs],
           query_timeout: RECON_QUERY_TIMEOUT_MS,
         })
         .catch(() => ({ rows: [{ total: 0 }] }))
@@ -1068,11 +1067,11 @@ async function fetchCashExpenses(restaurantId, startTs, endTs, options = {}) {
       SELECT COALESCE(SUM(amount), 0) AS total
       FROM staff_payments
       WHERE restaurant_id = $1
-        AND created_at >= $2
-        AND created_at < $3
-        AND payment_method = ANY($4)
+        AND COALESCE(created_at, payment_date::timestamptz, scheduled_date::timestamptz) >= $2::timestamptz
+        AND COALESCE(created_at, payment_date::timestamptz, scheduled_date::timestamptz) < $3::timestamptz
+        AND ${isCashMethodSql("payment_method")}
       `,
-      values: [restaurantId, startTs, endTs, cashMethods],
+      values: [restaurantId, startTs, endTs],
       query_timeout: RECON_QUERY_TIMEOUT_MS,
     })
     .catch(() => ({ rows: [{ total: 0 }] }));
@@ -1211,7 +1210,8 @@ async function buildRegisterReconciliationSnapshot({
     };
   }
 
-  const startTs = openTs.toISOString();
+  const requestedOpenIso = openTs.toISOString();
+  let startTs = requestedOpenIso;
   let posTotals = { cash_total: 0, card_total: 0, other_total: 0, grand_total: 0 };
   let cardByOrderType = emptyCardTypeTotals();
   let expenses = {
@@ -1227,6 +1227,59 @@ async function buildRegisterReconciliationSnapshot({
     payment_method_change_count: 0,
   };
   let cashSalesForExpected = null;
+  let openingFloat = 0;
+  let resolvedOpenRow = null;
+
+  try {
+    const windowStartIso = new Date(openTs.getTime() - 1000).toISOString();
+    const windowEndIso = new Date(openTs.getTime() + 1000).toISOString();
+    const exactOpenRes = await pool.query(
+      `
+      SELECT created_at, amount
+      FROM cash_register_logs
+      WHERE restaurant_id = $1
+        AND type = 'open'
+        AND created_at >= $2::timestamptz
+        AND created_at <= $3::timestamptz
+      ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - $4::timestamptz))) ASC
+      LIMIT 1
+      `,
+      [restaurantId, windowStartIso, windowEndIso, requestedOpenIso]
+    );
+
+    if (exactOpenRes.rows?.[0]) {
+      resolvedOpenRow = exactOpenRes.rows[0];
+    } else {
+      const fallbackOpenRes = await pool.query(
+        `
+        SELECT created_at, amount
+        FROM cash_register_logs
+        WHERE restaurant_id = $1
+          AND type = 'open'
+          AND created_at <= $2::timestamptz
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [restaurantId, requestedOpenIso]
+      );
+      resolvedOpenRow = fallbackOpenRes.rows?.[0] || null;
+    }
+
+    if (resolvedOpenRow?.created_at) {
+      startTs = new Date(resolvedOpenRow.created_at).toISOString();
+      openingFloat = parseFloat(resolvedOpenRow.amount || 0);
+    }
+
+    console.log("🔎 [reconciliation] session open log resolved", {
+      restaurantId,
+      requestedOpenTime: requestedOpenIso,
+      resolvedOpenAt: startTs,
+      openingFloat,
+      openRow: resolvedOpenRow || null,
+    });
+  } catch (err) {
+    errors.push({ section: "openingFloatResolve", message: String(err?.message || err) });
+  }
 
   // ⚡ ESSENTIAL MODE: Skip heavy queries, just get opening float
   if (mode === "essential") {
@@ -1235,11 +1288,11 @@ async function buildRegisterReconciliationSnapshot({
       fetchPosTotalsLite(restaurantId, startTs, nowIso),
       fetchCardTotalsByOrderTypeLite(restaurantId, startTs, nowIso),
       fetchCashExpenses(restaurantId, startTs, nowIso, { includeTransactions: true }),
-      fetchCashSalesLite(restaurantId, startTs, nowIso),
     ]);
 
     if (essentialResults[0].status === "fulfilled") {
       posTotals = essentialResults[0].value || posTotals;
+      cashSalesForExpected = Number(essentialResults[0].value?.cash_total || 0);
     } else {
       errors.push({
         section: "posTotalsLite",
@@ -1266,15 +1319,6 @@ async function buildRegisterReconciliationSnapshot({
       errors.push({
         section: "cashExpensesLite",
         message: String(essentialResults[2].reason?.message || essentialResults[2].reason),
-      });
-    }
-
-    if (essentialResults[3].status === "fulfilled") {
-      cashSalesForExpected = Number(essentialResults[3].value || 0);
-    } else {
-      errors.push({
-        section: "cashSalesLite",
-        message: String(essentialResults[3].reason?.message || essentialResults[3].reason),
       });
     }
   } else {
@@ -1312,32 +1356,6 @@ async function buildRegisterReconciliationSnapshot({
     }
   }
 
-  // Opening float from the relevant open log
-  let openRows = [];
-  let openingFloat = 0;
-  try {
-    const res = await pool.query(
-      `
-      SELECT created_at, amount
-      FROM cash_register_logs
-      WHERE restaurant_id = $1
-        AND type = 'open'
-        AND created_at <= $2::timestamptz
-      ORDER BY created_at DESC
-      LIMIT 1
-      `,
-      [restaurantId, openTs.toISOString()]
-    );
-    openRows = res.rows || [];
-    console.log("🔎 [reconciliation] opening float lookup", {
-      restaurantId,
-      openTime: openTs.toISOString(),
-      openRow: openRows[0] || null,
-    });
-    openingFloat = parseFloat(openRows?.[0]?.amount || 0);
-  } catch (err) {
-    errors.push({ section: "openingFloat", message: String(err?.message || err) });
-  }
   if (!openingFloat) {
     try {
       const { rows: prevClose } = await pool.query(
@@ -1350,7 +1368,7 @@ async function buildRegisterReconciliationSnapshot({
         ORDER BY created_at DESC
         LIMIT 1
         `,
-        [restaurantId, openTs.toISOString()]
+        [restaurantId, startTs]
       );
       openingFloat = parseFloat(prevClose?.[0]?.amount || 0);
     } catch (err) {
@@ -1367,7 +1385,7 @@ async function buildRegisterReconciliationSnapshot({
   console.log("💵 [reconciliation] expected-cash components", {
     restaurantId,
     mode,
-    openTime: openRows?.[0]?.created_at || startTs,
+    openTime: resolvedOpenRow?.created_at || startTs,
     openingFloat,
     cashSalesForExpected:
       cashSalesForExpected != null ? cashSalesForExpected : posTotals.cash_total || 0,
@@ -1377,7 +1395,7 @@ async function buildRegisterReconciliationSnapshot({
   });
 
   return {
-    session: { openTime: openRows?.[0]?.created_at || startTs, nowTime: nowIso },
+    session: { openTime: resolvedOpenRow?.created_at || startTs, nowTime: nowIso },
     posTotals,
     cardByOrderType,
     cashReconciliation: {
@@ -1995,7 +2013,9 @@ router.get("/daily-cash-expenses", async (req, res) => {
       `
       SELECT COALESCE(SUM(amount_paid), 0) AS total
       FROM transactions
-      WHERE restaurant_id = $1 AND delivery_date >= $2 AND LOWER(payment_method) = 'cash'
+      WHERE restaurant_id = $1
+        AND COALESCE(created_at, delivery_date::timestamptz) >= $2::timestamptz
+        AND ${isCashMethodSql("payment_method")}
       `,
       [restaurantId, openTime]
     );
@@ -2005,7 +2025,9 @@ router.get("/daily-cash-expenses", async (req, res) => {
       `
       SELECT COALESCE(SUM(amount), 0) AS total
       FROM staff_payments
-      WHERE restaurant_id = $1 AND created_at >= $2 AND LOWER(payment_method) = 'cash'
+      WHERE restaurant_id = $1
+        AND COALESCE(created_at, payment_date::timestamptz, scheduled_date::timestamptz) >= $2::timestamptz
+        AND ${isCashMethodSql("payment_method")}
       `,
       [restaurantId, openTime]
     );
@@ -2492,7 +2514,10 @@ router.post("/cash-register-log", async (req, res) => {
   // Normalize and validate type/amount
   const normalizedType = String(type || "").toLowerCase().trim();
   const ALLOWED_DB_TYPES = new Set(["open", "close", "entry", "expense"]);
-  const mappedType = normalizedType === "change" ? "expense" : normalizedType;
+  const EXPENSE_TYPES = new Set(["change", "supplier", "payroll", "expense"]);
+  const mappedType = EXPENSE_TYPES.has(normalizedType)
+    ? "expense"
+    : normalizedType;
 
   const countedCashRaw =
     mappedType === "close"
