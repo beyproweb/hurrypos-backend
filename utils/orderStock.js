@@ -9,6 +9,12 @@ const formatQuantity = (value) => {
   return Number.isInteger(rounded) ? String(rounded) : String(rounded);
 };
 
+const normalizeVolumeUnit = (unit) => {
+  const normalized = String(unit || "").trim().toLowerCase();
+  if (normalized === "lt") return "l";
+  return normalized;
+};
+
 // ✅ Update stock based on ingredients and extras
 async function updateStockForOrder(orderItems, restaurantId, io) {
   const ioRef = io || getIO();
@@ -118,6 +124,8 @@ async function updateStockForOrder(orderItems, restaurantId, io) {
 
       if (stockRes.rows.length) {
         const stockUnit = (stockRes.rows[0].unit || "").toLowerCase();
+        const normalizedIngUnit = normalizeVolumeUnit(ingUnit);
+        const normalizedStockUnit = normalizeVolumeUnit(stockUnit);
 
         // Normalize units (g/kg, ml/l, piece/portion)
         if (ingUnit && ingUnit !== stockUnit) {
@@ -127,10 +135,10 @@ async function updateStockForOrder(orderItems, restaurantId, io) {
           } else if (ingUnit === "kg" && stockUnit === "g") {
             amountPerUnit *= 1000;
             ingUnit = stockUnit;
-          } else if (ingUnit === "ml" && stockUnit === "l") {
+          } else if (normalizedIngUnit === "ml" && normalizedStockUnit === "l") {
             amountPerUnit /= 1000;
             ingUnit = stockUnit;
-          } else if (ingUnit === "l" && stockUnit === "ml") {
+          } else if (normalizedIngUnit === "l" && normalizedStockUnit === "ml") {
             amountPerUnit *= 1000;
             ingUnit = stockUnit;
           } else if (
@@ -234,6 +242,8 @@ async function updateStockForOrder(orderItems, restaurantId, io) {
 
       if (stockRes.rows.length) {
         const stockUnit = (stockRes.rows[0].unit || "").toLowerCase();
+        const normalizedExtraUnit = normalizeVolumeUnit(extraUnit);
+        const normalizedStockUnit = normalizeVolumeUnit(stockUnit);
         if (extraUnit && extraUnit !== stockUnit) {
           if (extraUnit === "g" && stockUnit === "kg") {
             amountPerPortion /= 1000;
@@ -241,10 +251,10 @@ async function updateStockForOrder(orderItems, restaurantId, io) {
           } else if (extraUnit === "kg" && stockUnit === "g") {
             amountPerPortion *= 1000;
             extraUnit = stockUnit;
-          } else if (extraUnit === "ml" && stockUnit === "l") {
+          } else if (normalizedExtraUnit === "ml" && normalizedStockUnit === "l") {
             amountPerPortion /= 1000;
             extraUnit = stockUnit;
-          } else if (extraUnit === "l" && stockUnit === "ml") {
+          } else if (normalizedExtraUnit === "l" && normalizedStockUnit === "ml") {
             amountPerPortion *= 1000;
             extraUnit = stockUnit;
           } else if (

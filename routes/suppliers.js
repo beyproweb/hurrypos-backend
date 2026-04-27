@@ -2546,6 +2546,97 @@ const parseCurrency = (text) => {
     }
   });
 
+  // PUT /suppliers/:id/pay - record a supplier payment and reduce outstanding due
+  router.put("/:id/pay", async (req, res) => {
+    const supplierId = toFiniteNumber(req.params?.id);
+    const paymentAmount = toFiniteNumber(req.body?.payment);
+    const requestedTotalDue = toFiniteNumber(req.body?.total_due);
+    const paymentMethod = String(req.body?.payment_method || "Cash").trim() || "Cash";
+    const restaurantId = req.user.restaurant_id;
+
+    if (!supplierId) {
+      return res.status(400).json({ error: "Invalid supplier id" });
+    }
+
+    if (!(paymentAmount > 0)) {
+      return res.status(400).json({ error: "Payment amount must be greater than 0" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const supplierRes = await client.query(
+        `SELECT id, name, total_due
+           FROM suppliers
+          WHERE restaurant_id = $1 AND id = $2
+          FOR UPDATE`,
+        [restaurantId, supplierId]
+      );
+
+      if (supplierRes.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Supplier not found" });
+      }
+
+      const supplier = supplierRes.rows[0];
+      const currentDue = Number(supplier?.total_due) || 0;
+      const dueBasis =
+        requestedTotalDue !== null ? Math.max(currentDue, requestedTotalDue) : currentDue;
+      const newDue = Math.max(0, dueBasis - paymentAmount);
+
+      const paymentTx = await client.query(
+        `INSERT INTO transactions
+           (
+             restaurant_id,
+             supplier_id,
+             ingredient,
+             quantity,
+             unit,
+             total_cost,
+             amount_paid,
+             due_after,
+             payment_method,
+             delivery_date,
+             expiry_date,
+             receipt_url,
+             items
+           )
+         VALUES ($1,$2,'Payment',0,NULL,0,$3,$4,$5,NOW(),NULL,NULL,NULL)
+         RETURNING *`,
+        [restaurantId, supplierId, paymentAmount, newDue, paymentMethod]
+      );
+
+      await client.query(
+        `UPDATE suppliers
+            SET total_due = $1
+          WHERE restaurant_id = $2 AND id = $3`,
+        [newDue, restaurantId, supplierId]
+      );
+
+      await client.query("COMMIT");
+
+      io.emit("supplier-updated", { supplier_id: supplierId });
+
+      return res.json({
+        success: true,
+        message: "Payment recorded successfully",
+        supplier: {
+          id: supplierId,
+          name: supplier.name,
+          total_due: newDue,
+        },
+        transaction: paymentTx.rows[0],
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      console.error("❌ Error recording supplier payment:", error);
+      return res.status(500).json({ error: "Database error" });
+    } finally {
+      client.release();
+    }
+  });
+
   // ---------------- TRANSACTIONS ----------------
 
 // POST /suppliers/transactions
