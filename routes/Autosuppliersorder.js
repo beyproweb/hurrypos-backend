@@ -517,7 +517,12 @@ router.get("/supplier-carts/items", async (req, res) => {
         updated.last_auto_add_at = null;
       }
 
-      io.emit("stock-updated", { stockId: id });
+      io.to(`restaurant_${restaurantId}`).emit("stock-updated", {
+        stockId: id,
+        restaurantId,
+        stock: updated,
+        timestamp: Date.now(),
+      });
       res.json({ success: true, stock: updated });
     } catch (error) {
       console.error("❌ Error updating stock:", error);

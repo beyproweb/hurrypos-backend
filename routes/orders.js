@@ -2780,21 +2780,32 @@ router.get("/", async (req, res) => {
     const orderSelect = await getOrderListSelectSql();
     const restaurantId = await requireRestaurantId(req, res);
     if (!restaurantId) return;
-    const { status, table_number, type } = req.query;
+    const { status, table_number, type, since } = req.query;
 
     // Fire-and-forget, throttled to avoid opening extra DB connections on every poll.
     scheduleCloseStaleReservations(restaurantId);
 
     // 🔐 Special mode: always and only open phone/packet
     if (String(status).toLowerCase() === "open_phone") {
+      const params = [restaurantId];
+      let sinceClause = "";
+      const sinceRaw = String(since || "").trim();
+      if (sinceRaw) {
+        const sinceDate = /^\d+$/.test(sinceRaw) ? new Date(Number(sinceRaw)) : new Date(sinceRaw);
+        if (Number.isFinite(sinceDate.getTime())) {
+          params.push(sinceDate.toISOString());
+          sinceClause = `AND COALESCE(updated_at, created_at) >= $${params.length}`;
+        }
+      }
       const { rows } = await pool.query(
         `SELECT ${orderSelect.plain}
            FROM orders
           WHERE restaurant_id = $1
             AND order_type IN ('phone','packet')
             AND status <> 'closed'
+            ${sinceClause}
           ORDER BY id DESC`,
-        [restaurantId]
+        params
       );
       return res.json(rows);
     }
@@ -2815,6 +2826,14 @@ router.get("/", async (req, res) => {
     if (type) {
       sql += ` AND order_type = $${idx++}`;
       params.push(type);
+    }
+    const sinceRaw = String(since || "").trim();
+    if (sinceRaw) {
+      const sinceDate = /^\d+$/.test(sinceRaw) ? new Date(Number(sinceRaw)) : new Date(sinceRaw);
+      if (Number.isFinite(sinceDate.getTime())) {
+        sql += ` AND COALESCE(updated_at, created_at) >= $${idx++}`;
+        params.push(sinceDate.toISOString());
+      }
     }
     sql += " ORDER BY id DESC";
 
@@ -4261,7 +4280,26 @@ router.put("/:id/status", async (req, res) => {
       }
     }
 
-    io.to(`restaurant_${restaurantId}`).emit("orders_updated");
+    const lifecyclePayload = {
+      restaurantId,
+      orderId: Number(parsedId),
+      order_id: Number(parsedId),
+      table_number: updatedOrder?.table_number ?? existingOrder?.table_number ?? null,
+      status: updatedOrder?.status ?? existingOrder?.status ?? normalizedStatus ?? null,
+      order: updatedOrder,
+      timestamp: Date.now(),
+    };
+
+    io.to(`restaurant_${restaurantId}`).emit("orders_updated", {
+      restaurantId,
+      orderId: Number(parsedId),
+      timestamp: lifecyclePayload.timestamp,
+    });
+    if (normalizedStatus === "cancelled") {
+      io.to(`restaurant_${restaurantId}`).emit("order_cancelled", lifecyclePayload);
+    } else if (normalizedStatus === "closed") {
+      io.to(`restaurant_${restaurantId}`).emit("order_closed", lifecyclePayload);
+    }
     res.json(updatedOrder);
   } catch (err) {
     await client.query("ROLLBACK");
@@ -7045,11 +7083,15 @@ router.patch("/:id/move-table", async (req, res) => {
     await client.query("COMMIT");
 
     // Emit socket update
-    io.emit("table_moved", {
+    io.to(`restaurant_${req.user.restaurant_id}`).emit("table_moved", {
       order_id: id,
       from: order.table_number,
       to: new_table_number,
       order: updatedOrder.rows[0],
+    });
+    io.to(`restaurant_${req.user.restaurant_id}`).emit("orders_updated", {
+      restaurantId: req.user.restaurant_id,
+      timestamp: Date.now(),
     });
 
     res.json({
@@ -7893,7 +7935,7 @@ router.get("/reservations", async (req, res) => {
   const restaurantId = await requireRestaurantId(req, res);
   if (!restaurantId) return;
 
-  const { start_date, end_date, table_number } = req.query;
+  const { start_date, end_date, table_number, since } = req.query;
 
   try {
     await ensureReservationGuestCompositionFields();
@@ -7946,6 +7988,15 @@ router.get("/reservations", async (req, res) => {
     if (table_number) {
       query += ` AND table_number = $${paramIdx++}`;
       params.push(parseInt(table_number));
+    }
+
+    const sinceRaw = String(since || "").trim();
+    if (sinceRaw) {
+      const sinceDate = /^\d+$/.test(sinceRaw) ? new Date(Number(sinceRaw)) : new Date(sinceRaw);
+      if (Number.isFinite(sinceDate.getTime())) {
+        query += ` AND COALESCE(updated_at, created_at) >= $${paramIdx++}`;
+        params.push(sinceDate.toISOString());
+      }
     }
 
     query += ` ORDER BY

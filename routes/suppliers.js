@@ -2661,9 +2661,9 @@ const parseCurrency = (text) => {
 
   // GET /suppliers/:id/ingredients - tenant-safe supplier ingredient list
   router.get("/:id/ingredients", async (req, res) => {
+    const restaurantId = req.user.restaurant_id;
+    const supplierId = toFiniteNumber(req.params?.id);
     try {
-      const restaurantId = req.user.restaurant_id;
-      const supplierId = toFiniteNumber(req.params?.id);
       if (!supplierId) {
         return res.status(400).json({ error: "Invalid supplier id" });
       }
@@ -3328,9 +3328,15 @@ const parseCurrency = (text) => {
     }
 
     // 🔹 Emit updates to frontend
-    io.emit("stock-updated");
-    io.emit("supplier-updated", { supplier_id });
-    io.emit("ingredient-prices-updated");
+    io.to(`restaurant_${restaurantId}`).emit("stock-updated", {
+      restaurantId,
+      timestamp: Date.now(),
+    });
+    io.to(`restaurant_${restaurantId}`).emit("supplier-updated", { supplier_id });
+    io.to(`restaurant_${restaurantId}`).emit("ingredient-prices-updated", {
+      supplier_id,
+      timestamp: Date.now(),
+    });
 
     res.json({
       success: true,

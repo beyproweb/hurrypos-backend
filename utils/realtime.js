@@ -19,10 +19,35 @@ const emitOrderUpdate = (io, restaurantId) => {
   io.to(`restaurant_${restaurantId}`).emit("orders_updated");
 };
 
-// Emits when stock is updated
-const emitStockUpdate = (io, restaurantId, stockId) => {
+// Emits when stock is updated.
+// Keep the payload compact so clients can patch local state without refetching
+// the entire stock table on every adjustment.
+const emitStockUpdate = (io, restaurantId, stockId, stock = null, options = {}) => {
+  const payload = {
+    stockId,
+    restaurantId,
+    deleted: options.deleted === true,
+    stock:
+      stock && typeof stock === "object"
+        ? {
+            id: stock.id,
+            name: stock.name,
+            quantity: stock.quantity,
+            unit: stock.unit,
+            supplier_id: stock.supplier_id ?? null,
+            supplier_name: stock.supplier_name ?? stock.supplier ?? "",
+            critical_quantity: stock.critical_quantity ?? 0,
+            reorder_quantity: stock.reorder_quantity ?? 0,
+            expiry_date: stock.expiry_date ?? null,
+            last_auto_add_at: stock.last_auto_add_at ?? null,
+            auto_added_to_cart: stock.auto_added_to_cart ?? false,
+            price_per_unit: stock.price_per_unit ?? null,
+          }
+        : null,
+    timestamp: Date.now(),
+  };
   console.log(`📡 Emitting stock-updated for stock ${stockId}, restaurant: ${restaurantId}`);
-  io.to(`restaurant_${restaurantId}`).emit("stock-updated", { stockId });
+  io.to(`restaurant_${restaurantId}`).emit("stock-updated", payload);
 };
 
 // Emits when an order is confirmed

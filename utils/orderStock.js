@@ -177,7 +177,7 @@ async function updateStockForOrder(orderItems, restaurantId, io) {
             unit: updatedStock.unit,
           }
         );
-        emitStockUpdate(ioRef, updatedStock.id);
+        emitStockUpdate(ioRef, restaurantId, updatedStock.id, updatedStock);
 
         if (updatedStock.quantity > updatedStock.critical_quantity && updatedStock.auto_added_to_cart) {
           await pool.query(
@@ -303,7 +303,7 @@ async function updateStockForOrder(orderItems, restaurantId, io) {
             unit: updatedStock.unit,
           }
         );
-        emitStockUpdate(ioRef, updatedStock.id);
+        emitStockUpdate(ioRef, restaurantId, updatedStock.id, updatedStock);
 
         if (updatedStock.quantity > updatedStock.critical_quantity && updatedStock.auto_added_to_cart) {
           await pool.query(

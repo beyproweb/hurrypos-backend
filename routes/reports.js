@@ -542,11 +542,6 @@ async function fetchPosPaymentTotals(restaurantId, startTs, endTs) {
   const sessionTsExpr = orderEventTimestampExpr("o");
   const sessionRangeExpr = sessionRangeExprForTs(sessionTsExpr, "o", 2, 3);
   const params = [restaurantId, startTs, endTs];
-  console.log("🔎 [reconciliation] POS totals window", {
-    restaurantId,
-    startTs,
-    endTs,
-  });
   const [receiptRes, paymentsRes, ordersRes] = await Promise.all([
     pool.query(
       `
@@ -591,12 +586,6 @@ async function fetchPosPaymentTotals(restaurantId, startTs, endTs) {
     ),
   ]);
 
-  console.log("🔎 [reconciliation] POS totals rows", {
-    receipt: receiptRes.rows,
-    payments: paymentsRes.rows,
-    orders: ordersRes.rows,
-  });
-
   const totals = new Map();
   const addRows = (rows) => {
     rows.forEach((row) => {
@@ -622,7 +611,6 @@ async function fetchPosPaymentTotals(restaurantId, startTs, endTs) {
       `,
       params
     );
-    console.log("🔎 [reconciliation] POS totals fallback rows", fallback.rows);
     addRows(fallback.rows);
   }
 
@@ -1014,21 +1002,26 @@ async function fetchCashSalesLite(restaurantId, startTs, endTs) {
   const paymentsTotal = parseFloat(paymentsRes.rows?.[0]?.total || 0);
   const ordersTotal = parseFloat(ordersRes.rows?.[0]?.total || 0);
   const total = receiptTotal + paymentsTotal + ordersTotal;
-  console.log("💵 [reconciliation] cash-sales-lite", {
-    restaurantId,
-    startTs,
-    endTs,
-    receiptTotal,
-    paymentsTotal,
-    ordersTotal,
-    total,
-  });
   return total;
 }
 
 async function fetchCashExpenses(restaurantId, startTs, endTs, options = {}) {
   const includeTransactions = options.includeTransactions !== false;
 
+  const res0 = await pool
+    .query({
+      text: `
+      SELECT COALESCE(SUM(amount), 0) AS total
+      FROM cash_register_logs
+      WHERE restaurant_id = $1
+        AND type = 'entry'
+        AND created_at >= $2::timestamptz
+        AND created_at < $3::timestamptz
+      `,
+      values: [restaurantId, startTs, endTs],
+      query_timeout: RECON_QUERY_TIMEOUT_MS,
+    })
+    .catch(() => ({ rows: [{ total: 0 }] }));
   const res1 = await pool
     .query({
       text: `
@@ -1036,8 +1029,8 @@ async function fetchCashExpenses(restaurantId, startTs, endTs, options = {}) {
       FROM cash_register_logs
       WHERE restaurant_id = $1
         AND type = ANY($4)
-        AND created_at >= $2
-        AND created_at < $3
+        AND created_at >= $2::timestamptz
+        AND created_at < $3::timestamptz
       `,
       values: [restaurantId, startTs, endTs, ["expense", "supplier", "payroll", "change"]],
       query_timeout: RECON_QUERY_TIMEOUT_MS,
@@ -1076,13 +1069,18 @@ async function fetchCashExpenses(restaurantId, startTs, endTs, options = {}) {
     })
     .catch(() => ({ rows: [{ total: 0 }] }));
 
+  const from_register_entries = parseFloat(res0.rows[0].total || 0);
   const from_register = parseFloat(res1.rows[0].total || 0);
   const from_transactions = parseFloat(res2.rows[0].total || 0);
   const from_staff = parseFloat(res3.rows[0].total || 0);
 
   return {
+    cash_entries_total: from_register_entries,
     cash_expenses_total: from_register + from_transactions + from_staff,
     cash_refunds_total: 0,
+    cash_entries_breakdown: {
+      from_register_entries,
+    },
     cash_expenses_breakdown: {
       from_register,
       from_transactions,
@@ -1215,8 +1213,10 @@ async function buildRegisterReconciliationSnapshot({
   let posTotals = { cash_total: 0, card_total: 0, other_total: 0, grand_total: 0 };
   let cardByOrderType = emptyCardTypeTotals();
   let expenses = {
+    cash_entries_total: 0,
     cash_expenses_total: 0,
     cash_refunds_total: 0,
+    cash_entries_breakdown: { from_register_entries: 0 },
     cash_expenses_breakdown: { from_register: 0, from_transactions: 0, from_staff: 0 },
   };
   let opsSignals = {
@@ -1270,20 +1270,12 @@ async function buildRegisterReconciliationSnapshot({
       openingFloat = parseFloat(resolvedOpenRow.amount || 0);
     }
 
-    console.log("🔎 [reconciliation] session open log resolved", {
-      restaurantId,
-      requestedOpenTime: requestedOpenIso,
-      resolvedOpenAt: startTs,
-      openingFloat,
-      openRow: resolvedOpenRow || null,
-    });
   } catch (err) {
     errors.push({ section: "openingFloatResolve", message: String(err?.message || err) });
   }
 
   // ⚡ ESSENTIAL MODE: Skip heavy queries, just get opening float
   if (mode === "essential") {
-    console.log(`⚡ [reconciliation] ESSENTIAL mode - skipping heavy queries for ${restaurantId}`);
     const essentialResults = await Promise.allSettled([
       fetchPosTotalsLite(restaurantId, startTs, nowIso),
       fetchCardTotalsByOrderTypeLite(restaurantId, startTs, nowIso),
@@ -1378,21 +1370,10 @@ async function buildRegisterReconciliationSnapshot({
 
   const expected_cash_total =
     openingFloat +
+    (expenses.cash_entries_total || 0) +
     (cashSalesForExpected != null ? cashSalesForExpected : posTotals.cash_total || 0) -
     (expenses.cash_expenses_total || 0) -
     (expenses.cash_refunds_total || 0);
-
-  console.log("💵 [reconciliation] expected-cash components", {
-    restaurantId,
-    mode,
-    openTime: resolvedOpenRow?.created_at || startTs,
-    openingFloat,
-    cashSalesForExpected:
-      cashSalesForExpected != null ? cashSalesForExpected : posTotals.cash_total || 0,
-    expenses: expenses.cash_expenses_total || 0,
-    refunds: expenses.cash_refunds_total || 0,
-    expected_cash_total,
-  });
 
   return {
     session: { openTime: resolvedOpenRow?.created_at || startTs, nowTime: nowIso },
@@ -1401,6 +1382,7 @@ async function buildRegisterReconciliationSnapshot({
     cashReconciliation: {
       opening_float: openingFloat,
       expected_cash_total,
+      cash_entries_total: expenses.cash_entries_total || 0,
       cash_expenses_total: expenses.cash_expenses_total || 0,
       cash_refunds_total: expenses.cash_refunds_total || 0,
     },
@@ -2003,7 +1985,7 @@ router.get("/daily-cash-expenses", async (req, res) => {
       FROM cash_register_logs
       WHERE restaurant_id = $1
         AND type = 'expense'
-        AND created_at >= $2
+        AND created_at >= $2::timestamptz
       `,
       [restaurantId, openTime]
     );
@@ -2500,6 +2482,32 @@ router.get("/daily-cash-total", async (req, res) => {
   }
 });
 
+router.get("/daily-cash-entry-total", async (req, res) => {
+  try {
+    const openTime = req.query.openTime;
+    const restaurantId = req.user.restaurant_id;
+
+    if (!openTime || openTime === "null" || openTime === "undefined") {
+      return res.json({ entry_total: 0 });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT COALESCE(SUM(amount), 0) AS entry_total
+      FROM cash_register_logs
+      WHERE restaurant_id = $1
+        AND type = 'entry'
+        AND created_at >= $2::timestamptz
+      `,
+      [restaurantId, openTime]
+    );
+    res.json({ entry_total: parseFloat(result.rows?.[0]?.entry_total || 0) });
+  } catch (err) {
+    console.error("❌ Failed to calculate daily cash entry total:", err);
+    res.status(500).json({ error: "Failed to fetch cash entry total" });
+  }
+});
+
 
 
 
@@ -2630,10 +2638,11 @@ router.post("/cash-register-log", async (req, res) => {
 
     // Simple path for non-close events
     if (mappedType !== "close") {
-      await pool.query(
+      const insertRes = await pool.query(
         `
-        INSERT INTO cash_register_logs (date, type, amount, note, staff_name, staff_id, restaurant_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO cash_register_logs (date, type, amount, note, staff_name, staff_id, restaurant_id, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        RETURNING id, date, type, amount, note, created_at, restaurant_id
         `,
         [
           todayStr,
@@ -2980,26 +2989,17 @@ router.get("/register-reconciliation", async (req, res) => {
     const restaurantId = req.user.restaurant_id;
     const openTime = req.query.openTime;
     const requestedMode = String(req.query.mode || "essential").toLowerCase() === "full" ? "full" : "essential";
+    const forceFresh = Boolean(req.query?._t || req.query?.force_fresh || req.query?.forceFresh);
     const key = getReconciliationCacheKey(restaurantId, openTime);
     const cached = reconciliationCache.get(key);
 
     // Return cached quickly while fresh.
     if (
+      !forceFresh &&
       cached?.snapshot &&
       Date.now() - (cached.updatedAt || 0) <= RECONCILIATION_TTL_MS &&
       (requestedMode !== "full" || cached.snapshot?.snapshot_mode === "full")
     ) {
-      const elapsed = performance.now() - t0;
-      console.log(`📦 [${restaurantId}] Reconciliation from cache (${elapsed.toFixed(0)}ms)`);
-      console.log("💵 [reconciliation] cache payload", {
-        restaurantId,
-        openTime,
-        requestedMode,
-        snapshot_mode: cached.snapshot?.snapshot_mode,
-        expected_cash_total: cached.snapshot?.cashReconciliation?.expected_cash_total,
-        pos_cash_total: cached.snapshot?.posTotals?.cash_total,
-        card_grand_total: cached.snapshot?.cardByOrderType?.grand_total,
-      });
       return res.json(cached.snapshot);
     }
 
@@ -3010,26 +3010,7 @@ router.get("/register-reconciliation", async (req, res) => {
       openTime,
       mode: requestedMode,
     });
-    const elapsedEssential = performance.now() - t1;
     reconciliationCache.set(key, { snapshot: essential, updatedAt: Date.now() });
-    console.log(
-      `${requestedMode === "full" ? "🧮" : "⚡"} [${restaurantId}] ${
-        requestedMode === "full" ? "Full" : "Essential"
-      } reconciliation built (${elapsedEssential.toFixed(0)}ms)`
-    );
-    console.log("💵 [reconciliation] fresh payload", {
-      restaurantId,
-      openTime,
-      requestedMode,
-      snapshot_mode: essential?.snapshot_mode,
-      expected_cash_total: essential?.cashReconciliation?.expected_cash_total,
-      pos_cash_total: essential?.posTotals?.cash_total,
-      card_grand_total: essential?.cardByOrderType?.grand_total,
-      errors: essential?.errors,
-    });
-
-    const totalElapsed = performance.now() - t0;
-    console.log(`   └─ Total response time: ${totalElapsed.toFixed(0)}ms`);
     return res.json(essential);
   } catch (err) {
     console.error("❌ Failed to build register reconciliation:", err);

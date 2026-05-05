@@ -39,7 +39,8 @@ async function ensureTableColumns() {
         ADD COLUMN IF NOT EXISTS seats INTEGER,
         ADD COLUMN IF NOT EXISTS area TEXT,
         ADD COLUMN IF NOT EXISTS guests INTEGER,
-        ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE
+        ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     `);
   } catch (err) {
     console.warn("⚠️ Could not ensure tables columns:", err.message);
@@ -55,8 +56,22 @@ async function ensureTableColumns() {
   }
 }
 
-async function fetchTables(restaurantId) {
+function parseSinceToIso(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const parsed = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
+}
+
+async function fetchTables(restaurantId, options = {}) {
   await ensureTableColumns();
+  const sinceIso = parseSinceToIso(options?.since);
+  const params = [restaurantId];
+  let sinceClause = "";
+  if (sinceIso) {
+    params.push(sinceIso);
+    sinceClause = `AND COALESCE(updated_at, NOW()) >= $${params.length}`;
+  }
 
   const { rows } = await pool.query(
     `SELECT number,
@@ -65,11 +80,13 @@ async function fetchTables(restaurantId) {
             seats,
             area,
             guests,
-            COALESCE(locked, FALSE) AS locked
+            COALESCE(locked, FALSE) AS locked,
+            updated_at
      FROM tables
      WHERE restaurant_id = $1
+       ${sinceClause}
      ORDER BY number ASC`,
-    [restaurantId]
+    params
   );
 
   return rows;
@@ -89,6 +106,7 @@ router.get("/", async (req, res) => {
   const activeOnly =
     req.query.active === "true" ||
     (Array.isArray(req.allowed_modules) && !req.allowed_modules.includes("pos_core"));
+  const sinceIso = parseSinceToIso(req.query.since);
   const cacheKey = buildTablesCacheKey(restaurantId);
 
   try {
@@ -96,21 +114,23 @@ router.get("/", async (req, res) => {
     let cacheMissLogged = false;
 
     try {
-      const cached = await redis.get(cacheKey);
+      if (!sinceIso) {
+        const cached = await redis.get(cacheKey);
 
-      if (cached) {
-        if (process.env.NODE_ENV !== "production") {
-          console.log("CACHE HIT", cacheKey);
-        }
+        if (cached) {
+          if (process.env.NODE_ENV !== "production") {
+            console.log("CACHE HIT", cacheKey);
+          }
 
-        try {
-          tables = JSON.parse(cached);
-        } catch (error) {
-          await redis.del(cacheKey);
+          try {
+            tables = JSON.parse(cached);
+          } catch (error) {
+            await redis.del(cacheKey);
+          }
+        } else if (process.env.NODE_ENV !== "production") {
+          console.log("CACHE MISS", cacheKey);
+          cacheMissLogged = true;
         }
-      } else if (process.env.NODE_ENV !== "production") {
-        console.log("CACHE MISS", cacheKey);
-        cacheMissLogged = true;
       }
     } catch (error) {
       if (process.env.NODE_ENV !== "production") {
@@ -123,10 +143,12 @@ router.get("/", async (req, res) => {
         console.log("CACHE MISS", cacheKey);
       }
 
-      tables = await fetchTables(restaurantId);
+      tables = await fetchTables(restaurantId, { since: sinceIso });
 
       try {
-        await redis.set(cacheKey, JSON.stringify(tables), "EX", 10);
+        if (!sinceIso) {
+          await redis.set(cacheKey, JSON.stringify(tables), "EX", 10);
+        }
       } catch (error) {
         if (process.env.NODE_ENV !== "production") {
           console.warn("⚠️ Tables cache write failed:", error?.message || error);
@@ -164,13 +186,16 @@ router.put("/count", async (req, res) => {
     for (let n = 1; n <= total; n++) {
       if (existingSet.has(n)) {
         await client.query(
-          `UPDATE tables SET active = TRUE WHERE restaurant_id = $1 AND number = $2`,
+          `UPDATE tables
+             SET active = TRUE,
+                 updated_at = NOW()
+           WHERE restaurant_id = $1 AND number = $2`,
           [restaurantId, n]
         );
       } else {
         await client.query(
-          `INSERT INTO tables (restaurant_id, number, active)
-           VALUES ($1, $2, TRUE)`,
+          `INSERT INTO tables (restaurant_id, number, active, updated_at)
+           VALUES ($1, $2, TRUE, NOW())`,
           [restaurantId, n]
         );
       }
@@ -178,13 +203,24 @@ router.put("/count", async (req, res) => {
 
     // Deactivate tables beyond total
     await client.query(
-      `UPDATE tables SET active = FALSE
+      `UPDATE tables
+          SET active = FALSE,
+              updated_at = NOW()
        WHERE restaurant_id = $1 AND number > $2`,
       [restaurantId, total]
     );
 
     await client.query("COMMIT");
     await invalidateTablesCache(restaurantId);
+    try {
+      const io = getIO();
+      io.to(`restaurant_${restaurantId}`).emit("tables_updated", {
+        restaurantId,
+        timestamp: Date.now(),
+      });
+    } catch (socketErr) {
+      console.warn("⚠️ Failed to emit tables_updated:", socketErr?.message || socketErr);
+    }
     res.json({ success: true, total });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -347,7 +383,7 @@ router.patch("/:number", async (req, res) => {
 
       await pool.query(
         `UPDATE tables 
-         SET ${fields.join(", ")}
+         SET ${fields.join(", ")}, updated_at = NOW()
          WHERE restaurant_id = $${idx++} AND number = $${idx}`,
         params
       );
@@ -355,8 +391,8 @@ router.patch("/:number", async (req, res) => {
       // === INSERT NEW ENTRY ===
       await pool.query(
         `INSERT INTO tables 
-           (restaurant_id, number, color, label, active, seats, area, guests, locked)
-         VALUES ($1, $2, $3, $4, COALESCE($5, TRUE), $6, $7, $8, COALESCE($9, FALSE))`,
+           (restaurant_id, number, color, label, active, seats, area, guests, locked, updated_at)
+         VALUES ($1, $2, $3, $4, COALESCE($5, TRUE), $6, $7, $8, COALESCE($9, FALSE), NOW())`,
         [
           restaurantId,
           number,
@@ -374,6 +410,29 @@ router.patch("/:number", async (req, res) => {
     await invalidateTablesCache(restaurantId);
     try {
       const io = getIO();
+      const refreshedTables = await fetchTables(restaurantId, { since: new Date(Date.now() - 60_000).toISOString() });
+      const changedTable =
+        refreshedTables.find((table) => Number(table?.number) === number) || {
+          number,
+          active: active !== false,
+          color: color ?? null,
+          label: label ?? null,
+          seats: seats ?? null,
+          area: area ?? null,
+          guests: guestsValue ?? null,
+          locked: lockedValue ?? false,
+          updated_at: new Date().toISOString(),
+        };
+      io.to(`restaurant_${restaurantId}`).emit("tables_updated", {
+        restaurantId,
+        numbers: [number],
+        timestamp: Date.now(),
+      });
+      io.to(`restaurant_${restaurantId}`).emit("table_config_updated", {
+        restaurantId,
+        table: changedTable,
+        timestamp: Date.now(),
+      });
       io.to(`restaurant_${restaurantId}`).emit("orders_updated");
       if (lockedValue !== undefined) {
         io.to(`restaurant_${restaurantId}`).emit("table_lock_updated", {

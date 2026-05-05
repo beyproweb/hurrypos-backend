@@ -424,7 +424,10 @@ router.patch("/orders/:id/status", async (req, res) => {
     }
 
     await client.query("COMMIT");
-    getIO().emit("orders_updated");
+    getIO().to(`restaurant_${restaurantId}`).emit("orders_updated", {
+      restaurantId,
+      timestamp: Date.now(),
+    });
     res.json(result.rows[0]);
   } catch (err) {
     await client.query("ROLLBACK");

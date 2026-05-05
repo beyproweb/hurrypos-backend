@@ -84,15 +84,19 @@ module.exports = (io) => {
   // ✅ protect all stock routes
   router.use(authMiddleware);
 
-  let ensuredCleaningColumn = false;
-  async function ensureCleaningColumn(client) {
-    if (ensuredCleaningColumn) return;
+  let ensuredStockColumns = false;
+  async function ensureStockColumns(client) {
+    if (ensuredStockColumns) return;
     const runner = client || pool;
     try {
-      await runner.query(`ALTER TABLE stock ADD COLUMN IF NOT EXISTS is_cleaning_supply BOOLEAN DEFAULT FALSE`);
-      ensuredCleaningColumn = true;
+      await runner.query(`
+        ALTER TABLE stock
+          ADD COLUMN IF NOT EXISTS is_cleaning_supply BOOLEAN DEFAULT FALSE,
+          ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      `);
+      ensuredStockColumns = true;
     } catch (err) {
-      console.warn("⚠️ stock cleaning column ensure failed:", err.message);
+      console.warn("⚠️ stock column ensure failed:", err.message);
     }
   }
 
@@ -101,8 +105,15 @@ module.exports = (io) => {
   // ==============================
   router.get("/", async (req, res) => {
     try {
-      await ensureCleaningColumn();
+      await ensureStockColumns();
       const restaurantId = req.user.restaurant_id;
+      const sinceRaw = String(req.query.since || "").trim();
+      const sinceDate = sinceRaw
+        ? /^\d+$/.test(sinceRaw)
+          ? new Date(Number(sinceRaw))
+          : new Date(sinceRaw)
+        : null;
+      const sinceIso = sinceDate && Number.isFinite(sinceDate.getTime()) ? sinceDate.toISOString() : null;
 
       const notifRes = await pool.query(
         `SELECT value FROM settings WHERE restaurant_id = $1 AND key = 'notifications'`,
@@ -115,6 +126,13 @@ module.exports = (io) => {
         const config = JSON.parse(notifRes.rows[0].value);
         cooldownMinutes = config.stockAlert?.cooldownMinutes ?? 30;
         stockAlertEnabled = config.stockAlert?.enabled !== false;
+      }
+
+      const params = [restaurantId];
+      let sinceClause = "";
+      if (sinceIso) {
+        params.push(sinceIso);
+        sinceClause = `AND COALESCE(s.updated_at, NOW()) >= $${params.length}`;
       }
 
       const result = await pool.query(
@@ -184,9 +202,10 @@ module.exports = (io) => {
 	          LIMIT 1
 	        ) ip2 ON true
         WHERE s.restaurant_id = $1
+          ${sinceClause}
         ORDER BY s.name ASC
         `,
-        [restaurantId]
+        params
       );
 
       res.json(result.rows);
@@ -348,7 +367,8 @@ module.exports = (io) => {
 
             await client.query(
               `UPDATE stock
-               SET quantity = quantity - $1
+               SET quantity = quantity - $1,
+                   updated_at = NOW()
                WHERE id = $2 AND restaurant_id = $3`,
               [adjusted, stockRow.id, restaurantId]
             );
@@ -360,12 +380,13 @@ module.exports = (io) => {
 
       // 🔺 Upsert finished product stock (tenant-safe)
       const upsertRes = await client.query(
-        `INSERT INTO stock (name, quantity, unit, supplier_id, restaurant_id, expiry_date)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO stock (name, quantity, unit, supplier_id, restaurant_id, expiry_date, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())
          ON CONFLICT (name, unit, restaurant_id)
          DO UPDATE SET
            quantity = stock.quantity + EXCLUDED.quantity,
            supplier_id = EXCLUDED.supplier_id,
+           updated_at = NOW(),
            expiry_date = CASE
              WHEN stock.expiry_date IS NULL THEN EXCLUDED.expiry_date
              WHEN EXCLUDED.expiry_date IS NULL THEN stock.expiry_date
@@ -379,7 +400,7 @@ module.exports = (io) => {
 
       // notify listeners
       const stockPayload = upsertRes.rows[0];
-      emitStockUpdate(io, stockPayload.id);
+      emitStockUpdate(io, restaurantId, stockPayload.id, stockPayload);
       await maybeEmitExpiryAlert(
         io,
         restaurantId,
@@ -412,7 +433,8 @@ module.exports = (io) => {
          SET quantity = COALESCE($1, quantity),
              critical_quantity = COALESCE($2, critical_quantity),
              reorder_quantity = COALESCE($3, reorder_quantity),
-             expiry_date = COALESCE($4, expiry_date)
+             expiry_date = COALESCE($4, expiry_date),
+             updated_at = NOW()
          WHERE restaurant_id = $5 AND id = $6
          RETURNING *`,
         [quantity, critical_quantity, reorder_quantity, normalizedExpiry, restaurantId, id]
@@ -434,7 +456,7 @@ module.exports = (io) => {
         );
       }
 
-      emitStockUpdate(io, id);
+      emitStockUpdate(io, restaurantId, updated.id, updated);
       if (updated.expiry_date) {
         await maybeEmitExpiryAlert(
           io,
@@ -468,7 +490,7 @@ module.exports = (io) => {
         return res.status(404).json({ error: "Stock item not found." });
       }
 
-      emitStockUpdate(io, id);
+      emitStockUpdate(io, restaurantId, id, delRes.rows[0], { deleted: true });
       res.json({ success: true });
     } catch (error) {
       console.error("❌ Error deleting stock:", error);
@@ -487,7 +509,8 @@ module.exports = (io) => {
     try {
       const result = await pool.query(
         `UPDATE stock
-         SET last_auto_add_at = $1
+         SET last_auto_add_at = $1,
+             updated_at = NOW()
          WHERE restaurant_id = $2 AND id = $3
          RETURNING *`,
         [last_auto_add_at, restaurantId, id]
@@ -708,7 +731,10 @@ module.exports = (io) => {
 
         const nextQty = Math.max(0, currentQty - qty);
         await client.query(
-          `UPDATE stock SET quantity = $1 WHERE id = $2 AND restaurant_id = $3`,
+          `UPDATE stock
+              SET quantity = $1,
+                  updated_at = NOW()
+            WHERE id = $2 AND restaurant_id = $3`,
           [nextQty, stock_id, restaurantId]
         );
       } else {
@@ -792,7 +818,7 @@ module.exports = (io) => {
       }
 
       await client.query("COMMIT");
-      emitStockUpdate(io, stock_id);
+      emitStockUpdate(io, restaurantId, stock_id, stockRow);
 
       return res.json({
         success: true,
